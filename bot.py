@@ -110,7 +110,7 @@ def run_bot():
                     print(f"خطأ في معالجة {symbol}: {e}")
         except Exception as e:
             print(f"خطأ في تحميل الأسواق: {e}")
-        time.sleep(300)
+        time.sleep(10)
 
 if __name__ == '__main__':
     threading.Thread(target=run_bot).start()
