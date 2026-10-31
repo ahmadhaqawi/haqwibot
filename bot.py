@@ -1,12 +1,20 @@
+import threading
+import os
 import time
 import requests
 import pandas as pd
 import pandas_ta as ta
 import ccxt
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running"
 
 TELEGRAM_TOKEN = '9185362616:AAE8zy7pFG_yOuJGurptodXU1CJ19YFQQMQ'
 TELEGRAM_CHAT_ID = '7586556190'
-
 BINANCE_API_KEY = 'qPofjSlD7PuRnvABVK1HwrA7SbtTyUBc6I5UnLakPmWky8FSvSkNh5NEF8v2HWZu'
 BINANCE_SECRET_KEY = 'G7Fs62dMe2YmRay0qbLIkGCzQpFxpwgJobaoZeIkiVZuoJU7GTDuLvMoXqrwP5zB'
 
@@ -57,41 +65,34 @@ def analyze_liquidity(symbol):
 def check_signals(df):
     if df is None or len(df) < 30:
         return None, None
-    
     df['RSI'] = ta.rsi(df['close'], length=14)
     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
     df = pd.concat([df, macd], axis=1)
-
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
-
     signal = None
     if last_row['RSI'] < 30 and prev_row['RSI'] >= 30 and last_row['MACDh_12_26_9'] > 0:
         signal = 'BUY'
     elif last_row['RSI'] > 70 and prev_row['RSI'] <= 70 and last_row['MACDh_12_26_9'] < 0:
         signal = 'SELL'
-        
     return signal, last_row
 
 def run_bot():
     send_telegram_message("🤖 البوت بدأ بمسح السوق ومراقبة الأزواج ذات السيولة")
-    
     markets = exchange.load_markets()
     usdt_symbols = [symbol for symbol in markets if symbol.endswith('/USDT')]
-    
     min_volume_threshold = 1000000
-
     while True:
         for symbol in usdt_symbols:
             try:
                 volume_4h = check_liquidity_4h(symbol)
                 if volume_4h < min_volume_threshold:
                     continue
-
                 df = fetch_data(symbol, timeframe='5m')
+                if df is None:
+                    continue
                 bid_depth, ask_depth = analyze_liquidity(symbol)
                 signal, data = check_signals(df)
-
                 if signal:
                     message = (
                         f"🔔 إشارة جديدة لـ {symbol}\n"
@@ -103,12 +104,12 @@ def run_bot():
                         f"💡 يُنصح باتخاذ القرار بناءً على التحليل الفني والسيولة."
                     )
                     send_telegram_message(message)
-                
                 time.sleep(2)
             except Exception as e:
                 print(f"خطأ في معالجة {symbol}: {e}")
-                
         time.sleep(300)
 
 if __name__ == '__main__':
-    run_bot()
+    threading.Thread(target=run_bot).start()
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
