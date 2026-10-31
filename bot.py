@@ -78,35 +78,38 @@ def check_signals(df):
     return signal, last_row
 
 def run_bot():
-    send_telegram_message("🤖 البوت بدأ بمسح السوق ومراقبة الأزواج ذات السيولة")
-    markets = exchange.load_markets()
-    usdt_symbols = [symbol for symbol in markets if symbol.endswith('/USDT')]
+    send_telegram_message("🤖 البوت بدأ بمسح العملات ذات السيولة العالية (4h)")
     min_volume_threshold = 1000000
     while True:
-        for symbol in usdt_symbols:
-            try:
-                volume_4h = check_liquidity_4h(symbol)
-                if volume_4h < min_volume_threshold:
-                    continue
-                df = fetch_data(symbol, timeframe='5m')
-                if df is None:
-                    continue
-                bid_depth, ask_depth = analyze_liquidity(symbol)
-                signal, data = check_signals(df)
-                if signal:
-                    message = (
-                        f"🔔 إشارة جديدة لـ {symbol}\n"
-                        f"الاتجاه: {signal}\n"
-                        f"السعر الحالي: {data['close']}\n"
-                        f"RSI: {data['RSI']:.2f}\n"
-                        f"حجم التداول (4h): {volume_4h:.2f}\n"
-                        f"عمق السيولة - الشراء: {bid_depth:.2f}, البيع: {ask_depth:.2f}\n"
-                        f"💡 يُنصح باتخاذ القرار بناءً على التحليل الفني والسيولة."
-                    )
-                    send_telegram_message(message)
-                time.sleep(2)
-            except Exception as e:
-                print(f"خطأ في معالجة {symbol}: {e}")
+        try:
+            markets = exchange.load_markets()
+            usdt_symbols = [symbol for symbol in markets if symbol.endswith('/USDT')]
+            for symbol in usdt_symbols:
+                try:
+                    volume_4h = check_liquidity_4h(symbol)
+                    if volume_4h < min_volume_threshold:
+                        continue
+                    df = fetch_data(symbol, timeframe='5m')
+                    if df is None:
+                        continue
+                    bid_depth, ask_depth = analyze_liquidity(symbol)
+                    signal, data = check_signals(df)
+                    if signal:
+                        message = (
+                            f"🔔 إشارة جديدة لـ {symbol}\n"
+                            f"الاتجاه: {signal}\n"
+                            f"السعر الحالي: {data['close']}\n"
+                            f"RSI: {data['RSI']:.2f}\n"
+                            f"حجم التداول (4h): {volume_4h:.2f}\n"
+                            f"عمق السيولة - الشراء: {bid_depth:.2f}, البيع: {ask_depth:.2f}\n"
+                            f"💡 يُنصح باتخاذ القرار بناءً على التحليل الفني والسيولة."
+                        )
+                        send_telegram_message(message)
+                    time.sleep(2)
+                except Exception as e:
+                    print(f"خطأ في معالجة {symbol}: {e}")
+        except Exception as e:
+            print(f"خطأ في تحميل الأسواق: {e}")
         time.sleep(300)
 
 if __name__ == '__main__':
