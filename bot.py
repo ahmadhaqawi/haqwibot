@@ -26,18 +26,38 @@ def send_telegram_message(message):
     requests.post(url, json=payload)
 
 def fetch_data(symbol, timeframe='5m', limit=100):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+    except Exception as e:
+        print(f"Error fetching data for {symbol}: {e}")
+        return None
+
+def check_liquidity_4h(symbol):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, '4h', limit=1)
+        volume_4h = ohlcv[0][5]
+        return volume_4h
+    except Exception as e:
+        print(f"Error fetching 4h volume for {symbol}: {e}")
+        return 0
 
 def analyze_liquidity(symbol):
-    order_book = exchange.fetch_order_book(symbol, limit=20)
-    bid_depth = sum([bid[1] for bid in order_book['bids']])
-    ask_depth = sum([ask[1] for ask in order_book['asks']])
-    return bid_depth, ask_depth
+    try:
+        order_book = exchange.fetch_order_book(symbol, limit=20)
+        bid_depth = sum([bid[1] for bid in order_book['bids']])
+        ask_depth = sum([ask[1] for ask in order_book['asks']])
+        return bid_depth, ask_depth
+    except Exception as e:
+        print(f"Error fetching liquidity for {symbol}: {e}")
+        return 0, 0
 
 def check_signals(df):
+    if df is None or len(df) < 30:
+        return None, None
+    
     df['RSI'] = ta.rsi(df['close'], length=14)
     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
     df = pd.concat([df, macd], axis=1)
@@ -53,29 +73,42 @@ def check_signals(df):
         
     return signal, last_row
 
-def run_bot(symbol):
-    send_telegram_message(f"🤖 البوت بدأ بمراقبة زوج {symbol}")
-    while True:
-        try:
-            df = fetch_data(symbol)
-            bid_depth, ask_depth = analyze_liquidity(symbol)
-            signal, data = check_signals(df)
+def run_bot():
+    send_telegram_message("🤖 البوت بدأ بمسح السوق ومراقبة الأزواج ذات السيولة")
+    
+    markets = exchange.load_markets()
+    usdt_symbols = [symbol for symbol in markets if symbol.endswith('/USDT')]
+    
+    min_volume_threshold = 1000000
 
-            if signal:
-                message = (
-                    f"🔔 إشارة جديدة لـ {symbol}\n"
-                    f"الاتجاه: {signal}\n"
-                    f"السعر الحالي: {data['close']}\n"
-                    f"RSI: {data['RSI']:.2f}\n"
-                    f"عمق السيولة - الشراء: {bid_depth:.2f}, البيع: {ask_depth:.2f}\n"
-                    f"💡 يُنصح باتخاذ القرار بناءً على التحليل الفني والسيولة."
-                )
-                send_telegram_message(message)
-            
-            time.sleep(300)
-        except Exception as e:
-            print(f"خطأ: {e}")
-            time.sleep(60)
+    while True:
+        for symbol in usdt_symbols:
+            try:
+                volume_4h = check_liquidity_4h(symbol)
+                if volume_4h < min_volume_threshold:
+                    continue
+
+                df = fetch_data(symbol, timeframe='5m')
+                bid_depth, ask_depth = analyze_liquidity(symbol)
+                signal, data = check_signals(df)
+
+                if signal:
+                    message = (
+                        f"🔔 إشارة جديدة لـ {symbol}\n"
+                        f"الاتجاه: {signal}\n"
+                        f"السعر الحالي: {data['close']}\n"
+                        f"RSI: {data['RSI']:.2f}\n"
+                        f"حجم التداول (4h): {volume_4h:.2f}\n"
+                        f"عمق السيولة - الشراء: {bid_depth:.2f}, البيع: {ask_depth:.2f}\n"
+                        f"💡 يُنصح باتخاذ القرار بناءً على التحليل الفني والسيولة."
+                    )
+                    send_telegram_message(message)
+                
+                time.sleep(2)
+            except Exception as e:
+                print(f"خطأ في معالجة {symbol}: {e}")
+                
+        time.sleep(300)
 
 if __name__ == '__main__':
-    run_bot('BTC/USDT')
+    run_bot()
