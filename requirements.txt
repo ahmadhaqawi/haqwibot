@@ -2,3 +2,4 @@ ccxt
 requests
 pandas
 pandas-ta
+flask
