@@ -1,41 +1,87 @@
+import os
+import time
 import ccxt
 import pandas as pd
 import requests
 
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def check_liquidity_24h(exchange, symbol, min_24h_quote_volume=10000000):
-  """Checks if 24-hour trading volume meets the minimum threshold.
+def send_telegram_alert(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[Alert] {message}")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Error sending Telegram alert: {e}")
 
-  min_24h_quote_volume: Threshold in USDT (e.g., 10,000,000 USDT for high
-  liquidity).
-  """
-  try:
-    ticker = exchange.fetch_ticker(symbol)
-    # 'quoteVolume' is the total volume in USDT over the last 24h
-    vol_```python
-import ccxt
-import pandas as pd
-import requests
+def check_liquidity_24h(exchange, symbol: str, min_24h_quote_volume: float = 10_000_000):
+    """
+    Checks if 24-hour trading volume meets the minimum threshold.
+    min_24h_quote_volume: Threshold in USDT.
+    """
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        vol_24h = float(ticker.get('quoteVolume', 0.0) or 0.0)
+        is_liquid = vol_24h >= min_24h_quote_volume
+        return is_liquid, vol_24h
+    except Exception as e:
+        print(f"Error fetching 24h ticker for {symbol}: {e}")
+        return False, 0.0
 
-def check_liquidity_24h(exchange, symbol, min_24h_quote_volume=10_000_000):
-  """Checks if 24-hour trading volume meets the minimum threshold.
-  min_24h_quote_volume: Threshold in USDT (e.g., 10,000,000 USDT for high liquidity).
-  """
-  try:
-    ticker = exchange.fetch_ticker(symbol)
-    vol_24h = ticker.get('quoteVolume', 0)
-    is_liquid = vol_24h >= min_24h_quote_volume
-    return is_liquid, vol_24h
-  except Exception as e:
-    print(f"Error fetching 24h ticker for {symbol}: {e}")
-    return False, 0
+def fetch_market_data(exchange, symbol: str, timeframe: str = '5m', limit: int = 100):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+    except Exception as e:
+        print(f"Error fetching candles for {symbol}: {e}")
+        return None
 
-def analyze_market_with_24h_volume(exchange, symbol, timeframe='5m', min_24h_volume=10_000_000):
-  is_liquid, vol_24h = check_liquidity_24h(exchange, symbol, min_24h_volume)
-  if not is_liquid:
-    print(f"[{symbol}] Skipped: 24h volume {vol_24h:,.0f} USDT is below threshold {min_24h_volume:,.0f} USDT")
-    return None
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-  ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-  df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-  return df
+def scan_symbol(exchange, symbol: str, timeframe: str = '5m', min_24h_vol: float = 10_000_000):
+    is_liquid, vol_24h = check_liquidity_24h(exchange, symbol, min_24h_vol)
+    if not is_liquid:
+        return
+
+    df = fetch_market_data(exchange, symbol, timeframe=timeframe, limit=50)
+    if df is None or len(df) < 20:
+        return
+
+    df['rsi'] = calculate_rsi(df['close'], period=14)
+    last_close = df['close'].iloc[-1]
+    last_rsi = df['rsi'].iloc[-1]
+
+    # Flexible test thresholds around median
+    if last_rsi >= 52:
+        msg = f"🟢 *LONG Signal*\nSymbol: `{symbol}`\nTF: `{timeframe}`\nClose: `{last_close}`\nRSI: `{last_rsi:.2f}`\n24h Vol: `${vol_24h:,.0f}`"
+        send_telegram_alert(msg)
+    elif last_rsi <= 48:
+        msg = f"🔴 *SHORT Signal*\nSymbol: `{symbol}`\nTF: `{timeframe}`\nClose: `{last_close}`\nRSI: `{last_rsi:.2f}`\n24h Vol: `${vol_24h:,.0f}`"
+        send_telegram_alert(msg)
+
+if __name__ == "__main__":
+    exchange = ccxt.binance({'enableRateLimit': True})
+    symbols_to_monitor = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+    
+    print("Bot initialized. Running scan loop...")
+    send_telegram_alert("🚀 *Bot started successfully on Render.*")
+
+    while True:
+        for sym in symbols_to_monitor:
+            scan_symbol(exchange, sym, timeframe='5m', min_24h_vol=10_000_000)
+            time.sleep(1)
+        time.sleep(60)
