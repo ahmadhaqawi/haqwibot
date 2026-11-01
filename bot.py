@@ -163,9 +163,11 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
     return None
 
 # ==========================================
-# 5. جلب البيانات ومعالجة الشموع اللحظية
+# 5. جلب البيانات ومعالجة الشموع اللحظية (مع تخطي الحظر الجغرافي)
 # ==========================================
+# استخدام data-api.binance.vision يتجاوز حظر Render الأمريكي
 client = Client()
+client.API_URL = 'https://data-api.binance.vision/api'
 
 def fetch_initial(sym):
     k5  = client.get_klines(symbol=sym, interval="5m",  limit=300)
@@ -209,7 +211,7 @@ def on_kline(msg):
             daily_pnl["value"] = 0.0
             daily_pnl["date"] = today
         if daily_pnl["value"] <= -MAX_DAILY_LOSS:
-            return # تم إرسال التنبيه مسبقاً
+            return 
 
         if signal["action"] == "ENTRY":
             with lock:
@@ -225,7 +227,6 @@ def on_kline(msg):
             
             send(msg_exit(sym, pos, signal["price"], entry, signal["reason"], pnl))
             
-            # تنبيه إذا تم الوصول للحد الأقصى للخسارة
             if daily_pnl["value"] <= -MAX_DAILY_LOSS:
                 send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nلقد وصلت للحد الأقصى للخسارة اليومية (-{MAX_DAILY_LOSS}%).\nلن يتم إرسال إشارات جديدة حتى الغد.")
 
@@ -254,7 +255,9 @@ def main():
         fetch_initial(s)
         update_trend(s)
 
-    twm = ThreadedWebsocketManager()
+    # استخدام مسار البث العام لـ Binance لتجاوز الحظر الجغرافي
+    twm = ThreadedWebsocketManager(client=client)
+    twm.stream_url = 'wss://data-stream.binance.vision'
     twm.start()
 
     for s in SYMBOLS:
