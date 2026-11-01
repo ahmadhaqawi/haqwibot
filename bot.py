@@ -39,9 +39,8 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 
-# إعدادات الحيتان
 WHALE_THRESHOLD = float(os.getenv("WHALE_THRESHOLD", "50000")) 
-TOP_WHALE_SYMBOLS = FUTURES_SYMBOLS[:10] # تتبع الحيتان في أفضل 10 عملات فقط لتخفيف الضغط
+TOP_WHALE_SYMBOLS = FUTURES_SYMBOLS[:10] 
 whale_last_ts = {sym: 0 for sym in TOP_WHALE_SYMBOLS}
 
 LEVERAGE = 5 
@@ -67,7 +66,10 @@ def send(msg):
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
-# تحليل تدفق السيولة للعقود
+# دالة لتنظيف اسم الزوج (إزالة التكرار)
+def clean_symbol(sym):
+    return sym.split(':')[0]
+
 def analyze_market_flow(exchange, symbol):
     try:
         trades = exchange.fetch_trades(symbol, limit=300)
@@ -110,7 +112,7 @@ def msg_entry(sym, side, price, sl, tp, rsi, flow_data):
     
     return (f"{title}\n"
             f"➖➖➖➖➖➖➖➖\n"
-            f"🪙 الزوج: <code>{sym}</code>\n"
+            f"🪙 الزوج: <code>{clean_symbol(sym)}</code>\n" # تم التعديل هنا
             f"⏱️ الفريم: <code>{TIMEFRAME}</code>\n"
             f"⚙️ الرافعة المقترحة: <b>{LEVERAGE}x</b>\n"
             f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
@@ -132,7 +134,7 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct):
 
     return (f"{title}\n"
             f"➖➖➖➖➖➖➖➖\n"
-            f"🪙 الزوج: <code>{sym}</code>\n"
+            f"🪙 الزوج: <code>{clean_symbol(sym)}</code>\n" # تم التعديل هنا
             f"📥 سعر الدخول: <code>{fmt(entry)}</code>\n"
             f"📤 سعر الخروج: <code>{fmt(price)}</code>\n"
             f"📊 النتيجة (بدون رافعة): <code>{pnl_pct:+.2f}%</code>\n"
@@ -192,7 +194,7 @@ def check_signal(df, position, entry_price=None, sl=None, tp=None):
 
     cross_up   = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
     cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
-    vol_ok     = last["volume"] > 1.2 * last["vol_ma"] # فلتر السيولة
+    vol_ok     = last["volume"] > 1.2 * last["vol_ma"] 
     macd_up    = last["macd_hist"] > 0 and last["macd_hist"] > prev["macd_hist"]
     macd_down  = last["macd_hist"] < 0 and last["macd_hist"] < prev["macd_hist"]
 
@@ -249,7 +251,6 @@ def scan_symbol(exchange, symbol):
 
         if signal["action"] == "ENTRY":
             state[symbol].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
-            # جلب تدفق السيولة عند وجود إشارة
             flow_data = analyze_market_flow(exchange, symbol)
             send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], flow_data))
 
@@ -269,7 +270,7 @@ def scan_symbol(exchange, symbol):
         print(f"[ERROR] Scan {symbol}: {e}", flush=True)
 
 # ==========================================
-# 5. صياد الحيتان للفيوتشر
+# 5. صياد الحيتان
 # ==========================================
 def track_whales(exchange):
     for sym in TOP_WHALE_SYMBOLS:
@@ -293,7 +294,7 @@ def track_whales(exchange):
                     
                     msg = (f"🐋 <b>تنبيه حيتان (فيوتشر)!</b>\n"
                            f"➖➖➖➖➖➖➖➖\n"
-                           f"🪙 الزوج: <code>{sym}</code>\n"
+                           f"🪙 الزوج: <code>{clean_symbol(sym)}</code>\n" # تم التعديل هنا
                            f"💰 القيمة: <code>${cost:,.0f}</code>\n"
                            f"{emoji} النوع: <b>{side_ar}</b>\n"
                            f"💵 السعر: <code>{fmt(t['price'])}</code>")
@@ -329,7 +330,6 @@ def trading_loop():
          f"🐋 صياد الحيتان: <b>مفعل</b>\n"
          f"📊 تحليل السيولة: <b>مفعل عند الإشارات</b>")
 
-    # تشغيل صياد الحيتان في الخلفية
     threading.Thread(target=whale_loop, args=(exchange,), daemon=True).start()
 
     while True:
