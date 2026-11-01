@@ -29,9 +29,7 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# رفعنا الحد الافتراضي إلى 500,000 دولار لتقليل الإزعاج
-WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "500000")) 
-# فترة التهدئة (بالثواني) لكل زوج لكل منصة (10 دقائق)
+WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "250000")) 
 WHALE_COOLDOWN = int(os.getenv("WHALE_COOLDOWN", "600")) 
 last_whale_alert = {}
 
@@ -109,19 +107,16 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct):
             f"📝 السبب: {ar_reason}")
 
 # ==========================================
-# 3. محرك مراقبة الصفقات (مع فلتر منع التكرار)
+# 3. محرك مراقبة الصفقات
 # ==========================================
 async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, price):
-    """دالة موحدة لمعالجة التنبيهات مع منع التكرار"""
     global last_whale_alert
     key = f"{platform}_{symbol_display}"
     now = time.time()
     
-    # التحقق من فترة التهدئة (هل مرت 10 دقائق على آخر تنبيه لنفس الزوج ونفس المنصة؟)
     if now - last_whale_alert.get(key, 0) < WHALE_COOLDOWN:
-        return # تجاهل التنبيه لأنه مكرر
+        return 
 
-    # تحديث وقت آخر تنبيه
     last_whale_alert[key] = now
 
     msg = (f"🐋 <b>صفقة ضخمة</b>\n"
@@ -210,7 +205,7 @@ def run_websocket_loop():
     asyncio.run(run_websockets())
 
 # ==========================================
-# 4. المؤشرات الفنية والاستراتيجية (كما هي)
+# 4. المؤشرات الفنية (مع MACD)
 # ==========================================
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
@@ -220,6 +215,14 @@ def rsi(series, period=14):
     loss  = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
     rs    = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
+
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    line     = ema_fast - ema_slow
+    sig_line = ema(line, signal)
+    hist     = line - sig_line
+    return line, sig_line, hist
 
 def adx(high, low, close, period=14):
     up = high.diff()
@@ -247,6 +250,12 @@ def add_indicators(df):
     df["vol_ma"] = df["volume"].rolling(20).mean()
     df["highest_high_20"] = df["high"].rolling(20).max().shift(1)
     df["lowest_low_20"]   = df["low"].rolling(20).min().shift(1)
+    
+    # إضافة مؤشر MACD
+    macd_line, macd_sig, macd_hist = macd(df["close"])
+    df["macd_line"] = macd_line
+    df["macd_sig"]  = macd_sig
+    df["macd_hist"] = macd_hist
     return df
 
 def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
@@ -267,12 +276,15 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
 
     if position is not None: return None
 
+    # متغيرات مشتركة
     trend_1h_up   = df_1h.iloc[-2]["close"] > df_1h.iloc[-2]["ema21"]
     trend_1h_down = df_1h.iloc[-2]["close"] < df_1h.iloc[-2]["ema21"]
+    vol_ok     = last_5m["volume"] > 1.2 * last_5m["vol_ma"] 
+    adx_strong = last_5m["adx"] > 25
+
+    # 1. استراتيجية الترند (EMA Cross + ADX)
     cross_up   = prev_5m["ema9"] <= prev_5m["ema21"] and last_5m["ema9"] > last_5m["ema21"]
     cross_down = prev_5m["ema9"] >= prev_5m["ema21"] and last_5m["ema9"] < last_5m["ema21"]
-    adx_strong = last_5m["adx"] > 25
-    vol_ok     = last_5m["volume"] > 1.2 * last_5m["vol_ma"] 
 
     if (cross_up and trend_1h_up and adx_strong and vol_ok and 40 < last_5m["rsi"] < 70):
         return {"action": "ENTRY", "side": "LONG", "price": price,
@@ -284,7 +296,8 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
                 "sl": price + 1.5 * last_5m["atr"], "tp": price - 3.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "ترند"}
 
-    breakout_vol = last_5m["volume"] > 2.5 * last_5m["vol_ma"]
+    # 2. استراتيجية اقتناص الفرص (اختراق الزخم - تم زيادة الحساسية)
+    breakout_vol = last_5m["volume"] > 2.0 * last_5m["vol_ma"] # خفضنا الشرط من 2.5 إلى 2.0
     if (price > last_5m["highest_high_20"] and breakout_vol and 50 < last_5m["rsi"] < 80):
         return {"action": "ENTRY", "side": "LONG", "price": price,
                 "sl": price - 1.0 * last_5m["atr"], "tp": price + 2.0 * last_5m["atr"], 
@@ -294,6 +307,20 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
                 "sl": price + 1.0 * last_5m["atr"], "tp": price - 2.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "اختراق ⚡"}
+
+    # 3. استراتيجية الزخم السريع (MACD Cross)
+    macd_cross_up   = prev_5m["macd_line"] <= prev_5m["macd_sig"] and last_5m["macd_line"] > last_5m["macd_sig"]
+    macd_cross_down = prev_5m["macd_line"] >= prev_5m["macd_sig"] and last_5m["macd_line"] < last_5m["macd_sig"]
+
+    if (macd_cross_up and trend_1h_up and vol_ok and 45 < last_5m["rsi"] < 70):
+        return {"action": "ENTRY", "side": "LONG", "price": price,
+                "sl": price - 1.2 * last_5m["atr"], "tp": price + 2.5 * last_5m["atr"], 
+                "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "زخم MACD 🚀"}
+
+    if (macd_cross_down and trend_1h_down and vol_ok and 30 < last_5m["rsi"] < 55):
+        return {"action": "ENTRY", "side": "SHORT", "price": price,
+                "sl": price + 1.2 * last_5m["atr"], "tp": price - 2.5 * last_5m["atr"], 
+                "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "زخم MACD 🚀"}
 
     return None
 
@@ -362,7 +389,7 @@ def scan_symbol(exchange, symbol):
 # 6. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting Advanced Opportunities Bot...", flush=True)
+    print("[INIT] Starting 3-Strategy Bot...", flush=True)
     
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
@@ -373,11 +400,12 @@ def trading_loop():
     })
     exchange.load_markets()
 
-    send(f"🚀 <b>تم تشغيل بوت اقتناص الفرص (V3) - نظام منع الإزعاج</b>\n"
+    send(f"🚀 <b>تم تشغيل بوت اقتناص الفرص (V4)</b>\n"
          f"➖➖➖➖➖➖➖➖\n"
-         f"📈 <b>استراتيجية الترند:</b> مفعلة\n"
-         f"⚡ <b>استراتيجية الاختراق:</b> مفعلة\n"
-         f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f} (تهدئة {WHALE_COOLDOWN//60} دقيقة)\n"
+         f"📈 <b>الاستراتيجية 1:</b> تداول الترند\n"
+         f"⚡ <b>الاستراتيجية 2:</b> الاختراقات\n"
+         f"🚀 <b>الاستراتيجية 3:</b> الزخم (MACD)\n"
+         f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f}\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
 
     while True:
