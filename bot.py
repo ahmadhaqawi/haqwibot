@@ -59,23 +59,65 @@ def send(msg):
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
-def msg_entry(sym, side, price, sl, tp, rsi):
-    ar_side = "شراء" if side == "LONG" else "بيع"
-    emoji = "🟢" if side == "LONG" else "🔴"
+# دالة تحليل تدفق السيولة والصفقات العالية
+def analyze_market_flow(exchange, symbol):
+    try:
+        # جلب آخر 500 صفقة
+        trades = exchange.fetch_trades(symbol, limit=500)
+        if not trades: return "غير متاح"
+        
+        buy_vol = sum(t['amount'] for t in trades if t['side'] == 'buy')
+        sell_vol = sum(t['amount'] for t in trades if t['side'] == 'sell')
+        total_vol = buy_vol + sell_vol
+        
+        buy_ratio = (buy_vol / total_vol) * 100 if total_vol > 0 else 50
+        
+        if buy_ratio >= 60:
+            flow_text = f"🟢 تدفق سيولة شراء قوي ({buy_ratio:.0f}%)"
+        elif buy_ratio <= 40:
+            flow_text = f"🔴 تدفق سيولة بيع قوي ({100-buy_ratio:.0f}%)"
+        else:
+            flow_text = f"⚖️ تدفق سيولة متوازن (شراء {buy_ratio:.0f}% | بيع {100-buy_ratio:.0f}%)"
+
+        # كشف الصفقات العالية (الحيتان)
+        max_trade = max(trades, key=lambda t: t['cost'])
+        max_trade_usdt = max_trade['cost']
+        
+        whale_text = ""
+        if max_trade_usdt > 50000: # إذا كانت الصفقة أكبر من 50 ألف دولار
+            whale_text = f"\n🐋 <b>صفقة حيتان:</b> <code>${max_trade_usdt:,.0f}</code>"
+            
+        return flow_text + whale_text
+    except Exception as e:
+        print(f"[FLOW ERROR] {symbol}: {e}")
+        return "تعذر جلب البيانات"
+
+def msg_entry(sym, side, price, sl, tp, rsi, flow_data):
+    if side == "LONG":
+        title = "🟢 <b>إشارة صفقة شراء (LONG)</b>"
+    else:
+        title = "🔴 <b>إشارة صفقة بيع (SHORT)</b>"
+        
     risk = abs(price - sl) / price * 100
     reward = abs(tp - price) / price * 100
     
-    return (f"{emoji} <b>إشارة دخول {ar_side}</b>\n"
+    return (f"{title}\n"
             f"➖➖➖➖➖➖➖➖\n"
             f"🪙 الزوج: <code>{sym}</code>\n"
             f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
-            f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
-            f"🎯 هدف الربح: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
+            f"🛑 وقف الخسارة (SL): <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
+            f"🎯 هدف الربح (TP): <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
             f"📊 مؤشر RSI: <code>{rsi:.1f}</code>\n"
-            f"⚖️ الربح للخسارة: <code>1:{reward/risk:.1f}</code>")
+            f"⚖️ الربح للخسارة: <code>1:{reward/risk:.1f}</code>\n"
+            f"➖➖➖➖➖➖➖➖\n"
+            f"{flow_data}")
 
 def msg_exit(sym, side, price, entry, reason, pnl_pct):
-    ar_side = "شراء" if side == "LONG" else "بيع"
+    if side == "LONG":
+        title = "⚪ <b>إغلاق صفقة شراء (LONG)</b>"
+    else:
+        title = "⚪ <b>إغلاق صفقة بيع (SHORT)</b>"
+        
     status = "ربح ✅" if pnl_pct >= 0 else "خسارة ❌"
     
     reasons_ar = {
@@ -85,7 +127,7 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct):
     }
     ar_reason = reasons_ar.get(reason, reason)
 
-    return (f"⚪ <b>إغلاق صفقة {ar_side}</b>\n"
+    return (f"{title}\n"
             f"➖➖➖➖➖➖➖➖\n"
             f"🪙 الزوج: <code>{sym}</code>\n"
             f"📥 سعر الدخول: <code>{fmt(entry)}</code>\n"
@@ -163,30 +205,25 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
     return None
 
 # ==========================================
-# 4. دالة الفحص الرئيسية (تعمل بـ ccxt)
+# 4. دالة الفحص الرئيسية
 # ==========================================
 def scan_symbol(exchange, symbol):
     try:
-        # جلب البيانات
         ohlcv_5m = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=300)
         ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=300)
         
         if len(ohlcv_5m) < 210 or len(ohlcv_1h) < 200:
             return
 
-        # تحويلها إلى DataFrames
         df_5m = pd.DataFrame(ohlcv_5m, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-        # إضافة المؤشرات
         df_5m = add_indicators(df_5m)
         df_1h = add_indicators(df_1h)
 
-        # تحديد اتجاه السوق من فريم الساعة
         last_1h = df_1h.iloc[-2]
         htf_trend = "UP" if last_1h["close"] > last_1h["ema200"] else "DOWN"
 
-        # منع تكرار نفس الشمعة
         current_candle_ts = int(df_5m.iloc[-2]["timestamp"])
         if state[symbol]["last_candle_ts"] == current_candle_ts:
             return
@@ -201,7 +238,6 @@ def scan_symbol(exchange, symbol):
 
         if not signal: return
 
-        # إدارة الخسارة اليومية
         today = datetime.now(timezone.utc).date()
         if daily_pnl["date"] != today:
             daily_pnl["value"] = 0.0
@@ -211,7 +247,11 @@ def scan_symbol(exchange, symbol):
 
         if signal["action"] == "ENTRY":
             state[symbol].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
-            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"]))
+            
+            # جلب تدفق السيولة فقط عند وجود إشارة (لتخفيف الضغط على السيرفر)
+            flow_data = analyze_market_flow(exchange, symbol)
+            
+            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], flow_data))
 
         elif signal["action"] == "EXIT":
             pnl = (signal["price"] - entry) / entry * 100
@@ -242,6 +282,7 @@ def trading_loop():
          f"🪙 الأزواج المراقبة: <code>{', '.join(SYMBOLS)}</code>\n"
          f"🧠 الاستراتيجية: تقاطع EMA + RSI + MACD\n"
          f"📈 فلتر الاتجاه: EMA 200 (فريم الساعة)\n"
+         f"🐋 مراقبة الحيتان وتدفق السيولة: <b>مفعلة</b>\n"
          f"💰 إدارة المخاطر: {RISK_PCT}% لكل صفقة\n"
          f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%")
 
@@ -249,7 +290,7 @@ def trading_loop():
         try:
             for sym in SYMBOLS:
                 scan_symbol(exchange, sym)
-                time.sleep(2) # تأخير بسيط بين الأزواج
+                time.sleep(2)
         except Exception as e:
             print(f"[FATAL] Loop error: {e}", flush=True)
         
