@@ -26,14 +26,15 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# قمنا بتعديل بعض الأسماء لتتوافق مع OKX (مثل MATIC إلى POL، وRNDR إلى RENDER)
 TOP_50_SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
     "ADA/USDT", "AVAX/USDT", "DOGE/USDT", "TRX/USDT", "DOT/USDT",
-    "LINK/USDT", "MATIC/USDT", "TON/USDT", "SHIB/USDT", "LTC/USDT",
+    "LINK/USDT", "POL/USDT", "TON/USDT", "SHIB/USDT", "LTC/USDT",
     "BCH/USDT", "NEAR/USDT", "UNI/USDT", "ICP/USDT", "APT/USDT",
     "SUI/USDT", "FIL/USDT", "ARB/USDT", "OP/USDT", "IMX/USDT",
-    "INJ/USDT", "RNDR/USDT", "HBAR/USDT", "ATOM/USDT", "STX/USDT",
-    "VET/USDT", "MNT/USDT", "GRT/USDT", "FTM/USDT", "THETA/USDT",
+    "INJ/USDT", "RENDER/USDT", "HBAR/USDT", "ATOM/USDT", "STX/USDT",
+    "VET/USDT", "MNT/USDT", "GRT/USDT", "S/USDT", "THETA/USDT",
     "LDO/USDT", "RUNE/USDT", "ALGO/USDT", "SEI/USDT", "QNT/USDT",
     "EGLD/USDT", "AAVE/USDT", "FLOW/USDT", "CHZ/USDT", "SAND/USDT",
     "MANA/USDT", "AXS/USDT", "SNX/USDT", "KAVA/USDT", "FET/USDT"
@@ -97,7 +98,6 @@ def analyze_market_flow(exchange, symbol):
             
         return flow_text + whale_text
     except Exception as e:
-        print(f"[FLOW ERROR] {symbol}: {e}")
         return "تعذر جلب البيانات"
 
 def msg_entry(sym, side, price, sl, tp, rsi, flow_data):
@@ -202,6 +202,10 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
 # ==========================================
 def scan_symbol(exchange, symbol):
     try:
+        # تخطي العملة إذا لم تكن مدرجة في منصة OKX
+        if symbol not in exchange.markets:
+            return
+
         if symbol not in state:
             state[symbol] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None}
             
@@ -266,6 +270,10 @@ def scan_symbol(exchange, symbol):
 def track_whales(exchange):
     for sym in TOP_WHALE_SYMBOLS:
         try:
+            # تخطي العملة إذا لم تكن مدرجة
+            if sym not in exchange.markets:
+                continue
+
             trades = exchange.fetch_trades(sym, limit=50)
             if not trades: continue
             
@@ -290,7 +298,7 @@ def track_whales(exchange):
                     time.sleep(1) 
                     
         except Exception as e:
-            print(f"[WHALE ERROR] {sym}: {e}", flush=True)
+            pass # تجاهل الأخطاء في صياد الحيتان بصمت
 
 def whale_loop(exchange):
     while True:
@@ -302,10 +310,13 @@ def whale_loop(exchange):
 # ==========================================
 def trading_loop():
     print("[INIT] Starting bot with OKX...", flush=True)
-    # تم التعديل هنا للاتصال بمنصة OKX لتجاوز حظر Binance
     exchange = ccxt.okx({
         'enableRateLimit': True
     })
+    
+    # تحميل قائمة العملات المتاحة في المنصة لتفادي الأخطاء
+    print("[INIT] Loading markets from OKX...", flush=True)
+    exchange.load_markets()
 
     send("🚀 <b>تم تشغيل بوت التداول (نظام OKX)</b>\n"
          "➖➖➖➖➖➖➖➖\n"
