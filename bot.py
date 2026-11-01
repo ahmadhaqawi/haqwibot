@@ -29,11 +29,9 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# --- إعدادات مراقبة الصفقات متعددة المنصات ---
 WEBSOCKET_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "100000")) 
 
-# --- إعدادات استراتيجية التداول (OKX) ---
 FUTURES_SYMBOLS = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", 
     "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
@@ -68,142 +66,47 @@ def send(msg):
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
-def clean_symbol(sym):
-    return sym.split(':')[0]
+def msg_entry(sym, side, price, sl, tp, rsi, adx):
+    if side == "LONG":
+        title = "🟢 <b>إشارة لونق (LONG) - فيوتشر</b>"
+        liq = price * (1 - (1/LEVERAGE) + 0.005) 
+    else:
+        title = "🔴 <b>إشارة شورت (SHORT) - فيوتشر</b>"
+        liq = price * (1 + (1/LEVERAGE) - 0.005)
+        
+    risk = abs(price - sl) / price * 100
+    reward = abs(tp - price) / price * 100
+    
+    return (f"{title}\n"
+            f"➖➖➖➖➖➖➖➖\n"
+            f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
+            f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
+            f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
+            f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
+            f"🎯 هدف الربح: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
+            f"📊 RSI: <code>{rsi:.1f}</code> | ADX: <code>{adx:.1f}</code>\n"
+            f"➖➖➖➖➖➖➖➖\n"
+            f"💡 <i>بمجرد ربح 1%، انقل وقف الخسارة للدخول.</i>")
+
+def msg_exit(sym, side, price, entry, reason, pnl_pct):
+    title = "⚪ <b>إغلاق صفقة لونق</b>" if side == "LONG" else "⚪ <b>إغلاق صفقة شورت</b>"
+    status = "ربح ✅" if pnl_pct >= 0 else "خسارة ❌"
+    reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯", "EMA Cross": "كسر المتوسط 📉"}
+    ar_reason = reasons_ar.get(reason, reason)
+
+    leveraged_pnl = pnl_pct * LEVERAGE
+
+    return (f"{title}\n"
+            f"➖➖➖➖➖➖➖➖\n"
+            f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
+            f"📥 الدخول: <code>{fmt(entry)}</code>\n"
+            f"📤 الخروج: <code>{fmt(price)}</code>\n"
+            f"📊 النتيجة: <code>{pnl_pct:+.2f}%</code>\n"
+            f"🔥 <b>بالرافعة ({LEVERAGE}x):</b> <code>{leveraged_pnl:+.2f}%</code>\n"
+            f"📝 السبب: {ar_reason}")
 
 # ==========================================
-# 3. محرك مراقبة الصفقات متعدد المنصات (WebSocket)
-# ==========================================
-
-async def listen_to_binance():
-    """مراقبة صفقات منصة Binance Futures"""
-    streams = "/".join([f"{sym.lower()}@aggTrade" for sym in WEBSOCKET_SYMBOLS])
-    uri = f"wss://fstream.binance.com/stream?streams={streams}"
-    print("[WS] Connecting to Binance...", flush=True)
-    while True:
-        try:
-            async with websockets.connect(uri) as websocket:
-                print("[WS] Binance Connected.", flush=True)
-                while True:
-                    message = await websocket.recv()
-                    data = json.loads(message)
-                    if 'data' in data and data['data'].get('e') == 'aggTrade':
-                        trade = data['data']
-                        price, quantity = float(trade['p']), float(trade['q'])
-                        cost = price * quantity
-                        if cost >= WHALE_THRESHOLD_WS:
-                            side_ar = "شراء (لونق)" if trade['m'] == False else "بيع (شورت)"
-                            emoji = "🟢" if trade['m'] == False else "🔴"
-                            symbol_display = trade['s'].replace('USDT', '/USDT')
-                            
-                            # الترتيب الجديد: الزوج أولاً ثم النوع
-                            msg = (f"🐋 <b>صفقة ضخمة</b>\n"
-                                   f"➖➖➖➖➖➖➖➖\n"
-                                   f"🪙 الزوج: <code>{symbol_display}</code>\n"
-                                   f"{emoji} النوع: <b>{side_ar}</b>\n"
-                                   f"💰 القيمة: <code>${cost:,.0f}</code>\n"
-                                   f"💵 السعر: <code>{fmt(price)}</code>\n"
-                                   f"➖➖➖➖➖➖➖➖\n"
-                                   f"🏢 المنصة: <b>Binance</b>")
-                            send(msg)
-        except Exception as e:
-            print(f"[WS BINANCE ERROR] {e}. Reconnecting...", flush=True)
-            await asyncio.sleep(5)
-
-async def listen_to_okx():
-    """مراقبة صفقات منصة OKX"""
-    args = [{"channel": "trades", "instId": sym.replace("USDT", "-USDT-SWAP")} for sym in WEBSOCKET_SYMBOLS]
-    uri = "wss://ws.okx.com:8443/ws/v5/public"
-    print("[WS] Connecting to OKX...", flush=True)
-    while True:
-        try:
-            async with websockets.connect(uri) as websocket:
-                subscribe_msg = {"op": "subscribe", "args": args}
-                await websocket.send(json.dumps(subscribe_msg))
-                print("[WS] OKX Subscribed.", flush=True)
-                
-                while True:
-                    message = await websocket.recv()
-                    data = json.loads(message)
-                    if 'data' in data and data['data']:
-                        for trade in data['data']:
-                            price = float(trade['px'])
-                            size = float(trade['sz'])
-                            cost = price * size
-                            side = trade.get('side', 'buy')
-                            if cost >= WHALE_THRESHOLD_WS:
-                                side_ar = "شراء (لونق)" if side == 'buy' else "بيع (شورت)"
-                                emoji = "🟢" if side == 'buy' else "🔴"
-                                symbol_display = trade['instId'].replace("-SWAP", "").replace("-", "/")
-                                
-                                # الترتيب الجديد: الزوج أولاً ثم النوع
-                                msg = (f"🐋 <b>صفقة ضخمة</b>\n"
-                                       f"➖➖➖➖➖➖➖➖\n"
-                                       f"🪙 الزوج: <code>{symbol_display}</code>\n"
-                                       f"{emoji} النوع: <b>{side_ar}</b>\n"
-                                       f"💰 القيمة: <code>${cost:,.0f}</code>\n"
-                                       f"💵 السعر: <code>{fmt(price)}</code>\n"
-                                       f"➖➖➖➖➖➖➖➖\n"
-                                       f"🏢 المنصة: <b>OKX</b>")
-                                send(msg)
-        except Exception as e:
-            print(f"[WS OKX ERROR] {e}. Reconnecting...", flush=True)
-            await asyncio.sleep(5)
-
-async def listen_to_bybit():
-    """مراقبة صفقات منصة Bybit"""
-    args = [f"publicTrade.{sym}" for sym in WEBSOCKET_SYMBOLS]
-    uri = "wss://stream.bybit.com/v5/public/linear"
-    print("[WS] Connecting to Bybit...", flush=True)
-    while True:
-        try:
-            async with websockets.connect(uri) as websocket:
-                subscribe_msg = {"op": "subscribe", "args": args}
-                await websocket.send(json.dumps(subscribe_msg))
-                print("[WS] Bybit Subscribed.", flush=True)
-                
-                while True:
-                    message = await websocket.recv()
-                    data = json.loads(message)
-                    if 'data' in data and data['data']:
-                        for trade in data['data']:
-                            price = float(trade['p'])
-                            size = float(trade['v'])
-                            cost = price * size
-                            side = trade.get('S', 'Buy')
-                            if cost >= WHALE_THRESHOLD_WS:
-                                side_ar = "شراء (لونق)" if side == 'Buy' else "بيع (شورت)"
-                                emoji = "🟢" if side == 'Buy' else "🔴"
-                                symbol_display = trade['s'].replace('USDT', '/USDT')
-                                
-                                # الترتيب الجديد: الزوج أولاً ثم النوع
-                                msg = (f"🐋 <b>صفقة ضخمة</b>\n"
-                                       f"➖➖➖➖➖➖➖➖\n"
-                                       f"🪙 الزوج: <code>{symbol_display}</code>\n"
-                                       f"{emoji} النوع: <b>{side_ar}</b>\n"
-                                       f"💰 القيمة: <code>${cost:,.0f}</code>\n"
-                                       f"💵 السعر: <code>{fmt(price)}</code>\n"
-                                       f"➖➖➖➖➖➖➖➖\n"
-                                       f"🏢 المنصة: <b>Bybit</b>")
-                                send(msg)
-        except Exception as e:
-            print(f"[WS BYBIT ERROR] {e}. Reconnecting...", flush=True)
-            await asyncio.sleep(5)
-
-async def run_websockets():
-    """تشغيل جميع اتصالات WebSocket في نفس الوقت"""
-    await asyncio.gather(
-        listen_to_binance(),
-        listen_to_okx(),
-        listen_to_bybit()
-    )
-
-def run_websocket_loop():
-    """تشغيل حلقة WebSocket في مسار منفصل"""
-    asyncio.run(run_websockets())
-
-# ==========================================
-# 4. دوال استراتيجية التداول (OKX)
+# 3. المؤشرات الفنية المتقدمة (ADX + ATR)
 # ==========================================
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
@@ -214,12 +117,19 @@ def rsi(series, period=14):
     rs    = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    line     = ema_fast - ema_slow
-    hist     = line - ema(line, signal)
-    return line, hist
+def adx(high, low, close, period=14):
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / (atr + 1e-9))
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / (atr + 1e-9))
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)) * 100
+    return dx.ewm(alpha=1/period, adjust=False).mean()
 
 def atr(df, period=14):
     high, low, close = df["high"], df["low"], df["close"]
@@ -229,49 +139,59 @@ def atr(df, period=14):
 def add_indicators(df):
     df["ema9"]   = ema(df["close"], 9)
     df["ema21"]  = ema(df["close"], 21)
-    df["ema200"] = ema(df["close"], 200)
     df["rsi"]    = rsi(df["close"], 14)
-    _, df["macd_hist"] = macd(df["close"])
+    df["adx"]    = adx(df["high"], df["low"], df["close"], 14)
     df["atr"]    = atr(df, 14)
     df["vol_ma"] = df["volume"].rolling(20).mean()
     return df
 
-def check_signal(df, position, entry_price=None, sl=None, tp=None):
-    if len(df) < 210: return None
-    last  = df.iloc[-2]      
-    prev  = df.iloc[-3]
-    price = last["close"]
+def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
+    if len(df_5m) < 50 or len(df_1h) < 50: return None
+    
+    last_5m = df_5m.iloc[-2]      
+    prev_5m = df_5m.iloc[-3]
+    price = last_5m["close"]
 
+    # إدارة الخروج
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
-        if price <= last["ema21"]: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "EMA Cross"}
+        if price <= last_5m["ema21"]: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "EMA Cross"}
     if position == "SHORT":
         if price >= sl: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Stop Loss"}
         if price <= tp: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Take Profit"}
-        if price >= last["ema21"]: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "EMA Cross"}
+        if price >= last_5m["ema21"]: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "EMA Cross"}
 
     if position is not None: return None
 
-    cross_up   = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
-    cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
-    vol_ok     = last["volume"] > 1.2 * last["vol_ma"] 
-    macd_up    = last["macd_hist"] > 0 and last["macd_hist"] > prev["macd_hist"]
-    macd_down  = last["macd_hist"] < 0 and last["macd_hist"] < prev["macd_hist"]
+    # فلاتر الدخول
+    trend_1h_up   = df_1h.iloc[-2]["close"] > df_1h.iloc[-2]["ema21"] # فلتر اتجاه الساعة
+    trend_1h_down = df_1h.iloc[-2]["close"] < df_1h.iloc[-2]["ema21"]
+    
+    cross_up   = prev_5m["ema9"] <= prev_5m["ema21"] and last_5m["ema9"] > last_5m["ema21"]
+    cross_down = prev_5m["ema9"] >= prev_5m["ema21"] and last_5m["ema9"] < last_5m["ema21"]
+    
+    # شروط القوة (ADX > 25 يعني اتجاه قوي)
+    adx_strong = last_5m["adx"] > 25
+    vol_ok     = last_5m["volume"] > 1.2 * last_5m["vol_ma"] 
 
-    trend_up   = price > last["ema200"]
-    trend_down = price < last["ema200"]
-
-    if (cross_up and trend_up and 40 < last["rsi"] < 70 and vol_ok and macd_up):
+    # LONGS
+    if (cross_up and trend_1h_up and adx_strong and vol_ok and 40 < last_5m["rsi"] < 70):
         return {"action": "ENTRY", "side": "LONG", "price": price,
-                "sl": price - 2.0 * last["atr"], "tp": price + 4.0 * last["atr"], "rsi": last["rsi"]}
+                "sl": price - 1.5 * last_5m["atr"], "tp": price + 3.0 * last_5m["atr"], 
+                "rsi": last_5m["rsi"], "adx": last_5m["adx"]}
 
-    if (cross_down and trend_down and 30 < last["rsi"] < 60 and vol_ok and macd_down):
+    # SHORTS
+    if (cross_down and trend_1h_down and adx_strong and vol_ok and 30 < last_5m["rsi"] < 60):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
-                "sl": price + 2.0 * last["atr"], "tp": price - 4.0 * last["atr"], "rsi": last["rsi"]}
+                "sl": price + 1.5 * last_5m["atr"], "tp": price - 3.0 * last_5m["atr"], 
+                "rsi": last_5m["rsi"], "adx": last_5m["adx"]}
 
     return None
 
+# ==========================================
+# 4. الفحص الرئيسي
+# ==========================================
 def scan_symbol(exchange, symbol):
     try:
         if symbol not in exchange.markets:
@@ -280,13 +200,19 @@ def scan_symbol(exchange, symbol):
         if symbol not in state:
             state[symbol] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None}
             
-        ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=300)
-        if len(ohlcv) < 210: return
+        # جلب بيانات 5 دقائق و 1 ساعة
+        ohlcv_5m = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
+        ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=50)
+        
+        if len(ohlcv_5m) < 50 or len(ohlcv_1h) < 50: return
 
-        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df = add_indicators(df)
+        df_5m = pd.DataFrame(ohlcv_5m, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        
+        df_5m = add_indicators(df_5m)
+        df_1h = add_indicators(df_1h) # نستخدم EMA21 على الساعة كفلتر
 
-        current_candle_ts = int(df.iloc[-2]["timestamp"])
+        current_candle_ts = int(df_5m.iloc[-2]["timestamp"])
         if state[symbol]["last_candle_ts"] == current_candle_ts:
             return
         state[symbol]["last_candle_ts"] = current_candle_ts
@@ -296,7 +222,7 @@ def scan_symbol(exchange, symbol):
         sl = state[symbol]["sl"]
         tp = state[symbol]["tp"]
 
-        signal = check_signal(df, pos, entry, sl, tp)
+        signal = check_signal(df_5m, df_1h, pos, entry, sl, tp)
 
         if not signal: return
 
@@ -309,7 +235,7 @@ def scan_symbol(exchange, symbol):
 
         if signal["action"] == "ENTRY":
             state[symbol].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
-            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"]))
+            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"]))
 
         elif signal["action"] == "EXIT":
             pnl = (signal["price"] - entry) / entry * 100
@@ -317,11 +243,10 @@ def scan_symbol(exchange, symbol):
             state[symbol].update({"position": None, "entry": None, "sl": None, "tp": None})
             
             daily_pnl["value"] += (pnl * LEVERAGE) * RISK_PCT / 100
-            
             send(msg_exit(symbol, pos, signal["price"], entry, signal["reason"], pnl))
             
             if daily_pnl["value"] <= -MAX_DAILY_LOSS:
-                send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nلقد وصلت للحد الأقصى للخسارة اليومية (-{MAX_DAILY_LOSS}%).")
+                send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nوصلت للحد الأقصى للخسارة اليومية.")
 
     except Exception as e:
         print(f"[ERROR] Scan {symbol}: {e}", flush=True)
@@ -330,26 +255,24 @@ def scan_symbol(exchange, symbol):
 # 5. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting Multi-Exchange Bot...", flush=True)
+    print("[INIT] Starting Advanced Futures Bot...", flush=True)
     
-    # تشغيل مراقب الصفقات متعدد المنصات في الخلفية
+    # تشغيل مراقب الصفقات
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
 
-    # إعداد منصة OKX لاستراتيجية التداول
     exchange = ccxt.okx({
         'enableRateLimit': True,
         'options': {'defaultType': 'swap'} 
     })
     exchange.load_markets()
 
-    send(f"🚀 <b>تم تشغيل البوت (استراتيجية + مراقب متعدد المنصات)</b>\n"
+    send(f"🚀 <b>تم تشغيل بوت التداول الاحترافي (V2)</b>\n"
          f"➖➖➖➖➖➖➖➖\n"
-         f"🪙 استراتيجية التداول: <b>{len(FUTURES_SYMBOLS)} عملة (OKX)</b>\n"
-         f"⏱️ الفريم الزمني: <b>5 دقائق</b>\n"
-         f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
-         f"👁️ مراقب الصفقات (Binance + OKX + Bybit)\n"
-         f"💰 حد تنبيه الصفقات: <b>${WHALE_THRESHOLD_WS:,.0f}</b>")
+         f"🛡️ <b>فلتر ADX:</b> مفعل (تجنب السوق العرضي)\n"
+         f"📈 <b>فلتر الاتجاه:</b> فريم الساعة (1H)\n"
+         f"⏱️ <b>فريم الدخول:</b> 5 دقائق\n"
+         f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
 
     while True:
         try:
