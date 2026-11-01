@@ -26,7 +26,7 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# قائمة أفضل 50 عملة من حيث السيولة (ثابتة لتجنب أخطاء الاتصال)
+# قائمة أفضل 50 عملة من حيث السيولة
 TOP_50_SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
     "ADA/USDT", "AVAX/USDT", "DOGE/USDT", "TRX/USDT", "DOT/USDT",
@@ -45,7 +45,6 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 
-# حالة البوت لكل زوج
 state = {}
 daily_pnl = {"value": 0.0, "date": datetime.now(timezone.utc).date()}
 
@@ -68,7 +67,6 @@ def send(msg):
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
-# دالة تحليل تدفق السيولة والصفقات العالية
 def analyze_market_flow(exchange, symbol):
     try:
         trades = exchange.fetch_trades(symbol, limit=500)
@@ -182,6 +180,7 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
     prev  = df.iloc[-3]
     price = last["close"]
 
+    # إدارة الخروج (لم نغيرها)
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
@@ -193,19 +192,21 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
 
     if position is not None: return None
 
+    # شروط الدخول
     cross_up   = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
     cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
-    vol_ok    = last["volume"] > 1.2 * last["vol_ma"]
-    macd_up   = last["macd_hist"] > 0 and last["macd_hist"] > prev["macd_hist"]
-    macd_down = last["macd_hist"] < 0 and last["macd_hist"] < prev["macd_hist"]
-
-    if (cross_up and htf_trend == "UP" and 40 < last["rsi"] < 70 and vol_ok and macd_up):
+    
+    # ==========================================
+    # ⚠️ وضع الاختبار: تم إزالة الشروط الصارمة مؤقتاً
+    # ==========================================
+    if (cross_up and htf_trend == "UP"):
         return {"action": "ENTRY", "side": "LONG", "price": price,
                 "sl": price - 1.5 * last["atr"], "tp": price + 3.0 * last["atr"], "rsi": last["rsi"]}
 
-    if (cross_down and htf_trend == "DOWN" and 30 < last["rsi"] < 60 and vol_ok and macd_down):
+    if (cross_down and htf_trend == "DOWN"):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
                 "sl": price + 1.5 * last["atr"], "tp": price - 3.0 * last["atr"], "rsi": last["rsi"]}
+    # ==========================================
 
     return None
 
@@ -282,20 +283,16 @@ def trading_loop():
         'options': {'defaultType': 'spot'}
     })
 
-    send("🚀 <b>تم تشغيل بوت التداول بنجاح</b>\n"
+    send("🚀 <b>تم تشغيل بوت التداول (وضع الاختبار)</b>\n"
          "➖➖➖➖➖➖➖➖\n"
          f"🪙 عدد العملات المراقبة: <b>{len(TOP_50_SYMBOLS)} عملة</b>\n"
-         f"🧠 الاستراتيجية: تقاطع EMA + RSI + MACD\n"
-         f"📈 فلتر الاتجاه: EMA 200 (فريم الساعة)\n"
-         f"🐋 مراقبة الحيتان: <b>مفعلة</b>\n"
-         f"💰 إدارة المخاطر: {RISK_PCT}% لكل صفقة\n"
-         f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%")
+         "⚠️ <b>تنبيه:</b> البوت في وضع تجربة الشروط، سترسل إشارات كثيرة.")
 
     while True:
         try:
             for sym in TOP_50_SYMBOLS:
                 scan_symbol(exchange, sym)
-                time.sleep(1) # تأخير ثانية بين كل عملة
+                time.sleep(1) 
                 
         except Exception as e:
             print(f"[FATAL] Loop error: {e}", flush=True)
