@@ -26,8 +26,19 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# تم تعديلها لمراقبة أفضل 50 عملة تلقائياً
-TOP_COINS_COUNT = int(os.getenv("TOP_COINS_COUNT", "50"))
+# قائمة أفضل 50 عملة من حيث السيولة (ثابتة لتجنب أخطاء الاتصال)
+TOP_50_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+    "ADA/USDT", "AVAX/USDT", "DOGE/USDT", "TRX/USDT", "DOT/USDT",
+    "LINK/USDT", "MATIC/USDT", "TON/USDT", "SHIB/USDT", "LTC/USDT",
+    "BCH/USDT", "NEAR/USDT", "UNI/USDT", "ICP/USDT", "APT/USDT",
+    "SUI/USDT", "FIL/USDT", "ARB/USDT", "OP/USDT", "IMX/USDT",
+    "INJ/USDT", "RNDR/USDT", "HBAR/USDT", "ATOM/USDT", "STX/USDT",
+    "VET/USDT", "MNT/USDT", "GRT/USDT", "FTM/USDT", "THETA/USDT",
+    "LDO/USDT", "RUNE/USDT", "ALGO/USDT", "SEI/USDT", "QNT/USDT",
+    "EGLD/USDT", "AAVE/USDT", "FLOW/USDT", "CHZ/USDT", "SAND/USDT",
+    "MANA/USDT", "AXS/USDT", "SNX/USDT", "KAVA/USDT", "FET/USDT"
+]
 
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
@@ -261,19 +272,6 @@ def scan_symbol(exchange, symbol):
     except Exception as e:
         print(f"[ERROR] Scan {symbol}: {e}", flush=True)
 
-# دالة جلب أفضل العملات من حيث السيولة
-def get_top_symbols(exchange, count=50):
-    try:
-        print("[INIT] Fetching top volume coins...", flush=True)
-        tickers = exchange.fetch_tickers()
-        usdt_pairs = {k: v for k, v in tickers.items() if k.endswith('/USDT')}
-        sorted_pairs = sorted(usdt_pairs.items(), key=lambda x: float(x[1]['quoteVolume'] or 0), reverse=True)
-        top = [p[0] for p in sorted_pairs[:count]]
-        return top
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch top symbols: {e}")
-        return ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-
 # ==========================================
 # 5. التشغيل الرئيسي
 # ==========================================
@@ -284,30 +282,20 @@ def trading_loop():
         'options': {'defaultType': 'spot'}
     })
 
-    active_symbols = get_top_symbols(exchange, TOP_COINS_COUNT)
-    
     send("🚀 <b>تم تشغيل بوت التداول بنجاح</b>\n"
          "➖➖➖➖➖➖➖➖\n"
-         f"🪙 عدد العملات المراقبة: <b>{len(active_symbols)} عملة</b> (الأعلى سيولة)\n"
+         f"🪙 عدد العملات المراقبة: <b>{len(TOP_50_SYMBOLS)} عملة</b>\n"
          f"🧠 الاستراتيجية: تقاطع EMA + RSI + MACD\n"
          f"📈 فلتر الاتجاه: EMA 200 (فريم الساعة)\n"
          f"🐋 مراقبة الحيتان: <b>مفعلة</b>\n"
          f"💰 إدارة المخاطر: {RISK_PCT}% لكل صفقة\n"
          f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%")
 
-    last_symbol_update = time.time()
-
     while True:
         try:
-            if time.time() - last_symbol_update > 3600:
-                active_symbols = get_top_symbols(exchange, TOP_COINS_COUNT)
-                last_symbol_update = time.time()
-                print("[UPDATE] Refreshed top symbols list.", flush=True)
-
-            for sym in active_symbols:
+            for sym in TOP_50_SYMBOLS:
                 scan_symbol(exchange, sym)
-                # تأخير ثانية واحدة بين كل عملة لتجنب حظر Binance API
-                time.sleep(1) 
+                time.sleep(1) # تأخير ثانية بين كل عملة
                 
         except Exception as e:
             print(f"[FATAL] Loop error: {e}", flush=True)
