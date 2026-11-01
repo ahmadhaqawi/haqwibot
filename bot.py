@@ -1,217 +1,277 @@
 import os
-import sys
-import threading
 import time
+import threading
+import traceback
 from datetime import datetime, timezone
-
-import ccxt
 import pandas as pd
 import requests
 from flask import Flask
+from binance.client import Client
+from binance import ThreadedWebsocketManager
 
+# ==========================================
+# 1. الإعدادات والمتغيرات (Config)
+# ==========================================
+TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
+RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
+
+# حالة البوت لكل زوج
+state = {
+    sym: {"position": None, "entry": None, "sl": None, "tp": None,
+          "htf_trend": None, "candles_5m": [], "candles_1h": []}
+    for sym in SYMBOLS
+}
+daily_pnl = {"value": 0.0, "date": datetime.now(timezone.utc).date()}
+lock = threading.Lock()
+
+# ==========================================
+# 2. سيرفر Flask (لإبقاء الخدمة مستيقظة على Render)
+# ==========================================
 app = Flask(__name__)
-
 
 @app.route("/")
 @app.route("/healthz")
-def health_check():
-    return {"status": "ok", "service": "trading_bot_active"}, 200
-
+def health():
+    return {"status": "ok", "service": "bot_active"}, 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), use_reloader=False)
 
+# ==========================================
+# 3. إرسال رسائل تيليجرام
+# ==========================================
+def send(msg):
+    if not TOKEN or not CHAT_ID: 
+        print("[TG ERROR] Token or Chat ID missing.")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
+            timeout=10)
+    except Exception as e:
+        print(f"[TG ERROR] {e}")
 
-# ---------- Config from env ----------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+def fmt(p): 
+    return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
-SYMBOLS = [s.strip() for s in os.getenv(
-    "SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+def msg_entry(sym, side, price, sl, tp, rsi):
+    ar_side = "شراء" if side == "LONG" else "بيع"
+    emoji = "🟢" if side == "LONG" else "🔴"
+    risk = abs(price - sl) / price * 100
+    reward = abs(tp - price) / price * 100
+    
+    return (f"{emoji} <b>إشارة دخول {ar_side}</b>\n"
+            f"➖➖➖➖➖➖➖➖\n"
+            f"🪙 الزوج: <code>{sym}</code>\n"
+            f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
+            f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
+            f"🎯 هدف الربح: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
+            f"📊 مؤشر RSI: <code>{rsi:.1f}</code>\n"
+            f"⚖️ الربح للخسارة: <code>1:{reward/risk:.1f}</code>")
 
-RSI_LONG_ENTRY = float(os.getenv("RSI_LONG_ENTRY", "55"))
-RSI_LONG_EXIT = float(os.getenv("RSI_LONG_EXIT", "50"))
-RSI_SHORT_ENTRY = float(os.getenv("RSI_SHORT_ENTRY", "45"))
-RSI_SHORT_EXIT = float(os.getenv("RSI_SHORT_EXIT", "50"))
-
-SL_PCT = float(os.getenv("SL_PCT", "0.02"))   # 2%
-TP_PCT = float(os.getenv("TP_PCT", "0.04"))   # 4%
-
-
-def log(level, msg):
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{ts}] [{level}] {msg}", flush=True)
-
-
-# ---------- Telegram ----------
-def send_telegram_alert(message: str, disable_preview: bool = True) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("ERROR", "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing.")
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": disable_preview,
+def msg_exit(sym, side, price, entry, reason, pnl_pct):
+    ar_side = "شراء" if side == "LONG" else "بيع"
+    status = "ربح ✅" if pnl_pct >= 0 else "خسارة ❌"
+    
+    reasons_ar = {
+        "Stop Loss": "ضرب وقف الخسارة 🛑",
+        "Take Profit": "تحقق هدف الربح 🎯",
+        "EMA Cross": "كسر المتوسط المتحرك 📉",
     }
-    for attempt in range(1, 4):
-        try:
-            res = requests.post(url, json=payload, timeout=10)
-            data = res.json()
-            if not data.get("ok"):
-                log("ERROR", f"Telegram API: {data}")
-                return False
-            log("INFO", "Telegram alert delivered.")
-            return True
-        except Exception as e:
-            log("EXCEPTION", f"Telegram send failed (try {attempt}): {e}")
-            time.sleep(2)
-    return False
+    ar_reason = reasons_ar.get(reason, reason)
 
+    return (f"⚪ <b>إغلاق صفقة {ar_side}</b>\n"
+            f"➖➖➖➖➖➖➖➖\n"
+            f"🪙 الزوج: <code>{sym}</code>\n"
+            f"📥 سعر الدخول: <code>{fmt(entry)}</code>\n"
+            f"📤 سعر الخروج: <code>{fmt(price)}</code>\n"
+            f"📊 النتيجة: <code>{pnl_pct:+.2f}%</code> ({status})\n"
+            f"📝 السبب: {ar_reason}")
 
-# ---------- RSI (Wilder's) ----------
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+# ==========================================
+# 4. المؤشرات الفنية والاستراتيجية
+# ==========================================
+def ema(series, period): return series.ewm(span=period, adjust=False).mean()
+
+def rsi(series, period=14):
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / (avg_loss + 1e-9)
+    gain  = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss  = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
+    rs    = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    line     = ema_fast - ema_slow
+    hist     = line - ema(line, signal)
+    return line, hist
 
-# ---------- State ----------
-positions = {sym: None for sym in SYMBOLS}          # None | 'LONG' | 'SHORT'
-last_candle_ts = {sym: None for sym in SYMBOLS}      # last processed closed candle
-entry_info = {}                                      # sym -> {entry, sl, tp}
+def atr(df, period=14):
+    high, low, close = df["high"], df["low"], df["close"]
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
+def add_indicators(df):
+    df["ema9"]   = ema(df["close"], 9)
+    df["ema21"]  = ema(df["close"], 21)
+    df["ema200"] = ema(df["close"], 200)
+    df["rsi"]    = rsi(df["close"], 14)
+    _, df["macd_hist"] = macd(df["close"])
+    df["atr"]    = atr(df, 14)
+    df["vol_ma"] = df["volume"].rolling(20).mean()
+    return df
 
-def fmt_price(p: float) -> str:
-    if p >= 1000:
-        return f"{p:,.2f}"
-    if p >= 1:
-        return f"{p:.4f}"
-    return f"{p:.6f}"
+def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
+    if len(df) < 210: return None
+    last  = df.iloc[-2]      
+    prev  = df.iloc[-3]
+    price = last["close"]
 
+    # إدارة الخروج
+    if position == "LONG":
+        if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
+        if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
+        if price <= last["ema21"]: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "EMA Cross"}
+    if position == "SHORT":
+        if price >= sl: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Stop Loss"}
+        if price <= tp: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Take Profit"}
+        if price >= last["ema21"]: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "EMA Cross"}
 
-def build_signal_message(symbol, side, action, price, rsi, tf):
-    emoji = {"LONG": "🟢", "SHORT": "🔴"}
-    action_ar = "دخول" if action == "ENTRY" else "خروج"
-    lines = [
-        f"{emoji.get(side, '⚪')} <b>{side} {action_ar}</b>",
-        f"الزوج: <code>{symbol}</code>",
-        f"الفريم: <code>{tf}</code>",
-        f"السعر: <code>{fmt_price(price)}</code>",
-        f"RSI: <code>{rsi:.2f}</code>",
-    ]
-    if action == "ENTRY":
-        if side == "LONG":
-            sl = price * (1 - SL_PCT)
-            tp = price * (1 + TP_PCT)
-        else:
-            sl = price * (1 + SL_PCT)
-            tp = price * (1 - TP_PCT)
-        lines.append(f"SL: <code>{fmt_price(sl)}</code>")
-        lines.append(f"TP: <code>{fmt_price(tp)}</code>")
-        entry_info[symbol] = {"entry": price, "sl": sl, "tp": tp}
-    else:
-        e = entry_info.pop(symbol, None)
-        if e:
-            pnl = (price - e["entry"]) / e["entry"] * 100
-            if side == "SHORT":
-                pnl = -pnl
-            lines.append(f"PnL: <code>{pnl:+.2f}%</code>")
-    return "\n".join(lines)
+    if position is not None: return None
 
+    # شروط الدخول
+    cross_up   = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
+    cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
+    vol_ok    = last["volume"] > 1.2 * last["vol_ma"]
+    macd_up   = last["macd_hist"] > 0 and last["macd_hist"] > prev["macd_hist"]
+    macd_down = last["macd_hist"] < 0 and last["macd_hist"] < prev["macd_hist"]
 
-def scan_symbol(exchange, symbol):
+    if (cross_up and htf_trend == "UP" and 40 < last["rsi"] < 70 and vol_ok and macd_up):
+        return {"action": "ENTRY", "side": "LONG", "price": price,
+                "sl": price - 1.5 * last["atr"], "tp": price + 3.0 * last["atr"], "rsi": last["rsi"]}
+
+    if (cross_down and htf_trend == "DOWN" and 30 < last["rsi"] < 60 and vol_ok and macd_down):
+        return {"action": "ENTRY", "side": "SHORT", "price": price,
+                "sl": price + 1.5 * last["atr"], "tp": price - 3.0 * last["atr"], "rsi": last["rsi"]}
+
+    return None
+
+# ==========================================
+# 5. جلب البيانات ومعالجة الشموع اللحظية
+# ==========================================
+client = Client()
+
+def fetch_initial(sym):
+    k5  = client.get_klines(symbol=sym, interval="5m",  limit=300)
+    k1h = client.get_klines(symbol=sym, interval="1h",  limit=300)
+    def to_df(ks):
+        return pd.DataFrame(ks, columns=["t","open","high","low","close","volume","ct","qv","n","tb","tq","i"]).astype({"open":float,"high":float,"low":float,"close":float,"volume":float})
+    with lock:
+        state[sym]["candles_5m"] = to_df(k5).to_dict("records")
+        state[sym]["candles_1h"] = to_df(k1h).to_dict("records")
+
+def update_trend(sym):
+    with lock:
+        df = pd.DataFrame(state[sym]["candles_1h"])
+    if len(df) < 200: return
+    df = add_indicators(df)
+    last = df.iloc[-2]
+    trend = "UP" if last["close"] > last["ema200"] else "DOWN"
+    with lock:
+        state[sym]["htf_trend"] = trend
+
+def on_kline(msg):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=RSI_PERIOD + 50)
-        if not ohlcv or len(ohlcv) < RSI_PERIOD + 5:
-            log("WARN", f"Insufficient candles for {symbol}")
-            return
+        if msg["k"]["x"] is not True: return
+        sym = msg["s"]
+        k = msg["k"]
+        candle = {"t": k["t"], "open": float(k["o"]), "high": float(k["h"]), "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["v"])}
+        with lock:
+            state[sym]["candles_5m"].append(candle)
+            if len(state[sym]["candles_5m"]) > 500:
+                state[sym]["candles_5m"] = state[sym]["candles_5m"][-500:]
+            df = pd.DataFrame(state[sym]["candles_5m"])
+            pos, entry, sl, tp, trend = state[sym]["position"], state[sym]["entry"], state[sym]["sl"], state[sym]["tp"], state[sym]["htf_trend"]
 
-        df = pd.DataFrame(
-            ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
-        )
-        df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
+        df = add_indicators(df)
+        signal = check_signal(df, trend, pos, entry, sl, tp)
 
-        # استخدم آخر شمعة مغلقة (iloc[-2])
-        closed = df.iloc[-2]
-        closed_ts = int(closed["timestamp"])
-        close_price = float(closed["close"])
-        rsi_val = float(closed["rsi"])
-        prev_rsi = float(df["rsi"].iloc[-3]) if len(df) >= 3 else rsi_val
+        if not signal: return
 
-        # تجنب معالجة نفس الشمعة مرتين
-        if last_candle_ts[symbol] == closed_ts:
-            return
-        last_candle_ts[symbol] = closed_ts
+        today = datetime.now(timezone.utc).date()
+        if daily_pnl["date"] != today:
+            daily_pnl["value"] = 0.0
+            daily_pnl["date"] = today
+        if daily_pnl["value"] <= -MAX_DAILY_LOSS:
+            return # تم إرسال التنبيه مسبقاً
 
-        pos = positions[symbol]
-        log("SCAN",
-            f"{symbol} | close={close_price} | RSI={rsi_val:.2f} (prev={prev_rsi:.2f}) | pos={pos}")
+        if signal["action"] == "ENTRY":
+            with lock:
+                state[sym].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
+            send(msg_entry(sym, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"]))
 
-        if pos is None:
-            # LONG entry: تقاطع RSI صاعدًا فوق 55
-            if prev_rsi < RSI_LONG_ENTRY <= rsi_val:
-                positions[symbol] = "LONG"
-                send_telegram_alert(build_signal_message(
-                    symbol, "LONG", "ENTRY", close_price, rsi_val, TIMEFRAME))
-            # SHORT entry: تقاطع RSI هابطًا تحت 45
-            elif prev_rsi > RSI_SHORT_ENTRY >= rsi_val:
-                positions[symbol] = "SHORT"
-                send_telegram_alert(build_signal_message(
-                    symbol, "SHORT", "ENTRY", close_price, rsi_val, TIMEFRAME))
-        elif pos == "LONG":
-            if rsi_val <= RSI_LONG_EXIT:
-                positions[symbol] = None
-                send_telegram_alert(build_signal_message(
-                    symbol, "LONG", "EXIT", close_price, rsi_val, TIMEFRAME))
-        elif pos == "SHORT":
-            if rsi_val >= RSI_SHORT_EXIT:
-                positions[symbol] = None
-                send_telegram_alert(build_signal_message(
-                    symbol, "SHORT", "EXIT", close_price, rsi_val, TIMEFRAME))
+        elif signal["action"] == "EXIT":
+            pnl = (signal["price"] - entry) / entry * 100
+            if pos == "SHORT": pnl = -pnl
+            with lock:
+                state[sym].update({"position": None, "entry": None, "sl": None, "tp": None})
+                daily_pnl["value"] += pnl * RISK_PCT / 100
+            
+            send(msg_exit(sym, pos, signal["price"], entry, signal["reason"], pnl))
+            
+            # تنبيه إذا تم الوصول للحد الأقصى للخسارة
+            if daily_pnl["value"] <= -MAX_DAILY_LOSS:
+                send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nلقد وصلت للحد الأقصى للخسارة اليومية (-{MAX_DAILY_LOSS}%).\nلن يتم إرسال إشارات جديدة حتى الغد.")
 
-    except ccxt.ExchangeError as e:
-        log("ERROR", f"Exchange error on {symbol}: {e}")
-    except Exception as e:
-        log("ERROR", f"Error scanning {symbol}: {e}")
+    except Exception:
+        print("[KLINE ERROR]", traceback.format_exc())
 
+def on_1h(msg):
+    try:
+        if msg["k"]["x"] is not True: return
+        sym = msg["s"]
+        k = msg["k"]
+        with lock:
+            state[sym]["candles_1h"].append({"t": k["t"], "open": float(k["o"]), "high": float(k["h"]), "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["v"])})
+            if len(state[sym]["candles_1h"]) > 500:
+                state[sym]["candles_1h"] = state[sym]["candles_1h"][-500:]
+        update_trend(sym)
+    except Exception:
+        print("[1H ERROR]", traceback.format_exc())
 
-def trading_loop():
-    log("INIT", "Background trading loop started.")
-    exchange = ccxt.binance({
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
+# ==========================================
+# 6. التشغيل الرئيسي
+# ==========================================
+def main():
+    print("[INIT] Loading initial data...")
+    for s in SYMBOLS:
+        fetch_initial(s)
+        update_trend(s)
 
-    log("INIT", f"Symbols: {SYMBOLS} | TF: {TIMEFRAME} | Interval: {SCAN_INTERVAL}s")
-    send_telegram_alert(
-        "🚀 <b>Trading Bot is live</b>\n"
-        f"Symbols: <code>{', '.join(SYMBOLS)}</code>\n"
-        f"TF: <code>{TIMEFRAME}</code>\n"
-        f"RSI long in/out: <code>{RSI_LONG_ENTRY}/{RSI_LONG_EXIT}</code>\n"
-        f"RSI short in/out: <code>{RSI_SHORT_ENTRY}/{RSI_SHORT_EXIT}</code>\n"
-        f"SL/TP: <code>{SL_PCT*100:.1f}% / {TP_PCT*100:.1f}%</code>"
-    )
+    twm = ThreadedWebsocketManager()
+    twm.start()
+
+    for s in SYMBOLS:
+        twm.start_kline_socket(callback=on_kline, symbol=s, interval="5m")
+        twm.start_kline_socket(callback=on_1h,   symbol=s, interval="1h")
+
+    send("🚀 <b>تم تشغيل بوت التداول بنجاح</b>\n"
+         "➖➖➖➖➖➖➖➖\n"
+         f"🪙 الأزواج المراقبة: <code>{', '.join(SYMBOLS)}</code>\n"
+         f"🧠 الاستراتيجية: تقاطع EMA + RSI + MACD\n"
+         f"📈 فلتر الاتجاه: EMA 200 (فريم الساعة)\n"
+         f"💰 إدارة المخاطر: {RISK_PCT}% لكل صفقة\n"
+         f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%")
 
     while True:
-        try:
-            for sym in SYMBOLS:
-                scan_symbol(exchange, sym)
-                time.sleep(1)
-        except Exception as e:
-            log("FATAL", f"Loop error: {e}")
-        time.sleep(SCAN_INTERVAL)
-
+        time.sleep(60)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    trading_loop()
+    main()
