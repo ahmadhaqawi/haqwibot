@@ -1,56 +1,56 @@
 import os
-import time
+import sys
 import threading
-import traceback
+import time
 from datetime import datetime, timezone
+
+import ccxt
 import pandas as pd
 import requests
 from flask import Flask
-from binance.client import Client
-from binance import ThreadedWebsocketManager
+
+app = Flask(__name__)
+
+@app.route("/")
+@app.route("/healthz")
+def health_check():
+    return {"status": "ok", "service": "trading_bot_active"}, 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 # ==========================================
 # 1. الإعدادات والمتغيرات (Config)
 # ==========================================
-TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 
 # حالة البوت لكل زوج
 state = {
     sym: {"position": None, "entry": None, "sl": None, "tp": None,
-          "htf_trend": None, "candles_5m": [], "candles_1h": []}
+          "htf_trend": None, "last_candle_ts": None}
     for sym in SYMBOLS
 }
 daily_pnl = {"value": 0.0, "date": datetime.now(timezone.utc).date()}
-lock = threading.Lock()
 
 # ==========================================
-# 2. سيرفر Flask (لإبقاء الخدمة مستيقظة على Render)
-# ==========================================
-app = Flask(__name__)
-
-@app.route("/")
-@app.route("/healthz")
-def health():
-    return {"status": "ok", "service": "bot_active"}, 200
-
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), use_reloader=False)
-
-# ==========================================
-# 3. إرسال رسائل تيليجرام
+# 2. إرسال رسائل تيليجرام
 # ==========================================
 def send(msg):
-    if not TOKEN or not CHAT_ID: 
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
         print("[TG ERROR] Token or Chat ID missing.")
         return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML",
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML",
                   "disable_web_page_preview": True},
             timeout=10)
     except Exception as e:
@@ -94,7 +94,7 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct):
             f"📝 السبب: {ar_reason}")
 
 # ==========================================
-# 4. المؤشرات الفنية والاستراتيجية
+# 3. المؤشرات الفنية والاستراتيجية
 # ==========================================
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
@@ -163,49 +163,45 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
     return None
 
 # ==========================================
-# 5. جلب البيانات ومعالجة الشموع اللحظية (مع تخطي الحظر الجغرافي)
+# 4. دالة الفحص الرئيسية (تعمل بـ ccxt)
 # ==========================================
-# استخدام data-api.binance.vision يتجاوز حظر Render الأمريكي
-client = Client()
-client.API_URL = 'https://data-api.binance.vision/api'
-
-def fetch_initial(sym):
-    k5  = client.get_klines(symbol=sym, interval="5m",  limit=300)
-    k1h = client.get_klines(symbol=sym, interval="1h",  limit=300)
-    def to_df(ks):
-        return pd.DataFrame(ks, columns=["t","open","high","low","close","volume","ct","qv","n","tb","tq","i"]).astype({"open":float,"high":float,"low":float,"close":float,"volume":float})
-    with lock:
-        state[sym]["candles_5m"] = to_df(k5).to_dict("records")
-        state[sym]["candles_1h"] = to_df(k1h).to_dict("records")
-
-def update_trend(sym):
-    with lock:
-        df = pd.DataFrame(state[sym]["candles_1h"])
-    if len(df) < 200: return
-    df = add_indicators(df)
-    last = df.iloc[-2]
-    trend = "UP" if last["close"] > last["ema200"] else "DOWN"
-    with lock:
-        state[sym]["htf_trend"] = trend
-
-def on_kline(msg):
+def scan_symbol(exchange, symbol):
     try:
-        if msg["k"]["x"] is not True: return
-        sym = msg["s"]
-        k = msg["k"]
-        candle = {"t": k["t"], "open": float(k["o"]), "high": float(k["h"]), "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["v"])}
-        with lock:
-            state[sym]["candles_5m"].append(candle)
-            if len(state[sym]["candles_5m"]) > 500:
-                state[sym]["candles_5m"] = state[sym]["candles_5m"][-500:]
-            df = pd.DataFrame(state[sym]["candles_5m"])
-            pos, entry, sl, tp, trend = state[sym]["position"], state[sym]["entry"], state[sym]["sl"], state[sym]["tp"], state[sym]["htf_trend"]
+        # جلب البيانات
+        ohlcv_5m = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=300)
+        ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=300)
+        
+        if len(ohlcv_5m) < 210 or len(ohlcv_1h) < 200:
+            return
 
-        df = add_indicators(df)
-        signal = check_signal(df, trend, pos, entry, sl, tp)
+        # تحويلها إلى DataFrames
+        df_5m = pd.DataFrame(ohlcv_5m, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+        # إضافة المؤشرات
+        df_5m = add_indicators(df_5m)
+        df_1h = add_indicators(df_1h)
+
+        # تحديد اتجاه السوق من فريم الساعة
+        last_1h = df_1h.iloc[-2]
+        htf_trend = "UP" if last_1h["close"] > last_1h["ema200"] else "DOWN"
+
+        # منع تكرار نفس الشمعة
+        current_candle_ts = int(df_5m.iloc[-2]["timestamp"])
+        if state[symbol]["last_candle_ts"] == current_candle_ts:
+            return
+        state[symbol]["last_candle_ts"] = current_candle_ts
+
+        pos = state[symbol]["position"]
+        entry = state[symbol]["entry"]
+        sl = state[symbol]["sl"]
+        tp = state[symbol]["tp"]
+
+        signal = check_signal(df_5m, htf_trend, pos, entry, sl, tp)
 
         if not signal: return
 
+        # إدارة الخسارة اليومية
         today = datetime.now(timezone.utc).date()
         if daily_pnl["date"] != today:
             daily_pnl["value"] = 0.0
@@ -214,57 +210,34 @@ def on_kline(msg):
             return 
 
         if signal["action"] == "ENTRY":
-            with lock:
-                state[sym].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
-            send(msg_entry(sym, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"]))
+            state[symbol].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
+            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"]))
 
         elif signal["action"] == "EXIT":
             pnl = (signal["price"] - entry) / entry * 100
             if pos == "SHORT": pnl = -pnl
-            with lock:
-                state[sym].update({"position": None, "entry": None, "sl": None, "tp": None})
-                daily_pnl["value"] += pnl * RISK_PCT / 100
+            state[symbol].update({"position": None, "entry": None, "sl": None, "tp": None})
+            daily_pnl["value"] += pnl * RISK_PCT / 100
             
-            send(msg_exit(sym, pos, signal["price"], entry, signal["reason"], pnl))
+            send(msg_exit(symbol, pos, signal["price"], entry, signal["reason"], pnl))
             
             if daily_pnl["value"] <= -MAX_DAILY_LOSS:
-                send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nلقد وصلت للحد الأقصى للخسارة اليومية (-{MAX_DAILY_LOSS}%).\nلن يتم إرسال إشارات جديدة حتى الغد.")
+                send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nلقد وصلت للحد الأقصى للخسارة اليومية (-{MAX_DAILY_LOSS}%).")
 
-    except Exception:
-        print("[KLINE ERROR]", traceback.format_exc())
-
-def on_1h(msg):
-    try:
-        if msg["k"]["x"] is not True: return
-        sym = msg["s"]
-        k = msg["k"]
-        with lock:
-            state[sym]["candles_1h"].append({"t": k["t"], "open": float(k["o"]), "high": float(k["h"]), "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["v"])})
-            if len(state[sym]["candles_1h"]) > 500:
-                state[sym]["candles_1h"] = state[sym]["candles_1h"][-500:]
-        update_trend(sym)
-    except Exception:
-        print("[1H ERROR]", traceback.format_exc())
+    except Exception as e:
+        print(f"[ERROR] Scan {symbol}: {e}", flush=True)
 
 # ==========================================
-# 6. التشغيل الرئيسي
+# 5. التشغيل الرئيسي
 # ==========================================
-def main():
-    print("[INIT] Loading initial data...")
-    for s in SYMBOLS:
-        fetch_initial(s)
-        update_trend(s)
+def trading_loop():
+    print("[INIT] Starting bot with ccxt...", flush=True)
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'}
+    })
 
-    # استخدام مسار البث العام لـ Binance لتجاوز الحظر الجغرافي
-    twm = ThreadedWebsocketManager(client=client)
-    twm.stream_url = 'wss://data-stream.binance.vision'
-    twm.start()
-
-    for s in SYMBOLS:
-        twm.start_kline_socket(callback=on_kline, symbol=s, interval="5m")
-        twm.start_kline_socket(callback=on_1h,   symbol=s, interval="1h")
-
-    send("🚀 <b>تم تشغيل بوت التداول بنجاح</b>\n"
+    send("🚀 <b>تم تشغيل بوت التداول بنجاح (نظام ccxt)</b>\n"
          "➖➖➖➖➖➖➖➖\n"
          f"🪙 الأزواج المراقبة: <code>{', '.join(SYMBOLS)}</code>\n"
          f"🧠 الاستراتيجية: تقاطع EMA + RSI + MACD\n"
@@ -273,8 +246,15 @@ def main():
          f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%")
 
     while True:
-        time.sleep(60)
+        try:
+            for sym in SYMBOLS:
+                scan_symbol(exchange, sym)
+                time.sleep(2) # تأخير بسيط بين الأزواج
+        except Exception as e:
+            print(f"[FATAL] Loop error: {e}", flush=True)
+        
+        time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    main()
+    trading_loop()
