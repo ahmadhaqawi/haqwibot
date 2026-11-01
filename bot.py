@@ -31,7 +31,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # --- إعدادات مراقبة الصفقات متعددة المنصات ---
 WEBSOCKET_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-# تم رفع الحد الافتراضي إلى 100 ألف دولار لتقليل الإشعارات، يمكنك تغييره من Render
 WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "100000")) 
 
 # --- إعدادات استراتيجية التداول (OKX) ---
@@ -97,10 +96,11 @@ async def listen_to_binance():
                             emoji = "🟢" if trade['m'] == False else "🔴"
                             symbol_display = trade['s'].replace('USDT', '/USDT')
                             
-                            # التعديل الجديد للرسالة
-                            msg = (f"🐋 <b>{side_ar}</b>\n"
+                            # الترتيب الجديد: الزوج أولاً ثم النوع
+                            msg = (f"🐋 <b>صفقة ضخمة</b>\n"
                                    f"➖➖➖➖➖➖➖➖\n"
                                    f"🪙 الزوج: <code>{symbol_display}</code>\n"
+                                   f"{emoji} النوع: <b>{side_ar}</b>\n"
                                    f"💰 القيمة: <code>${cost:,.0f}</code>\n"
                                    f"💵 السعر: <code>{fmt(price)}</code>\n"
                                    f"➖➖➖➖➖➖➖➖\n"
@@ -136,10 +136,11 @@ async def listen_to_okx():
                                 emoji = "🟢" if side == 'buy' else "🔴"
                                 symbol_display = trade['instId'].replace("-SWAP", "").replace("-", "/")
                                 
-                                # التعديل الجديد للرسالة
-                                msg = (f"🐋 <b>{side_ar}</b>\n"
+                                # الترتيب الجديد: الزوج أولاً ثم النوع
+                                msg = (f"🐋 <b>صفقة ضخمة</b>\n"
                                        f"➖➖➖➖➖➖➖➖\n"
                                        f"🪙 الزوج: <code>{symbol_display}</code>\n"
+                                       f"{emoji} النوع: <b>{side_ar}</b>\n"
                                        f"💰 القيمة: <code>${cost:,.0f}</code>\n"
                                        f"💵 السعر: <code>{fmt(price)}</code>\n"
                                        f"➖➖➖➖➖➖➖➖\n"
@@ -175,10 +176,11 @@ async def listen_to_bybit():
                                 emoji = "🟢" if side == 'Buy' else "🔴"
                                 symbol_display = trade['s'].replace('USDT', '/USDT')
                                 
-                                # التعديل الجديد للرسالة
-                                msg = (f"🐋 <b>{side_ar}</b>\n"
+                                # الترتيب الجديد: الزوج أولاً ثم النوع
+                                msg = (f"🐋 <b>صفقة ضخمة</b>\n"
                                        f"➖➖➖➖➖➖➖➖\n"
                                        f"🪙 الزوج: <code>{symbol_display}</code>\n"
+                                       f"{emoji} النوع: <b>{side_ar}</b>\n"
                                        f"💰 القيمة: <code>${cost:,.0f}</code>\n"
                                        f"💵 السعر: <code>{fmt(price)}</code>\n"
                                        f"➖➖➖➖➖➖➖➖\n"
