@@ -29,10 +29,9 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# --- إعدادات مراقبة الصفقات المباشرة (Binance WebSocket) ---
-# يمكنك تغيير العملات التي تريد مراقبتها هنا
-WEBSOCKET_SYMBOLS = ["btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt"]
-# الحد الأدنى لقيمة الصفقة بالدولار لإرسال تنبيه
+# --- إعدادات مراقبة الصفقات متعددة المنصات ---
+# العملات التي نريد مراقبتها (يجب أن تكون بنفس التنسيق عبر المنصات)
+WEBSOCKET_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "50000"))
 
 # --- إعدادات استراتيجية التداول (OKX) ---
@@ -74,56 +73,127 @@ def clean_symbol(sym):
     return sym.split(':')[0]
 
 # ==========================================
-# 3. محرك مراقبة الصفقات المباشر (WebSocket)
+# 3. محرك مراقبة الصفقات متعدد المنصات (WebSocket)
 # ==========================================
-async def listen_to_binance_trades():
-    """الاتصال بـ WebSocket الخاص بـ Binance لمراقبة الصفقات اللحظية"""
-    # بناء رابط الاتصال لجميع العملات المحددة
-    streams = "/".join([f"{sym}@aggTrade" for sym in WEBSOCKET_SYMBOLS])
+
+async def listen_to_binance():
+    """مراقبة صفقات منصة Binance Futures"""
+    streams = "/".join([f"{sym.lower()}@aggTrade" for sym in WEBSOCKET_SYMBOLS])
     uri = f"wss://fstream.binance.com/stream?streams={streams}"
-    
-    print(f"[WS] Connecting to Binance WebSocket for {len(WEBSOCKET_SYMBOLS)} symbols...", flush=True)
-    
+    print("[WS] Connecting to Binance...", flush=True)
     while True:
         try:
             async with websockets.connect(uri) as websocket:
-                print("[WS] Connected successfully. Monitoring trades...", flush=True)
+                print("[WS] Binance Connected.", flush=True)
                 while True:
                     message = await websocket.recv()
                     data = json.loads(message)
-                    
-                    # التحقق من أن الرسالة هي صفقة مجمعة
                     if 'data' in data and data['data'].get('e') == 'aggTrade':
                         trade = data['data']
-                        price = float(trade['p'])
-                        quantity = float(trade['q'])
-                        cost = price * quantity  # القيمة بالدولار
-                        
-                        # إذا تجاوزت الصفقة الحد المطلوب
+                        price, quantity = float(trade['p']), float(trade['q'])
+                        cost = price * quantity
                         if cost >= WHALE_THRESHOLD_WS:
                             side_ar = "شراء (لونق)" if trade['m'] == False else "بيع (شورت)"
                             emoji = "🟢" if trade['m'] == False else "🔴"
                             symbol_display = trade['s'].replace('USDT', '/USDT')
-                            
-                            msg = (f"🐋 <b>تنبيه صفقة ضخمة (WebSocket مباشر)!</b>\n"
+                            msg = (f"🐋 <b>تنبيه صفقة ضخمة (Binance)</b>\n"
                                    f"➖➖➖➖➖➖➖➖\n"
                                    f"🪙 الزوج: <code>{symbol_display}</code>\n"
                                    f"💰 القيمة: <code>${cost:,.0f}</code>\n"
                                    f"{emoji} النوع: <b>{side_ar}</b>\n"
                                    f"💵 السعر: <code>{fmt(price)}</code>")
                             send(msg)
-                            time.sleep(0.5) # تأخير بسيط لتجنب حظر تيليجرام
-                            
-        except websockets.exceptions.ConnectionClosed:
-            print("[WS] Connection closed. Reconnecting...", flush=True)
-            await asyncio.sleep(5)
         except Exception as e:
-            print(f"[WS ERROR] {e}. Reconnecting...", flush=True)
+            print(f"[WS BINANCE ERROR] {e}. Reconnecting...", flush=True)
             await asyncio.sleep(5)
+
+async def listen_to_okx():
+    """مراقبة صفقات منصة OKX"""
+    # OKX يتطلب تنسيقاً مختلفاً قليلاً في الروابط
+    args = [{"channel": "trades", "instId": sym.replace("USDT", "-USDT-SWAP")} for sym in WEBSOCKET_SYMBOLS]
+    uri = "wss://ws.okx.com:8443/ws/v5/public"
+    print("[WS] Connecting to OKX...", flush=True)
+    while True:
+        try:
+            async with websockets.connect(uri) as websocket:
+                # الاشتراك في القنوات
+                subscribe_msg = {"op": "subscribe", "args": args}
+                await websocket.send(json.dumps(subscribe_msg))
+                print("[WS] OKX Subscribed.", flush=True)
+                
+                while True:
+                    message = await websocket.recv()
+                    data = json.loads(message)
+                    if 'data' in data and data['data']:
+                        for trade in data['data']:
+                            price = float(trade['px'])
+                            size = float(trade['sz'])
+                            cost = price * size
+                            # OKX لا يحدد الشراء/البيع مباشرة، لكن يمكن استنتاجه من الحقل 'side'
+                            side = trade.get('side', 'buy') # buy or sell
+                            if cost >= WHALE_THRESHOLD_WS:
+                                side_ar = "شراء (لونق)" if side == 'buy' else "بيع (شورت)"
+                                emoji = "🟢" if side == 'buy' else "🔴"
+                                symbol_display = trade['instId'].replace("-SWAP", "").replace("-", "/")
+                                msg = (f"🐋 <b>تنبيه صفقة ضخمة (OKX)</b>\n"
+                                       f"➖➖➖➖➖➖➖➖\n"
+                                       f"🪙 الزوج: <code>{symbol_display}</code>\n"
+                                       f"💰 القيمة: <code>${cost:,.0f}</code>\n"
+                                       f"{emoji} النوع: <b>{side_ar}</b>\n"
+                                       f"💵 السعر: <code>{fmt(price)}</code>")
+                                send(msg)
+        except Exception as e:
+            print(f"[WS OKX ERROR] {e}. Reconnecting...", flush=True)
+            await asyncio.sleep(5)
+
+async def listen_to_bybit():
+    """مراقبة صفقات منصة Bybit"""
+    # Bybit يستخدم صيغة مختلفة للاشتراك
+    args = [f"publicTrade.{sym}" for sym in WEBSOCKET_SYMBOLS]
+    uri = "wss://stream.bybit.com/v5/public/linear"
+    print("[WS] Connecting to Bybit...", flush=True)
+    while True:
+        try:
+            async with websockets.connect(uri) as websocket:
+                subscribe_msg = {"op": "subscribe", "args": args}
+                await websocket.send(json.dumps(subscribe_msg))
+                print("[WS] Bybit Subscribed.", flush=True)
+                
+                while True:
+                    message = await websocket.recv()
+                    data = json.loads(message)
+                    if 'data' in data and data['data']:
+                        for trade in data['data']:
+                            price = float(trade['p'])
+                            size = float(trade['v'])
+                            cost = price * size
+                            side = trade.get('S', 'Buy') # Buy or Sell
+                            if cost >= WHALE_THRESHOLD_WS:
+                                side_ar = "شراء (لونق)" if side == 'Buy' else "بيع (شورت)"
+                                emoji = "🟢" if side == 'Buy' else "🔴"
+                                symbol_display = trade['s'].replace('USDT', '/USDT')
+                                msg = (f"🐋 <b>تنبيه صفقة ضخمة (Bybit)</b>\n"
+                                       f"➖➖➖➖➖➖➖➖\n"
+                                       f"🪙 الزوج: <code>{symbol_display}</code>\n"
+                                       f"💰 القيمة: <code>${cost:,.0f}</code>\n"
+                                       f"{emoji} النوع: <b>{side_ar}</b>\n"
+                                       f"💵 السعر: <code>{fmt(price)}</code>")
+                                send(msg)
+        except Exception as e:
+            print(f"[WS BYBIT ERROR] {e}. Reconnecting...", flush=True)
+            await asyncio.sleep(5)
+
+async def run_websockets():
+    """تشغيل جميع اتصالات WebSocket في نفس الوقت"""
+    await asyncio.gather(
+        listen_to_binance(),
+        listen_to_okx(),
+        listen_to_bybit()
+    )
 
 def run_websocket_loop():
     """تشغيل حلقة WebSocket في مسار منفصل"""
-    asyncio.run(listen_to_binance_trades())
+    asyncio.run(run_websockets())
 
 # ==========================================
 # 4. دوال استراتيجية التداول (OKX)
@@ -253,9 +323,9 @@ def scan_symbol(exchange, symbol):
 # 5. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting Bot with WebSocket Trade Monitor...", flush=True)
+    print("[INIT] Starting Multi-Exchange Bot...", flush=True)
     
-    # تشغيل مراقب الصفقات المباشر في الخلفية
+    # تشغيل مراقب الصفقات متعدد المنصات في الخلفية
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
 
@@ -266,12 +336,12 @@ def trading_loop():
     })
     exchange.load_markets()
 
-    send(f"🚀 <b>تم تشغيل البوت (استراتيجية + مراقب صفقات مباشر)</b>\n"
+    send(f"🚀 <b>تم تشغيل البوت (استراتيجية + مراقب متعدد المنصات)</b>\n"
          f"➖➖➖➖➖➖➖➖\n"
          f"🪙 استراتيجية التداول: <b>{len(FUTURES_SYMBOLS)} عملة (OKX)</b>\n"
          f"⏱️ الفريم الزمني: <b>5 دقائق</b>\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
-         f"👁️ مراقب الصفقات المباشر: <b>{len(WEBSOCKET_SYMBOLS)} عملة (Binance WS)</b>\n"
+         f"👁️ مراقب الصفقات (Binance + OKX + Bybit): <b>{len(WEBSOCKET_SYMBOLS)} عملة</b>\n"
          f"💰 حد تنبيه الصفقات الضخمة: <b>${WHALE_THRESHOLD_WS:,.0f}</b>")
 
     while True:
