@@ -35,7 +35,8 @@ FUTURES_SYMBOLS = [
     "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT"
 ]
 
-TIMEFRAME = "15m" # فريم 15 دقيقة أفضل للرافعة المالية
+# تم التعديل إلى 5 دقائق
+TIMEFRAME = "5m" 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
@@ -68,7 +69,7 @@ def fmt(p):
 def msg_entry(sym, side, price, sl, tp, rsi):
     if side == "LONG":
         title = "🟢 <b>إشارة لونق (LONG) - فيوتشر</b>"
-        liq = price * (1 - (1/LEVERAGE) + 0.005) # تقدير سعر التصفية
+        liq = price * (1 - (1/LEVERAGE) + 0.005) 
     else:
         title = "🔴 <b>إشارة شورت (SHORT) - فيوتشر</b>"
         liq = price * (1 + (1/LEVERAGE) - 0.005)
@@ -79,6 +80,7 @@ def msg_entry(sym, side, price, sl, tp, rsi):
     return (f"{title}\n"
             f"➖➖➖➖➖➖➖➖\n"
             f"🪙 الزوج: <code>{sym}</code>\n"
+            f"⏱️ الفريم: <code>{TIMEFRAME}</code>\n"
             f"⚙️ الرافعة المقترحة: <b>{LEVERAGE}x</b>\n"
             f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
             f"🛑 وقف الخسارة (SL): <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
@@ -95,7 +97,6 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct):
     reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯", "EMA Cross": "كسر المتوسط المتحرك 📉"}
     ar_reason = reasons_ar.get(reason, reason)
 
-    # حساب الربح مع الرافعة (تقريبي)
     leveraged_pnl = pnl_pct * LEVERAGE
 
     return (f"{title}\n"
@@ -166,7 +167,7 @@ def check_signal(df, position, entry_price=None, sl=None, tp=None):
     macd_up    = last["macd_hist"] > 0 and last["macd_hist"] > prev["macd_hist"]
     macd_down  = last["macd_hist"] < 0 and last["macd_hist"] < prev["macd_hist"]
 
-    # فلتر الاتجاه: السعر يجب أن يكون فوق المتوسط 200 للونق، وتحته للشورت
+    # فلتر الاتجاه
     trend_up   = price > last["ema200"]
     trend_down = price < last["ema200"]
 
@@ -229,7 +230,6 @@ def scan_symbol(exchange, symbol):
             if pos == "SHORT": pnl = -pnl
             state[symbol].update({"position": None, "entry": None, "sl": None, "tp": None})
             
-            # حساب الخسارة اليومية بناءً على الرافعة
             daily_pnl["value"] += (pnl * LEVERAGE) * RISK_PCT / 100
             
             send(msg_exit(symbol, pos, signal["price"], entry, signal["reason"], pnl))
@@ -244,9 +244,8 @@ def scan_symbol(exchange, symbol):
 # 5. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting Futures Bot with OKX...", flush=True)
+    print("[INIT] Starting Futures Bot on 5m timeframe...", flush=True)
     
-    # إعداد المنصة لتعمل على العقود الآجلة (Swap) وليس الفوري
     exchange = ccxt.okx({
         'enableRateLimit': True,
         'options': {'defaultType': 'swap'} 
@@ -257,7 +256,7 @@ def trading_loop():
     send(f"🚀 <b>تم تشغيل بوت العقود الآجلة (Futures)</b>\n"
          f"➖➖➖➖➖➖➖➖\n"
          f"🪙 العملات المراقبة: <b>{len(FUTURES_SYMBOLS)} عملة</b>\n"
-         f"⏱️ الفريم الزمني: <b>15 دقيقة</b>\n"
+         f"⏱️ الفريم الزمني: <b>5 دقائق (سريع)</b>\n"
          f"⚙️ الرافعة المالية: <b>{LEVERAGE}x</b>\n"
          f"📈 الاستراتيجية: EMA + RSI + MACD + ATR\n"
          f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%\n"
