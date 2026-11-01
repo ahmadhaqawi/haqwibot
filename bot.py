@@ -87,7 +87,7 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
             f"🎯 هدف الربح: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
             f"📊 RSI: <code>{rsi:.1f}</code> | ADX: <code>{adx:.1f}</code>\n"
             f"➖➖➖➖➖➖➖➖\n"
-            f"💡 <i>بمجرد ربح 1%، انقل وقف الخسارة للدخول.</i>")
+            f"💡 <i>بمجرد ربح 1%، قم بتعديل وقف الخسارة إلى سعر الدخول.</i>")
 
 def msg_exit(sym, side, price, entry, reason, pnl_pct):
     title = "⚪ <b>إغلاق صفقة لونق</b>" if side == "LONG" else "⚪ <b>إغلاق صفقة شورت</b>"
@@ -251,7 +251,6 @@ def add_indicators(df):
     df["highest_high_20"] = df["high"].rolling(20).max().shift(1)
     df["lowest_low_20"]   = df["low"].rolling(20).min().shift(1)
     
-    # إضافة مؤشر MACD
     macd_line, macd_sig, macd_hist = macd(df["close"])
     df["macd_line"] = macd_line
     df["macd_sig"]  = macd_sig
@@ -276,13 +275,11 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
 
     if position is not None: return None
 
-    # متغيرات مشتركة
     trend_1h_up   = df_1h.iloc[-2]["close"] > df_1h.iloc[-2]["ema21"]
     trend_1h_down = df_1h.iloc[-2]["close"] < df_1h.iloc[-2]["ema21"]
     vol_ok     = last_5m["volume"] > 1.2 * last_5m["vol_ma"] 
     adx_strong = last_5m["adx"] > 25
 
-    # 1. استراتيجية الترند (EMA Cross + ADX)
     cross_up   = prev_5m["ema9"] <= prev_5m["ema21"] and last_5m["ema9"] > last_5m["ema21"]
     cross_down = prev_5m["ema9"] >= prev_5m["ema21"] and last_5m["ema9"] < last_5m["ema21"]
 
@@ -296,8 +293,7 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
                 "sl": price + 1.5 * last_5m["atr"], "tp": price - 3.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "ترند"}
 
-    # 2. استراتيجية اقتناص الفرص (اختراق الزخم - تم زيادة الحساسية)
-    breakout_vol = last_5m["volume"] > 2.0 * last_5m["vol_ma"] # خفضنا الشرط من 2.5 إلى 2.0
+    breakout_vol = last_5m["volume"] > 2.0 * last_5m["vol_ma"]
     if (price > last_5m["highest_high_20"] and breakout_vol and 50 < last_5m["rsi"] < 80):
         return {"action": "ENTRY", "side": "LONG", "price": price,
                 "sl": price - 1.0 * last_5m["atr"], "tp": price + 2.0 * last_5m["atr"], 
@@ -308,7 +304,6 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
                 "sl": price + 1.0 * last_5m["atr"], "tp": price - 2.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "اختراق ⚡"}
 
-    # 3. استراتيجية الزخم السريع (MACD Cross)
     macd_cross_up   = prev_5m["macd_line"] <= prev_5m["macd_sig"] and last_5m["macd_line"] > last_5m["macd_sig"]
     macd_cross_down = prev_5m["macd_line"] >= prev_5m["macd_sig"] and last_5m["macd_line"] < last_5m["macd_sig"]
 
