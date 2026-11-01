@@ -30,7 +30,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # --- إعدادات مراقبة الصفقات متعددة المنصات ---
-# العملات التي نريد مراقبتها (يجب أن تكون بنفس التنسيق عبر المنصات)
 WEBSOCKET_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "50000"))
 
@@ -96,8 +95,9 @@ async def listen_to_binance():
                             side_ar = "شراء (لونق)" if trade['m'] == False else "بيع (شورت)"
                             emoji = "🟢" if trade['m'] == False else "🔴"
                             symbol_display = trade['s'].replace('USDT', '/USDT')
-                            msg = (f"🐋 <b>تنبيه صفقة ضخمة (Binance)</b>\n"
+                            msg = (f"🐋 <b>تنبيه صفقة ضخمة!</b>\n"
                                    f"➖➖➖➖➖➖➖➖\n"
+                                   f"🏢 المنصة: <b>Binance (فيوتشر)</b>\n"
                                    f"🪙 الزوج: <code>{symbol_display}</code>\n"
                                    f"💰 القيمة: <code>${cost:,.0f}</code>\n"
                                    f"{emoji} النوع: <b>{side_ar}</b>\n"
@@ -109,14 +109,12 @@ async def listen_to_binance():
 
 async def listen_to_okx():
     """مراقبة صفقات منصة OKX"""
-    # OKX يتطلب تنسيقاً مختلفاً قليلاً في الروابط
     args = [{"channel": "trades", "instId": sym.replace("USDT", "-USDT-SWAP")} for sym in WEBSOCKET_SYMBOLS]
     uri = "wss://ws.okx.com:8443/ws/v5/public"
     print("[WS] Connecting to OKX...", flush=True)
     while True:
         try:
             async with websockets.connect(uri) as websocket:
-                # الاشتراك في القنوات
                 subscribe_msg = {"op": "subscribe", "args": args}
                 await websocket.send(json.dumps(subscribe_msg))
                 print("[WS] OKX Subscribed.", flush=True)
@@ -129,14 +127,14 @@ async def listen_to_okx():
                             price = float(trade['px'])
                             size = float(trade['sz'])
                             cost = price * size
-                            # OKX لا يحدد الشراء/البيع مباشرة، لكن يمكن استنتاجه من الحقل 'side'
-                            side = trade.get('side', 'buy') # buy or sell
+                            side = trade.get('side', 'buy')
                             if cost >= WHALE_THRESHOLD_WS:
                                 side_ar = "شراء (لونق)" if side == 'buy' else "بيع (شورت)"
                                 emoji = "🟢" if side == 'buy' else "🔴"
                                 symbol_display = trade['instId'].replace("-SWAP", "").replace("-", "/")
-                                msg = (f"🐋 <b>تنبيه صفقة ضخمة (OKX)</b>\n"
+                                msg = (f"🐋 <b>تنبيه صفقة ضخمة!</b>\n"
                                        f"➖➖➖➖➖➖➖➖\n"
+                                       f"🏢 المنصة: <b>OKX (فيوتشر)</b>\n"
                                        f"🪙 الزوج: <code>{symbol_display}</code>\n"
                                        f"💰 القيمة: <code>${cost:,.0f}</code>\n"
                                        f"{emoji} النوع: <b>{side_ar}</b>\n"
@@ -148,7 +146,6 @@ async def listen_to_okx():
 
 async def listen_to_bybit():
     """مراقبة صفقات منصة Bybit"""
-    # Bybit يستخدم صيغة مختلفة للاشتراك
     args = [f"publicTrade.{sym}" for sym in WEBSOCKET_SYMBOLS]
     uri = "wss://stream.bybit.com/v5/public/linear"
     print("[WS] Connecting to Bybit...", flush=True)
@@ -167,13 +164,14 @@ async def listen_to_bybit():
                             price = float(trade['p'])
                             size = float(trade['v'])
                             cost = price * size
-                            side = trade.get('S', 'Buy') # Buy or Sell
+                            side = trade.get('S', 'Buy')
                             if cost >= WHALE_THRESHOLD_WS:
                                 side_ar = "شراء (لونق)" if side == 'Buy' else "بيع (شورت)"
                                 emoji = "🟢" if side == 'Buy' else "🔴"
                                 symbol_display = trade['s'].replace('USDT', '/USDT')
-                                msg = (f"🐋 <b>تنبيه صفقة ضخمة (Bybit)</b>\n"
+                                msg = (f"🐋 <b>تنبيه صفقة ضخمة!</b>\n"
                                        f"➖➖➖➖➖➖➖➖\n"
+                                       f"🏢 المنصة: <b>Bybit (فيوتشر)</b>\n"
                                        f"🪙 الزوج: <code>{symbol_display}</code>\n"
                                        f"💰 القيمة: <code>${cost:,.0f}</code>\n"
                                        f"{emoji} النوع: <b>{side_ar}</b>\n"
