@@ -3,8 +3,9 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+import asyncio
 
-import ccxt
+import ccxt.async_support as ccxt  # استخدام النسخة غير المتزامنة (Async)
 import pandas as pd
 import requests
 from flask import Flask
@@ -26,18 +27,18 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# قائمة أفضل 50 عملة من حيث السيولة
+# قائمة أفضل 50 عملة (متوفرة في OKX)
 TOP_50_SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
-    "ADA/USDT", "AVAX/USDT", "DOGE/USDT", "TRX/USDT", "DOT/USDT",
-    "LINK/USDT", "MATIC/USDT", "TON/USDT", "SHIB/USDT", "LTC/USDT",
-    "BCH/USDT", "NEAR/USDT", "UNI/USDT", "ICP/USDT", "APT/USDT",
-    "SUI/USDT", "FIL/USDT", "ARB/USDT", "OP/USDT", "IMX/USDT",
-    "INJ/USDT", "RNDR/USDT", "HBAR/USDT", "ATOM/USDT", "STX/USDT",
-    "VET/USDT", "MNT/USDT", "GRT/USDT", "FTM/USDT", "THETA/USDT",
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT",
+    "ADA/USDT", "AVAX/USDT", "TRX/USDT", "DOT/USDT", "LINK/USDT",
+    "TON/USDT", "SHIB/USDT", "LTC/USDT", "BCH/USDT", "NEAR/USDT",
+    "UNI/USDT", "ICP/USDT", "APT/USDT", "SUI/USDT", "FIL/USDT",
+    "ARB/USDT", "OP/USDT", "IMX/USDT", "INJ/USDT", "HBAR/USDT",
+    "ATOM/USDT", "STX/USDT", "VET/USDT", "GRT/USDT", "THETA/USDT",
     "LDO/USDT", "RUNE/USDT", "ALGO/USDT", "SEI/USDT", "QNT/USDT",
     "EGLD/USDT", "AAVE/USDT", "FLOW/USDT", "CHZ/USDT", "SAND/USDT",
-    "MANA/USDT", "AXS/USDT", "SNX/USDT", "KAVA/USDT", "FET/USDT"
+    "MANA/USDT", "AXS/USDT", "SNX/USDT", "KAVA/USDT", "FET/USDT",
+    "RNDR/USDT", "GALA/USDT", "MINA/USDT", "WOO/USDT", "ENS/USDT"
 ]
 
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
@@ -49,9 +50,9 @@ state = {}
 daily_pnl = {"value": 0.0, "date": datetime.now(timezone.utc).date()}
 
 # ==========================================
-# 2. إرسال رسائل تيليجرام
+# 2. إرسال رسائل تيليجرام (متوافق مع Async)
 # ==========================================
-def send(msg):
+def send_sync(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
         print("[TG ERROR] Token or Chat ID missing.")
         return
@@ -64,12 +65,19 @@ def send(msg):
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
+async def send(msg):
+    # تشغيل دالة الإرسال في الخلفية حتى لا توقف فحص باقي العملات
+    await asyncio.to_thread(send_sync, msg)
+
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
-def analyze_market_flow(exchange, symbol):
+# ==========================================
+# 3. تحليل السيولة والحيتان
+# ==========================================
+async def analyze_market_flow(exchange, symbol):
     try:
-        trades = exchange.fetch_trades(symbol, limit=500)
+        trades = await exchange.fetch_trades(symbol, limit=500)
         if not trades: return "غير متاح"
         
         buy_vol = sum(t['amount'] for t in trades if t['side'] == 'buy')
@@ -97,6 +105,9 @@ def analyze_market_flow(exchange, symbol):
         print(f"[FLOW ERROR] {symbol}: {e}")
         return "تعذر جلب البيانات"
 
+# ==========================================
+# 4. الرسائل
+# ==========================================
 def msg_entry(sym, side, price, sl, tp, rsi, flow_data):
     if side == "LONG":
         title = "🟢 <b>إشارة صفقة شراء (LONG)</b>"
@@ -141,7 +152,7 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct):
             f"📝 السبب: {ar_reason}")
 
 # ==========================================
-# 3. المؤشرات الفنية والاستراتيجية
+# 5. المؤشرات الفنية
 # ==========================================
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
@@ -180,7 +191,6 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
     prev  = df.iloc[-3]
     price = last["close"]
 
-    # إدارة الخروج (لم نغيرها)
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
@@ -192,34 +202,33 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
 
     if position is not None: return None
 
-    # شروط الدخول
     cross_up   = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
     cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
-    
-    # ==========================================
-    # ⚠️ وضع الاختبار: تم إزالة الشروط الصارمة مؤقتاً
-    # ==========================================
-    if (cross_up and htf_trend == "UP"):
+    vol_ok    = last["volume"] > 1.2 * last["vol_ma"]
+    macd_up   = last["macd_hist"] > 0 and last["macd_hist"] > prev["macd_hist"]
+    macd_down = last["macd_hist"] < 0 and last["macd_hist"] < prev["macd_hist"]
+
+    # شروط الدخول (الاستراتيجية الصارمة)
+    if (cross_up and htf_trend == "UP" and 40 < last["rsi"] < 70 and vol_ok and macd_up):
         return {"action": "ENTRY", "side": "LONG", "price": price,
                 "sl": price - 1.5 * last["atr"], "tp": price + 3.0 * last["atr"], "rsi": last["rsi"]}
 
-    if (cross_down and htf_trend == "DOWN"):
+    if (cross_down and htf_trend == "DOWN" and 30 < last["rsi"] < 60 and vol_ok and macd_down):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
                 "sl": price + 1.5 * last["atr"], "tp": price - 3.0 * last["atr"], "rsi": last["rsi"]}
-    # ==========================================
 
     return None
 
 # ==========================================
-# 4. دالة الفحص الرئيسية
+# 6. دالة الفحص (Async)
 # ==========================================
-def scan_symbol(exchange, symbol):
+async def scan_symbol(exchange, symbol):
     try:
         if symbol not in state:
             state[symbol] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None}
             
-        ohlcv_5m = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=300)
-        ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=300)
+        ohlcv_5m = await exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=300)
+        ohlcv_1h = await exchange.fetch_ohlcv(symbol, "1h", limit=300)
         
         if len(ohlcv_5m) < 210 or len(ohlcv_1h) < 200:
             return
@@ -256,8 +265,8 @@ def scan_symbol(exchange, symbol):
 
         if signal["action"] == "ENTRY":
             state[symbol].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
-            flow_data = analyze_market_flow(exchange, symbol)
-            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], flow_data))
+            flow_data = await analyze_market_flow(exchange, symbol)
+            await send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], flow_data))
 
         elif signal["action"] == "EXIT":
             pnl = (signal["price"] - entry) / entry * 100
@@ -265,39 +274,50 @@ def scan_symbol(exchange, symbol):
             state[symbol].update({"position": None, "entry": None, "sl": None, "tp": None})
             daily_pnl["value"] += pnl * RISK_PCT / 100
             
-            send(msg_exit(symbol, pos, signal["price"], entry, signal["reason"], pnl))
+            await send(msg_exit(symbol, pos, signal["price"], entry, signal["reason"], pnl))
             
             if daily_pnl["value"] <= -MAX_DAILY_LOSS:
-                send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nلقد وصلت للحد الأقصى للخسارة اليومية (-{MAX_DAILY_LOSS}%).")
+                await send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nلقد وصلت للحد الأقصى للخسارة اليومية (-{MAX_DAILY_LOSS}%).")
 
     except Exception as e:
-        print(f"[ERROR] Scan {symbol}: {e}", flush=True)
+        # تجاهل الأخطاء البسيطة (مثل عدم توفر عملة معينة في المنصة) لعدم إيقاف البوت
+        pass
 
 # ==========================================
-# 5. التشغيل الرئيسي
+# 7. التشغيل الرئيسي
 # ==========================================
-def trading_loop():
-    print("[INIT] Starting bot with ccxt...", flush=True)
-    exchange = ccxt.binance({
+async def main_async():
+    print("[INIT] Starting bot with OKX (Async)...", flush=True)
+    
+    # استخدام OKX بدلاً من Binance
+    exchange = ccxt.okx({
         'enableRateLimit': True,
         'options': {'defaultType': 'spot'}
     })
 
-    send("🚀 <b>تم تشغيل بوت التداول (وضع الاختبار)</b>\n"
-         "➖➖➖➖➖➖➖➖\n"
-         f"🪙 عدد العملات المراقبة: <b>{len(TOP_50_SYMBOLS)} عملة</b>\n"
-         "⚠️ <b>تنبيه:</b> البوت في وضع تجربة الشروط، سترسل إشارات كثيرة.")
+    await send("🚀 <b>تم تشغيل بوت التداول (نظام OKX اللحظي)</b>\n"
+               "➖➖➖➖➖➖➖➖\n"
+               f"🪙 عدد العملات المراقبة: <b>{len(TOP_50_SYMBOLS)} عملة</b>\n"
+               f"🧠 الاستراتيجية: تقاطع EMA + RSI + MACD\n"
+               f"📈 فلتر الاتجاه: EMA 200 (فريم الساعة)\n"
+               f"🐋 مراقبة الحيتان وتدفق السيولة: <b>مفعلة</b>\n"
+               f"💰 إدارة المخاطر: {RISK_PCT}% لكل صفقة\n"
+               f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%")
 
     while True:
         try:
-            for sym in TOP_50_SYMBOLS:
-                scan_symbol(exchange, sym)
-                time.sleep(1) 
+            # فحص جميع العملات في نفس الوقت (توازياً) لسرعة قصوى
+            tasks = [scan_symbol(exchange, sym) for sym in TOP_50_SYMBOLS]
+            await asyncio.gather(*tasks)
                 
         except Exception as e:
             print(f"[FATAL] Loop error: {e}", flush=True)
         
-        time.sleep(SCAN_INTERVAL)
+        # انتظار 60 ثانية قبل الفحص التالي
+        await asyncio.sleep(SCAN_INTERVAL)
+
+def trading_loop():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
