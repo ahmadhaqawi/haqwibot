@@ -44,9 +44,8 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 
-# إعدادات صياد الحيتان
-WHALE_THRESHOLD = float(os.getenv("WHALE_THRESHOLD", "50000")) # الحد الأدنى للصفقة (50 ألف دولار)
-TOP_WHALE_SYMBOLS = TOP_50_SYMBOLS[:15] # فحص أفضل 15 عملة للحيتان لتخفيف الضغط
+WHALE_THRESHOLD = float(os.getenv("WHALE_THRESHOLD", "50000")) 
+TOP_WHALE_SYMBOLS = TOP_50_SYMBOLS[:15] 
 whale_last_ts = {sym: 0 for sym in TOP_WHALE_SYMBOLS}
 
 state = {}
@@ -199,7 +198,7 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
     return None
 
 # ==========================================
-# 4. دالة الفحص الرئيسية للصفقات
+# 4. دالة الفحص الرئيسية
 # ==========================================
 def scan_symbol(exchange, symbol):
     try:
@@ -262,24 +261,21 @@ def scan_symbol(exchange, symbol):
         print(f"[ERROR] Scan {symbol}: {e}", flush=True)
 
 # ==========================================
-# 5. صياد الحيتان (Whale Tracker)
+# 5. صياد الحيتان
 # ==========================================
 def track_whales(exchange):
     for sym in TOP_WHALE_SYMBOLS:
         try:
-            # جلب آخر 50 صفقة فقط
             trades = exchange.fetch_trades(sym, limit=50)
             if not trades: continue
             
-            # تصفية الصفقات الجديدة التي لم نفحصها بعد
             new_trades = [t for t in trades if t['timestamp'] > whale_last_ts[sym]]
             if not new_trades: continue
             
-            # تحديث وقت آخر صفقة
             whale_last_ts[sym] = new_trades[-1]['timestamp']
             
             for t in new_trades:
-                cost = t['cost'] # القيمة بالدولار (الكمية × السعر)
+                cost = t['cost']
                 if cost >= WHALE_THRESHOLD:
                     side_ar = "شراء" if t['side'] == 'buy' else "بيع"
                     emoji = "🟢" if t['side'] == 'buy' else "🔴"
@@ -291,7 +287,7 @@ def track_whales(exchange):
                            f"{emoji} النوع: <b>{side_ar}</b>\n"
                            f"💵 السعر: <code>{fmt(t['price'])}</code>")
                     send(msg)
-                    time.sleep(1) # تأخير بسيط لتجنب حظر تيليجرام
+                    time.sleep(1) 
                     
         except Exception as e:
             print(f"[WHALE ERROR] {sym}: {e}", flush=True)
@@ -299,19 +295,19 @@ def track_whales(exchange):
 def whale_loop(exchange):
     while True:
         track_whales(exchange)
-        time.sleep(30) # يفحص الحيتان كل 30 ثانية
+        time.sleep(30) 
 
 # ==========================================
 # 6. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting bot with ccxt...", flush=True)
-    exchange = ccxt.binance({
-        'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}
+    print("[INIT] Starting bot with OKX...", flush=True)
+    # تم التعديل هنا للاتصال بمنصة OKX لتجاوز حظر Binance
+    exchange = ccxt.okx({
+        'enableRateLimit': True
     })
 
-    send("🚀 <b>تم تشغيل بوت التداول (النسخة النهائية + صياد الحيتان)</b>\n"
+    send("🚀 <b>تم تشغيل بوت التداول (نظام OKX)</b>\n"
          "➖➖➖➖➖➖➖➖\n"
          f"🪙 العملات المراقبة: <b>{len(TOP_50_SYMBOLS)} عملة</b>\n"
          f"🧠 الاستراتيجية: تقاطع EMA + RSI + MACD\n"
@@ -320,7 +316,6 @@ def trading_loop():
          f"💰 إدارة المخاطر: {RISK_PCT}% لكل صفقة\n"
          f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%")
 
-    # تشغيل صياد الحيتان في مسار منفصل بالخلفية
     threading.Thread(target=whale_loop, args=(exchange,), daemon=True).start()
 
     while True:
