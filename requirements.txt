@@ -1,5 +1,5 @@
-ccxt
-requests
+python-binance
 pandas
-pandas-ta
-flask
+numpy
+requests
+Flask
