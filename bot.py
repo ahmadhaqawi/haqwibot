@@ -26,7 +26,6 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# أزواج العقود الآجلة في OKX (Swap)
 FUTURES_SYMBOLS = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", 
     "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
@@ -35,13 +34,16 @@ FUTURES_SYMBOLS = [
     "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT"
 ]
 
-# تم التعديل إلى 5 دقائق
 TIMEFRAME = "5m" 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 
-# نسبة الرافعة المالية المقترحة (للتنبيه فقط)
+# إعدادات الحيتان
+WHALE_THRESHOLD = float(os.getenv("WHALE_THRESHOLD", "50000")) 
+TOP_WHALE_SYMBOLS = FUTURES_SYMBOLS[:10] # تتبع الحيتان في أفضل 10 عملات فقط لتخفيف الضغط
+whale_last_ts = {sym: 0 for sym in TOP_WHALE_SYMBOLS}
+
 LEVERAGE = 5 
 
 state = {}
@@ -52,7 +54,6 @@ daily_pnl = {"value": 0.0, "date": datetime.now(timezone.utc).date()}
 # ==========================================
 def send(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
-        print("[TG ERROR] Token or Chat ID missing.")
         return
     try:
         requests.post(
@@ -66,7 +67,37 @@ def send(msg):
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
-def msg_entry(sym, side, price, sl, tp, rsi):
+# تحليل تدفق السيولة للعقود
+def analyze_market_flow(exchange, symbol):
+    try:
+        trades = exchange.fetch_trades(symbol, limit=300)
+        if not trades: return "غير متاح"
+        
+        buy_vol = sum(t['amount'] for t in trades if t['side'] == 'buy')
+        sell_vol = sum(t['amount'] for t in trades if t['side'] == 'sell')
+        total_vol = buy_vol + sell_vol
+        
+        buy_ratio = (buy_vol / total_vol) * 100 if total_vol > 0 else 50
+        
+        if buy_ratio >= 60:
+            flow_text = f"🟢 تدفق سيولة شراء (لونق) قوي ({buy_ratio:.0f}%)"
+        elif buy_ratio <= 40:
+            flow_text = f"🔴 تدفق سيولة بيع (شورت) قوي ({100-buy_ratio:.0f}%)"
+        else:
+            flow_text = f"⚖️ تدفق سيولة متوازن (شراء {buy_ratio:.0f}% | بيع {100-buy_ratio:.0f}%)"
+
+        max_trade = max(trades, key=lambda t: t['cost'])
+        max_trade_usdt = max_trade['cost']
+        
+        whale_text = ""
+        if max_trade_usdt > WHALE_THRESHOLD:
+            whale_text = f"\n🐋 <b>صفقة حيتان:</b> <code>${max_trade_usdt:,.0f}</code>"
+            
+        return flow_text + whale_text
+    except Exception as e:
+        return "تعذر جلب البيانات"
+
+def msg_entry(sym, side, price, sl, tp, rsi, flow_data):
     if side == "LONG":
         title = "🟢 <b>إشارة لونق (LONG) - فيوتشر</b>"
         liq = price * (1 - (1/LEVERAGE) + 0.005) 
@@ -86,8 +117,8 @@ def msg_entry(sym, side, price, sl, tp, rsi):
             f"🛑 وقف الخسارة (SL): <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
             f"🎯 هدف الربح (TP): <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
             f"⚠️ <b>سعر التصفية التقريبي:</b> <code>{fmt(liq)}</code>\n"
-            f"📊 RSI: <code>{rsi:.1f}</code>\n"
-            f"⚖️ الربح للخسارة: <code>1:{reward/risk:.1f}</code>\n"
+            f"➖➖➖➖➖➖➖➖\n"
+            f"{flow_data}\n"
             f"➖➖➖➖➖➖➖➖\n"
             f"💡 <i>نصيحة: بمجرد تحقق ربح 1%، انقل وقف الخسارة لنقطة الدخول.</i>")
 
@@ -148,7 +179,6 @@ def check_signal(df, position, entry_price=None, sl=None, tp=None):
     prev  = df.iloc[-3]
     price = last["close"]
 
-    # إدارة الخروج
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
@@ -160,23 +190,19 @@ def check_signal(df, position, entry_price=None, sl=None, tp=None):
 
     if position is not None: return None
 
-    # شروط الدخول
     cross_up   = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
     cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
-    vol_ok     = last["volume"] > 1.2 * last["vol_ma"]
+    vol_ok     = last["volume"] > 1.2 * last["vol_ma"] # فلتر السيولة
     macd_up    = last["macd_hist"] > 0 and last["macd_hist"] > prev["macd_hist"]
     macd_down  = last["macd_hist"] < 0 and last["macd_hist"] < prev["macd_hist"]
 
-    # فلتر الاتجاه
     trend_up   = price > last["ema200"]
     trend_down = price < last["ema200"]
 
-    # LONGS
     if (cross_up and trend_up and 40 < last["rsi"] < 70 and vol_ok and macd_up):
         return {"action": "ENTRY", "side": "LONG", "price": price,
                 "sl": price - 2.0 * last["atr"], "tp": price + 4.0 * last["atr"], "rsi": last["rsi"]}
 
-    # SHORTS
     if (cross_down and trend_down and 30 < last["rsi"] < 60 and vol_ok and macd_down):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
                 "sl": price + 2.0 * last["atr"], "tp": price - 4.0 * last["atr"], "rsi": last["rsi"]}
@@ -223,7 +249,9 @@ def scan_symbol(exchange, symbol):
 
         if signal["action"] == "ENTRY":
             state[symbol].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
-            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"]))
+            # جلب تدفق السيولة عند وجود إشارة
+            flow_data = analyze_market_flow(exchange, symbol)
+            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], flow_data))
 
         elif signal["action"] == "EXIT":
             pnl = (signal["price"] - entry) / entry * 100
@@ -241,10 +269,50 @@ def scan_symbol(exchange, symbol):
         print(f"[ERROR] Scan {symbol}: {e}", flush=True)
 
 # ==========================================
-# 5. التشغيل الرئيسي
+# 5. صياد الحيتان للفيوتشر
+# ==========================================
+def track_whales(exchange):
+    for sym in TOP_WHALE_SYMBOLS:
+        try:
+            if sym not in exchange.markets:
+                continue
+
+            trades = exchange.fetch_trades(sym, limit=50)
+            if not trades: continue
+            
+            new_trades = [t for t in trades if t['timestamp'] > whale_last_ts[sym]]
+            if not new_trades: continue
+            
+            whale_last_ts[sym] = new_trades[-1]['timestamp']
+            
+            for t in new_trades:
+                cost = t['cost']
+                if cost >= WHALE_THRESHOLD:
+                    side_ar = "شراء (لونق)" if t['side'] == 'buy' else "بيع (شورت)"
+                    emoji = "🟢" if t['side'] == 'buy' else "🔴"
+                    
+                    msg = (f"🐋 <b>تنبيه حيتان (فيوتشر)!</b>\n"
+                           f"➖➖➖➖➖➖➖➖\n"
+                           f"🪙 الزوج: <code>{sym}</code>\n"
+                           f"💰 القيمة: <code>${cost:,.0f}</code>\n"
+                           f"{emoji} النوع: <b>{side_ar}</b>\n"
+                           f"💵 السعر: <code>{fmt(t['price'])}</code>")
+                    send(msg)
+                    time.sleep(1) 
+                    
+        except Exception as e:
+            pass
+
+def whale_loop(exchange):
+    while True:
+        track_whales(exchange)
+        time.sleep(30) 
+
+# ==========================================
+# 6. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting Futures Bot on 5m timeframe...", flush=True)
+    print("[INIT] Starting Futures Bot with Whale Tracker...", flush=True)
     
     exchange = ccxt.okx({
         'enableRateLimit': True,
@@ -253,14 +321,16 @@ def trading_loop():
     
     exchange.load_markets()
 
-    send(f"🚀 <b>تم تشغيل بوت العقود الآجلة (Futures)</b>\n"
+    send(f"🚀 <b>تم تشغيل بوت العقود الآجلة + صياد الحيتان</b>\n"
          f"➖➖➖➖➖➖➖➖\n"
          f"🪙 العملات المراقبة: <b>{len(FUTURES_SYMBOLS)} عملة</b>\n"
-         f"⏱️ الفريم الزمني: <b>5 دقائق (سريع)</b>\n"
-         f"⚙️ الرافعة المالية: <b>{LEVERAGE}x</b>\n"
-         f"📈 الاستراتيجية: EMA + RSI + MACD + ATR\n"
-         f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%\n"
-         f"⚠️ <i>تأكد من إعداد الرافعة المالية في حسابك لتطابق البوت.</i>")
+         f"⏱️ الفريم الزمني: <b>5 دقائق</b>\n"
+         f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
+         f"🐋 صياد الحيتان: <b>مفعل</b>\n"
+         f"📊 تحليل السيولة: <b>مفعل عند الإشارات</b>")
+
+    # تشغيل صياد الحيتان في الخلفية
+    threading.Thread(target=whale_loop, args=(exchange,), daemon=True).start()
 
     while True:
         try:
