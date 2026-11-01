@@ -31,7 +31,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # --- إعدادات مراقبة الصفقات متعددة المنصات ---
 WEBSOCKET_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "50000"))
+# تم رفع الحد الافتراضي إلى 100 ألف دولار لتقليل الإشعارات، يمكنك تغييره من Render
+WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "100000")) 
 
 # --- إعدادات استراتيجية التداول (OKX) ---
 FUTURES_SYMBOLS = [
@@ -95,13 +96,15 @@ async def listen_to_binance():
                             side_ar = "شراء (لونق)" if trade['m'] == False else "بيع (شورت)"
                             emoji = "🟢" if trade['m'] == False else "🔴"
                             symbol_display = trade['s'].replace('USDT', '/USDT')
-                            msg = (f"🐋 <b>تنبيه صفقة ضخمة!</b>\n"
+                            
+                            # التعديل الجديد للرسالة
+                            msg = (f"🐋 <b>{side_ar}</b>\n"
                                    f"➖➖➖➖➖➖➖➖\n"
-                                   f"🏢 المنصة: <b>Binance (فيوتشر)</b>\n"
                                    f"🪙 الزوج: <code>{symbol_display}</code>\n"
                                    f"💰 القيمة: <code>${cost:,.0f}</code>\n"
-                                   f"{emoji} النوع: <b>{side_ar}</b>\n"
-                                   f"💵 السعر: <code>{fmt(price)}</code>")
+                                   f"💵 السعر: <code>{fmt(price)}</code>\n"
+                                   f"➖➖➖➖➖➖➖➖\n"
+                                   f"🏢 المنصة: <b>Binance</b>")
                             send(msg)
         except Exception as e:
             print(f"[WS BINANCE ERROR] {e}. Reconnecting...", flush=True)
@@ -132,13 +135,15 @@ async def listen_to_okx():
                                 side_ar = "شراء (لونق)" if side == 'buy' else "بيع (شورت)"
                                 emoji = "🟢" if side == 'buy' else "🔴"
                                 symbol_display = trade['instId'].replace("-SWAP", "").replace("-", "/")
-                                msg = (f"🐋 <b>تنبيه صفقة ضخمة!</b>\n"
+                                
+                                # التعديل الجديد للرسالة
+                                msg = (f"🐋 <b>{side_ar}</b>\n"
                                        f"➖➖➖➖➖➖➖➖\n"
-                                       f"🏢 المنصة: <b>OKX (فيوتشر)</b>\n"
                                        f"🪙 الزوج: <code>{symbol_display}</code>\n"
                                        f"💰 القيمة: <code>${cost:,.0f}</code>\n"
-                                       f"{emoji} النوع: <b>{side_ar}</b>\n"
-                                       f"💵 السعر: <code>{fmt(price)}</code>")
+                                       f"💵 السعر: <code>{fmt(price)}</code>\n"
+                                       f"➖➖➖➖➖➖➖➖\n"
+                                       f"🏢 المنصة: <b>OKX</b>")
                                 send(msg)
         except Exception as e:
             print(f"[WS OKX ERROR] {e}. Reconnecting...", flush=True)
@@ -169,13 +174,15 @@ async def listen_to_bybit():
                                 side_ar = "شراء (لونق)" if side == 'Buy' else "بيع (شورت)"
                                 emoji = "🟢" if side == 'Buy' else "🔴"
                                 symbol_display = trade['s'].replace('USDT', '/USDT')
-                                msg = (f"🐋 <b>تنبيه صفقة ضخمة!</b>\n"
+                                
+                                # التعديل الجديد للرسالة
+                                msg = (f"🐋 <b>{side_ar}</b>\n"
                                        f"➖➖➖➖➖➖➖➖\n"
-                                       f"🏢 المنصة: <b>Bybit (فيوتشر)</b>\n"
                                        f"🪙 الزوج: <code>{symbol_display}</code>\n"
                                        f"💰 القيمة: <code>${cost:,.0f}</code>\n"
-                                       f"{emoji} النوع: <b>{side_ar}</b>\n"
-                                       f"💵 السعر: <code>{fmt(price)}</code>")
+                                       f"💵 السعر: <code>{fmt(price)}</code>\n"
+                                       f"➖➖➖➖➖➖➖➖\n"
+                                       f"🏢 المنصة: <b>Bybit</b>")
                                 send(msg)
         except Exception as e:
             print(f"[WS BYBIT ERROR] {e}. Reconnecting...", flush=True)
@@ -339,8 +346,8 @@ def trading_loop():
          f"🪙 استراتيجية التداول: <b>{len(FUTURES_SYMBOLS)} عملة (OKX)</b>\n"
          f"⏱️ الفريم الزمني: <b>5 دقائق</b>\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
-         f"👁️ مراقب الصفقات (Binance + OKX + Bybit): <b>{len(WEBSOCKET_SYMBOLS)} عملة</b>\n"
-         f"💰 حد تنبيه الصفقات الضخمة: <b>${WHALE_THRESHOLD_WS:,.0f}</b>")
+         f"👁️ مراقب الصفقات (Binance + OKX + Bybit)\n"
+         f"💰 حد تنبيه الصفقات: <b>${WHALE_THRESHOLD_WS:,.0f}</b>")
 
     while True:
         try:
