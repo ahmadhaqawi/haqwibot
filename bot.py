@@ -26,18 +26,16 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
+# تم تعديلها لمراقبة أفضل 50 عملة تلقائياً
+TOP_COINS_COUNT = int(os.getenv("TOP_COINS_COUNT", "50"))
+
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 
 # حالة البوت لكل زوج
-state = {
-    sym: {"position": None, "entry": None, "sl": None, "tp": None,
-          "htf_trend": None, "last_candle_ts": None}
-    for sym in SYMBOLS
-}
+state = {}
 daily_pnl = {"value": 0.0, "date": datetime.now(timezone.utc).date()}
 
 # ==========================================
@@ -62,7 +60,6 @@ def fmt(p):
 # دالة تحليل تدفق السيولة والصفقات العالية
 def analyze_market_flow(exchange, symbol):
     try:
-        # جلب آخر 500 صفقة
         trades = exchange.fetch_trades(symbol, limit=500)
         if not trades: return "غير متاح"
         
@@ -79,12 +76,11 @@ def analyze_market_flow(exchange, symbol):
         else:
             flow_text = f"⚖️ تدفق سيولة متوازن (شراء {buy_ratio:.0f}% | بيع {100-buy_ratio:.0f}%)"
 
-        # كشف الصفقات العالية (الحيتان)
         max_trade = max(trades, key=lambda t: t['cost'])
         max_trade_usdt = max_trade['cost']
         
         whale_text = ""
-        if max_trade_usdt > 50000: # إذا كانت الصفقة أكبر من 50 ألف دولار
+        if max_trade_usdt > 50000:
             whale_text = f"\n🐋 <b>صفقة حيتان:</b> <code>${max_trade_usdt:,.0f}</code>"
             
         return flow_text + whale_text
@@ -175,7 +171,6 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
     prev  = df.iloc[-3]
     price = last["close"]
 
-    # إدارة الخروج
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
@@ -187,7 +182,6 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
 
     if position is not None: return None
 
-    # شروط الدخول
     cross_up   = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
     cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
     vol_ok    = last["volume"] > 1.2 * last["vol_ma"]
@@ -209,6 +203,9 @@ def check_signal(df, htf_trend, position, entry_price=None, sl=None, tp=None):
 # ==========================================
 def scan_symbol(exchange, symbol):
     try:
+        if symbol not in state:
+            state[symbol] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None}
+            
         ohlcv_5m = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=300)
         ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=300)
         
@@ -247,10 +244,7 @@ def scan_symbol(exchange, symbol):
 
         if signal["action"] == "ENTRY":
             state[symbol].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
-            
-            # جلب تدفق السيولة فقط عند وجود إشارة (لتخفيف الضغط على السيرفر)
             flow_data = analyze_market_flow(exchange, symbol)
-            
             send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], flow_data))
 
         elif signal["action"] == "EXIT":
@@ -267,6 +261,19 @@ def scan_symbol(exchange, symbol):
     except Exception as e:
         print(f"[ERROR] Scan {symbol}: {e}", flush=True)
 
+# دالة جلب أفضل العملات من حيث السيولة
+def get_top_symbols(exchange, count=50):
+    try:
+        print("[INIT] Fetching top volume coins...", flush=True)
+        tickers = exchange.fetch_tickers()
+        usdt_pairs = {k: v for k, v in tickers.items() if k.endswith('/USDT')}
+        sorted_pairs = sorted(usdt_pairs.items(), key=lambda x: float(x[1]['quoteVolume'] or 0), reverse=True)
+        top = [p[0] for p in sorted_pairs[:count]]
+        return top
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch top symbols: {e}")
+        return ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+
 # ==========================================
 # 5. التشغيل الرئيسي
 # ==========================================
@@ -277,20 +284,31 @@ def trading_loop():
         'options': {'defaultType': 'spot'}
     })
 
-    send("🚀 <b>تم تشغيل بوت التداول بنجاح (نظام ccxt)</b>\n"
+    active_symbols = get_top_symbols(exchange, TOP_COINS_COUNT)
+    
+    send("🚀 <b>تم تشغيل بوت التداول بنجاح</b>\n"
          "➖➖➖➖➖➖➖➖\n"
-         f"🪙 الأزواج المراقبة: <code>{', '.join(SYMBOLS)}</code>\n"
+         f"🪙 عدد العملات المراقبة: <b>{len(active_symbols)} عملة</b> (الأعلى سيولة)\n"
          f"🧠 الاستراتيجية: تقاطع EMA + RSI + MACD\n"
          f"📈 فلتر الاتجاه: EMA 200 (فريم الساعة)\n"
-         f"🐋 مراقبة الحيتان وتدفق السيولة: <b>مفعلة</b>\n"
+         f"🐋 مراقبة الحيتان: <b>مفعلة</b>\n"
          f"💰 إدارة المخاطر: {RISK_PCT}% لكل صفقة\n"
          f"🛑 حد الخسارة اليومي: -{MAX_DAILY_LOSS}%")
 
+    last_symbol_update = time.time()
+
     while True:
         try:
-            for sym in SYMBOLS:
+            if time.time() - last_symbol_update > 3600:
+                active_symbols = get_top_symbols(exchange, TOP_COINS_COUNT)
+                last_symbol_update = time.time()
+                print("[UPDATE] Refreshed top symbols list.", flush=True)
+
+            for sym in active_symbols:
                 scan_symbol(exchange, sym)
-                time.sleep(2)
+                # تأخير ثانية واحدة بين كل عملة لتجنب حظر Binance API
+                time.sleep(1) 
+                
         except Exception as e:
             print(f"[FATAL] Loop error: {e}", flush=True)
         
