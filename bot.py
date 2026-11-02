@@ -92,7 +92,7 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
 def msg_exit(sym, side, price, entry, reason, pnl_pct):
     title = "⚪ <b>إغلاق صفقة لونق</b>" if side == "LONG" else "⚪ <b>إغلاق صفقة شورت</b>"
     status = "ربح ✅" if pnl_pct >= 0 else "خسارة ❌"
-    reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯", "EMA Cross": "كسر المتوسط 📉"}
+    reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯"}
     ar_reason = reasons_ar.get(reason, reason)
 
     leveraged_pnl = pnl_pct * LEVERAGE
@@ -107,26 +107,18 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct):
             f"📝 السبب: {ar_reason}")
 
 # ==========================================
-# 3. محرك مراقبة الصفقات
+# 3. محرك مراقبة الصفقات (الحيتان)
 # ==========================================
 async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, price):
     global last_whale_alert
     key = f"{platform}_{symbol_display}"
     now = time.time()
-    
     if now - last_whale_alert.get(key, 0) < WHALE_COOLDOWN:
         return 
-
     last_whale_alert[key] = now
-
-    msg = (f"🐋 <b>صفقة ضخمة</b>\n"
-           f"➖➖➖➖➖➖➖➖\n"
-           f"🪙 الزوج: <code>{symbol_display}</code>\n"
-           f"{emoji} النوع: <b>{side_ar}</b>\n"
-           f"💰 القيمة: <code>${cost:,.0f}</code>\n"
-           f"💵 السعر: <code>{fmt(price)}</code>\n"
-           f"➖➖➖➖➖➖➖➖\n"
-           f"🏢 المنصة: <b>{platform}</b>")
+    msg = (f"🐋 <b>صفقة ضخمة</b>\n➖➖➖➖➖➖➖➖\n🪙 الزوج: <code>{symbol_display}</code>\n"
+           f"{emoji} النوع: <b>{side_ar}</b>\n💰 القيمة: <code>${cost:,.0f}</code>\n"
+           f"💵 السعر: <code>{fmt(price)}</code>\n➖➖➖➖➖➖➖➖\n🏢 المنصة: <b>{platform}</b>")
     send(msg)
 
 async def listen_to_binance():
@@ -205,7 +197,7 @@ def run_websocket_loop():
     asyncio.run(run_websockets())
 
 # ==========================================
-# 4. المؤشرات الفنية (مع MACD)
+# 4. المؤشرات الفنية
 # ==========================================
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
@@ -264,14 +256,13 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
     prev_5m = df_5m.iloc[-3]
     price = last_5m["close"]
 
+    # إدارة الخروج (تم إلغاء الخروج بكسر المتوسط لتجنب الخسائر المتتالية)
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
-        if price <= last_5m["ema21"]: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "EMA Cross"}
     if position == "SHORT":
         if price >= sl: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Stop Loss"}
         if price <= tp: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Take Profit"}
-        if price >= last_5m["ema21"]: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "EMA Cross"}
 
     if position is not None: return None
 
@@ -280,42 +271,32 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
     vol_ok     = last_5m["volume"] > 1.2 * last_5m["vol_ma"] 
     adx_strong = last_5m["adx"] > 25
 
+    # 1. استراتيجية الترند
     cross_up   = prev_5m["ema9"] <= prev_5m["ema21"] and last_5m["ema9"] > last_5m["ema21"]
     cross_down = prev_5m["ema9"] >= prev_5m["ema21"] and last_5m["ema9"] < last_5m["ema21"]
 
+    # توسيع وقف الخسارة إلى 2.0 ATR لإعطاء مساحة للصفقة
     if (cross_up and trend_1h_up and adx_strong and vol_ok and 40 < last_5m["rsi"] < 70):
         return {"action": "ENTRY", "side": "LONG", "price": price,
-                "sl": price - 1.5 * last_5m["atr"], "tp": price + 3.0 * last_5m["atr"], 
+                "sl": price - 2.0 * last_5m["atr"], "tp": price + 4.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "ترند"}
 
     if (cross_down and trend_1h_down and adx_strong and vol_ok and 30 < last_5m["rsi"] < 60):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
-                "sl": price + 1.5 * last_5m["atr"], "tp": price - 3.0 * last_5m["atr"], 
+                "sl": price + 2.0 * last_5m["atr"], "tp": price - 4.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "ترند"}
 
-    breakout_vol = last_5m["volume"] > 2.0 * last_5m["vol_ma"]
-    if (price > last_5m["highest_high_20"] and breakout_vol and 50 < last_5m["rsi"] < 80):
+    # 2. استراتيجية الاختراق (جعلناها أصعب حتى لا تصطاد الاختراقات الوهمية)
+    breakout_vol = last_5m["volume"] > 2.5 * last_5m["vol_ma"] 
+    if (price > last_5m["highest_high_20"] and breakout_vol and 60 < last_5m["rsi"] < 80):
         return {"action": "ENTRY", "side": "LONG", "price": price,
-                "sl": price - 1.0 * last_5m["atr"], "tp": price + 2.0 * last_5m["atr"], 
+                "sl": price - 1.5 * last_5m["atr"], "tp": price + 3.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "اختراق ⚡"}
 
-    if (price < last_5m["lowest_low_20"] and breakout_vol and 20 < last_5m["rsi"] < 50):
+    if (price < last_5m["lowest_low_20"] and breakout_vol and 20 < last_5m["rsi"] < 40):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
-                "sl": price + 1.0 * last_5m["atr"], "tp": price - 2.0 * last_5m["atr"], 
+                "sl": price + 1.5 * last_5m["atr"], "tp": price - 3.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "اختراق ⚡"}
-
-    macd_cross_up   = prev_5m["macd_line"] <= prev_5m["macd_sig"] and last_5m["macd_line"] > last_5m["macd_sig"]
-    macd_cross_down = prev_5m["macd_line"] >= prev_5m["macd_sig"] and last_5m["macd_line"] < last_5m["macd_sig"]
-
-    if (macd_cross_up and trend_1h_up and vol_ok and 45 < last_5m["rsi"] < 70):
-        return {"action": "ENTRY", "side": "LONG", "price": price,
-                "sl": price - 1.2 * last_5m["atr"], "tp": price + 2.5 * last_5m["atr"], 
-                "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "زخم MACD 🚀"}
-
-    if (macd_cross_down and trend_1h_down and vol_ok and 30 < last_5m["rsi"] < 55):
-        return {"action": "ENTRY", "side": "SHORT", "price": price,
-                "sl": price + 1.2 * last_5m["atr"], "tp": price - 2.5 * last_5m["atr"], 
-                "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "زخم MACD 🚀"}
 
     return None
 
@@ -384,7 +365,7 @@ def scan_symbol(exchange, symbol):
 # 6. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting 3-Strategy Bot...", flush=True)
+    print("[INIT] Starting Safe V5 Bot...", flush=True)
     
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
@@ -395,12 +376,11 @@ def trading_loop():
     })
     exchange.load_markets()
 
-    send(f"🚀 <b>تم تشغيل بوت اقتناص الفرص (V4)</b>\n"
+    send(f"🛡️ <b>تم تشغيل بوت التداول الآمن (V5)</b>\n"
          f"➖➖➖➖➖➖➖➖\n"
-         f"📈 <b>الاستراتيجية 1:</b> تداول الترند\n"
-         f"⚡ <b>الاستراتيجية 2:</b> الاختراقات\n"
-         f"🚀 <b>الاستراتيجية 3:</b> الزخم (MACD)\n"
-         f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f}\n"
+         f"📈 <b>الاستراتيجية:</b> ترند واختراق (معدلة)\n"
+         f"🛑 <b>وقف الخسارة:</b> واسع (2.0 ATR)\n"
+         f"🚫 <b>الخروج بكسر المتوسط:</b> ملغي\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
 
     while True:
