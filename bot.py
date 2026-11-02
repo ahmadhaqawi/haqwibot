@@ -127,10 +127,11 @@ async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, pr
     
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     
+    # تم مسح اسم المنصة من هنا
     msg = (f"🐋 <b>صفقة ضخمة</b>\n➖➖➖➖➖➖➖➖\n🪙 الزوج: <code>{symbol_display}</code>\n"
            f"{emoji} النوع: <b>{side_ar}</b>\n💰 القيمة: <code>${cost:,.0f}</code>\n"
            f"💵 السعر: <code>{fmt(price)}</code>\n⏰ الوقت: <code>{now_str}</code>\n"
-           f"➖➖➖➖➖➖➖➖\n🏢 المنصة: <b>{platform}</b>")
+           f"➖➖➖➖➖➖➖➖")
     send(msg)
 
 async def listen_to_binance():
