@@ -29,7 +29,8 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "250000")) 
+# تم رفع حد الحيتان إلى 500,000 دولار
+WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "500000")) 
 WHALE_COOLDOWN = int(os.getenv("WHALE_COOLDOWN", "600")) 
 last_whale_alert = {}
 
@@ -256,7 +257,6 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
     prev_5m = df_5m.iloc[-3]
     price = last_5m["close"]
 
-    # إدارة الخروج (تم إلغاء الخروج بكسر المتوسط لتجنب الخسائر المتتالية)
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
@@ -271,11 +271,9 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
     vol_ok     = last_5m["volume"] > 1.2 * last_5m["vol_ma"] 
     adx_strong = last_5m["adx"] > 25
 
-    # 1. استراتيجية الترند
     cross_up   = prev_5m["ema9"] <= prev_5m["ema21"] and last_5m["ema9"] > last_5m["ema21"]
     cross_down = prev_5m["ema9"] >= prev_5m["ema21"] and last_5m["ema9"] < last_5m["ema21"]
 
-    # توسيع وقف الخسارة إلى 2.0 ATR لإعطاء مساحة للصفقة
     if (cross_up and trend_1h_up and adx_strong and vol_ok and 40 < last_5m["rsi"] < 70):
         return {"action": "ENTRY", "side": "LONG", "price": price,
                 "sl": price - 2.0 * last_5m["atr"], "tp": price + 4.0 * last_5m["atr"], 
@@ -286,7 +284,6 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
                 "sl": price + 2.0 * last_5m["atr"], "tp": price - 4.0 * last_5m["atr"], 
                 "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "ترند"}
 
-    # 2. استراتيجية الاختراق (جعلناها أصعب حتى لا تصطاد الاختراقات الوهمية)
     breakout_vol = last_5m["volume"] > 2.5 * last_5m["vol_ma"] 
     if (price > last_5m["highest_high_20"] and breakout_vol and 60 < last_5m["rsi"] < 80):
         return {"action": "ENTRY", "side": "LONG", "price": price,
@@ -381,6 +378,7 @@ def trading_loop():
          f"📈 <b>الاستراتيجية:</b> ترند واختراق (معدلة)\n"
          f"🛑 <b>وقف الخسارة:</b> واسع (2.0 ATR)\n"
          f"🚫 <b>الخروج بكسر المتوسط:</b> ملغي\n"
+         f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f}\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
 
     while True:
