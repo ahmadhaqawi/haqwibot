@@ -26,10 +26,10 @@ def run_flask():
 # ==========================================
 # 1. الإعدادات والمتغيرات (Config)
 # ==========================================
-# تحديد توقيت السعودية (UTC+3)
 KSA_TZ = timezone(timedelta(hours=3))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# هنا يمكنك وضع أكثر من رقم مفصولين بفاصلة (بدون مسافات)
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "500000")) 
@@ -55,19 +55,24 @@ state = {}
 daily_pnl = {"value": 0.0, "date": datetime.now(KSA_TZ).date()}
 
 # ==========================================
-# 2. إرسال رسائل تيليجرام
+# 2. إرسال رسائل تيليجرام (يدعم عدة أرقام)
 # ==========================================
 def send(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
         return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=10)
-    except Exception as e:
-        print(f"[TG ERROR] {e}")
+    
+    # تقسيم الأرقام إذا كان هناك أكثر من رقم
+    chat_ids = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(",") if cid.strip()]
+    
+    for cid in chat_ids:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": cid, "text": msg, "parse_mode": "HTML",
+                      "disable_web_page_preview": True},
+                timeout=10)
+        except Exception as e:
+            print(f"[TG ERROR] Failed to send to {cid}: {e}")
 
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
@@ -81,7 +86,6 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
     risk = abs(price - sl) / price * 100
     reward = abs(tp - price) / price * 100
     
-    # الوقت المحلي للسعودية
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     
     return (f"{title}\n"
@@ -345,7 +349,7 @@ def scan_symbol(exchange, symbol):
                 "entry": signal["price"], 
                 "sl": signal["sl"], 
                 "tp": signal["tp"],
-                "entry_time": datetime.now(timezone.utc) # نحفظ الوقت بتوقيت UTC للحسابات الدقيقة
+                "entry_time": datetime.now(timezone.utc)
             })
             send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"]))
 
