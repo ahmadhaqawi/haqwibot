@@ -2,7 +2,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import asyncio
 import websockets
 import json
@@ -26,10 +26,12 @@ def run_flask():
 # ==========================================
 # 1. الإعدادات والمتغيرات (Config)
 # ==========================================
+# تحديد توقيت السعودية (UTC+3)
+KSA_TZ = timezone(timedelta(hours=3))
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# تم رفع حد الحيتان إلى 500,000 دولار
 WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "500000")) 
 WHALE_COOLDOWN = int(os.getenv("WHALE_COOLDOWN", "600")) 
 last_whale_alert = {}
@@ -50,7 +52,7 @@ MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 LEVERAGE = 5 
 
 state = {}
-daily_pnl = {"value": 0.0, "date": datetime.now(timezone.utc).date()}
+daily_pnl = {"value": 0.0, "date": datetime.now(KSA_TZ).date()}
 
 # ==========================================
 # 2. إرسال رسائل تيليجرام
@@ -79,18 +81,22 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
     risk = abs(price - sl) / price * 100
     reward = abs(tp - price) / price * 100
     
+    # الوقت المحلي للسعودية
+    now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
+    
     return (f"{title}\n"
             f"➖➖➖➖➖➖➖➖\n"
             f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
             f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
             f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
+            f"⏰ وقت الدخول: <code>{now_str}</code>\n"
             f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
             f"🎯 هدف الربح: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
             f"📊 RSI: <code>{rsi:.1f}</code> | ADX: <code>{adx:.1f}</code>\n"
             f"➖➖➖➖➖➖➖➖\n"
             f"💡 <i>بمجرد ربح 1%، قم بتعديل وقف الخسارة إلى سعر الدخول.</i>")
 
-def msg_exit(sym, side, price, entry, reason, pnl_pct):
+def msg_exit(sym, side, price, entry, reason, pnl_pct, duration, entry_str, exit_str):
     title = "⚪ <b>إغلاق صفقة لونق</b>" if side == "LONG" else "⚪ <b>إغلاق صفقة شورت</b>"
     status = "ربح ✅" if pnl_pct >= 0 else "خسارة ❌"
     reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯"}
@@ -101,10 +107,11 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct):
     return (f"{title}\n"
             f"➖➖➖➖➖➖➖➖\n"
             f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
-            f"📥 الدخول: <code>{fmt(entry)}</code>\n"
-            f"📤 الخروج: <code>{fmt(price)}</code>\n"
+            f"📥 الدخول: <code>{fmt(entry)}</code> (⏰ {entry_str})\n"
+            f"📤 الخروج: <code>{fmt(price)}</code> (⏰ {exit_str})\n"
             f"📊 النتيجة: <code>{pnl_pct:+.2f}%</code>\n"
             f"🔥 <b>بالرافعة ({LEVERAGE}x):</b> <code>{leveraged_pnl:+.2f}%</code>\n"
+            f"⏱️ <b>مدة الصفقة:</b> <code>{duration}</code>\n"
             f"📝 السبب: {ar_reason}")
 
 # ==========================================
@@ -117,9 +124,13 @@ async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, pr
     if now - last_whale_alert.get(key, 0) < WHALE_COOLDOWN:
         return 
     last_whale_alert[key] = now
+    
+    now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
+    
     msg = (f"🐋 <b>صفقة ضخمة</b>\n➖➖➖➖➖➖➖➖\n🪙 الزوج: <code>{symbol_display}</code>\n"
            f"{emoji} النوع: <b>{side_ar}</b>\n💰 القيمة: <code>${cost:,.0f}</code>\n"
-           f"💵 السعر: <code>{fmt(price)}</code>\n➖➖➖➖➖➖➖➖\n🏢 المنصة: <b>{platform}</b>")
+           f"💵 السعر: <code>{fmt(price)}</code>\n⏰ الوقت: <code>{now_str}</code>\n"
+           f"➖➖➖➖➖➖➖➖\n🏢 المنصة: <b>{platform}</b>")
     send(msg)
 
 async def listen_to_binance():
@@ -209,14 +220,6 @@ def rsi(series, period=14):
     rs    = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    line     = ema_fast - ema_slow
-    sig_line = ema(line, signal)
-    hist     = line - sig_line
-    return line, sig_line, hist
-
 def adx(high, low, close, period=14):
     up = high.diff()
     down = -low.diff()
@@ -243,11 +246,6 @@ def add_indicators(df):
     df["vol_ma"] = df["volume"].rolling(20).mean()
     df["highest_high_20"] = df["high"].rolling(20).max().shift(1)
     df["lowest_low_20"]   = df["low"].rolling(20).min().shift(1)
-    
-    macd_line, macd_sig, macd_hist = macd(df["close"])
-    df["macd_line"] = macd_line
-    df["macd_sig"]  = macd_sig
-    df["macd_hist"] = macd_hist
     return df
 
 def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
@@ -306,7 +304,7 @@ def scan_symbol(exchange, symbol):
             return
 
         if symbol not in state:
-            state[symbol] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None}
+            state[symbol] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None, "entry_time": None}
             
         ohlcv_5m = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
         ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=50)
@@ -333,7 +331,7 @@ def scan_symbol(exchange, symbol):
 
         if not signal: return
 
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(KSA_TZ).date()
         if daily_pnl["date"] != today:
             daily_pnl["value"] = 0.0
             daily_pnl["date"] = today
@@ -341,16 +339,40 @@ def scan_symbol(exchange, symbol):
             return 
 
         if signal["action"] == "ENTRY":
-            state[symbol].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
+            state[symbol].update({
+                "position": signal["side"], 
+                "entry": signal["price"], 
+                "sl": signal["sl"], 
+                "tp": signal["tp"],
+                "entry_time": datetime.now(timezone.utc) # نحفظ الوقت بتوقيت UTC للحسابات الدقيقة
+            })
             send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"]))
 
         elif signal["action"] == "EXIT":
             pnl = (signal["price"] - entry) / entry * 100
             if pos == "SHORT": pnl = -pnl
-            state[symbol].update({"position": None, "entry": None, "sl": None, "tp": None})
+            
+            exit_time_utc = datetime.now(timezone.utc)
+            entry_time_utc = state[symbol]["entry_time"]
+            
+            duration_str = "غير محدد"
+            entry_str = "-"
+            exit_str = "-"
+            
+            if entry_time_utc:
+                time_diff = exit_time_utc - entry_time_utc
+                total_seconds = int(time_diff.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                duration_str = f"{hours} ساعة و {minutes} دقيقة" if hours > 0 else f"{minutes} دقيقة"
+                
+                entry_str = entry_time_utc.astimezone(KSA_TZ).strftime("%I:%M %p")
+                exit_str = exit_time_utc.astimezone(KSA_TZ).strftime("%I:%M %p")
+
+            state[symbol].update({"position": None, "entry": None, "sl": None, "tp": None, "entry_time": None})
             
             daily_pnl["value"] += (pnl * LEVERAGE) * RISK_PCT / 100
-            send(msg_exit(symbol, pos, signal["price"], entry, signal["reason"], pnl))
+            send(msg_exit(symbol, pos, signal["price"], entry, signal["reason"], pnl, duration_str, entry_str, exit_str))
             
             if daily_pnl["value"] <= -MAX_DAILY_LOSS:
                 send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nوصلت للحد الأقصى للخسارة اليومية.")
@@ -362,7 +384,7 @@ def scan_symbol(exchange, symbol):
 # 6. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting Safe V5 Bot...", flush=True)
+    print("[INIT] Starting V7 Bot (Local Time)...", flush=True)
     
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
@@ -373,11 +395,11 @@ def trading_loop():
     })
     exchange.load_markets()
 
-    send(f"🛡️ <b>تم تشغيل بوت التداول الآمن (V5)</b>\n"
+    send(f"🛡️ <b>تم تشغيل البوت (V7) - التوقيت المحلي</b>\n"
          f"➖➖➖➖➖➖➖➖\n"
-         f"📈 <b>الاستراتيجية:</b> ترند واختراق (معدلة)\n"
+         f"📈 <b>الاستراتيجية:</b> ترند واختراق\n"
          f"🛑 <b>وقف الخسارة:</b> واسع (2.0 ATR)\n"
-         f"🚫 <b>الخروج بكسر المتوسط:</b> ملغي\n"
+         f"⏰ <b>التوقيت:</b> توقيت السعودية (UTC+3)\n"
          f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f}\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
 
