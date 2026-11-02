@@ -29,7 +29,6 @@ def run_flask():
 KSA_TZ = timezone(timedelta(hours=3))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-# هنا يمكنك وضع أكثر من رقم مفصولين بفاصلة (بدون مسافات)
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "500000")) 
@@ -45,25 +44,25 @@ FUTURES_SYMBOLS = [
     "SUI/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT", "INJ/USDT:USDT",
     "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT"
 ]
-TIMEFRAME = "5m" 
+
+# تم إضافة الفريمين معاً
+TIMEFRAMES = ["5m", "15m"] 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 LEVERAGE = 5 
 
+# حالة البوت لكل (عملة + فريم)
 state = {}
 daily_pnl = {"value": 0.0, "date": datetime.now(KSA_TZ).date()}
 
 # ==========================================
-# 2. إرسال رسائل تيليجرام (يدعم عدة أرقام)
+# 2. إرسال رسائل تيليجرام
 # ==========================================
 def send(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
         return
-    
-    # تقسيم الأرقام إذا كان هناك أكثر من رقم
     chat_ids = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(",") if cid.strip()]
-    
     for cid in chat_ids:
         try:
             requests.post(
@@ -85,11 +84,9 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
         
     risk = abs(price - sl) / price * 100
     reward = abs(tp - price) / price * 100
-    
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     
     return (f"{title}\n"
-            f"➖➖➖➖➖➖➖➖\n"
             f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
             f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
             f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
@@ -97,11 +94,10 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
             f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
             f"🎯 هدف الربح: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
             f"📊 RSI: <code>{rsi:.1f}</code> | ADX: <code>{adx:.1f}</code>\n"
-            f"➖➖➖➖➖➖➖➖\n"
             f"💡 <i>بمجرد ربح 1%، قم بتعديل وقف الخسارة إلى سعر الدخول.</i>")
 
-def msg_exit(sym, side, price, entry, reason, pnl_pct, duration, entry_str, exit_str):
-    title = "⚪ <b>إغلاق صفقة لونق</b>" if side == "LONG" else "⚪ <b>إغلاق صفقة شورت</b>"
+def msg_exit(sym, side, timeframe, price, entry, reason, pnl_pct, duration, entry_str, exit_str):
+    title = f"⚪ <b>إغلاق صفقة لونق ({timeframe})</b>" if side == "LONG" else f"⚪ <b>إغلاق صفقة شورت ({timeframe})</b>"
     status = "ربح ✅" if pnl_pct >= 0 else "خسارة ❌"
     reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯"}
     ar_reason = reasons_ar.get(reason, reason)
@@ -109,7 +105,6 @@ def msg_exit(sym, side, price, entry, reason, pnl_pct, duration, entry_str, exit
     leveraged_pnl = pnl_pct * LEVERAGE
 
     return (f"{title}\n"
-            f"➖➖➖➖➖➖➖➖\n"
             f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
             f"📥 الدخول: <code>{fmt(entry)}</code> (⏰ {entry_str})\n"
             f"📤 الخروج: <code>{fmt(price)}</code> (⏰ {exit_str})\n"
@@ -131,11 +126,12 @@ async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, pr
     
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     
-    # تم مسح اسم المنصة من هنا
-    msg = (f"🐋 <b>صفقة ضخمة</b>\n➖➖➖➖➖➖➖➖\n🪙 الزوج: <code>{symbol_display}</code>\n"
-           f"{emoji} النوع: <b>{side_ar}</b>\n💰 القيمة: <code>${cost:,.0f}</code>\n"
-           f"💵 السعر: <code>{fmt(price)}</code>\n⏰ الوقت: <code>{now_str}</code>\n"
-           f"➖➖➖➖➖➖➖➖")
+    msg = (f"🐋 <b>صفقة ضخمة</b>\n"
+           f"🪙 الزوج: <code>{symbol_display}</code>\n"
+           f"{emoji} النوع: <b>{side_ar}</b>\n"
+           f"💰 القيمة: <code>${cost:,.0f}</code>\n"
+           f"💵 السعر: <code>{fmt(price)}</code>\n"
+           f"⏰ الوقت: <code>{now_str}</code>")
     send(msg)
 
 async def listen_to_binance():
@@ -253,12 +249,12 @@ def add_indicators(df):
     df["lowest_low_20"]   = df["low"].rolling(20).min().shift(1)
     return df
 
-def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
-    if len(df_5m) < 50 or len(df_1h) < 50: return None
+def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None, tp=None):
+    if len(df_main) < 50 or len(df_1h) < 50: return None
     
-    last_5m = df_5m.iloc[-2]      
-    prev_5m = df_5m.iloc[-3]
-    price = last_5m["close"]
+    last_main = df_main.iloc[-2]      
+    prev_main = df_main.iloc[-3]
+    price = last_main["close"]
 
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
@@ -271,68 +267,72 @@ def check_signal(df_5m, df_1h, position, entry_price=None, sl=None, tp=None):
 
     trend_1h_up   = df_1h.iloc[-2]["close"] > df_1h.iloc[-2]["ema21"]
     trend_1h_down = df_1h.iloc[-2]["close"] < df_1h.iloc[-2]["ema21"]
-    vol_ok     = last_5m["volume"] > 1.2 * last_5m["vol_ma"] 
-    adx_strong = last_5m["adx"] > 25
+    vol_ok     = last_main["volume"] > 1.2 * last_main["vol_ma"] 
+    adx_strong = last_main["adx"] > 30
 
-    cross_up   = prev_5m["ema9"] <= prev_5m["ema21"] and last_5m["ema9"] > last_5m["ema21"]
-    cross_down = prev_5m["ema9"] >= prev_5m["ema21"] and last_5m["ema9"] < last_5m["ema21"]
+    cross_up   = prev_main["ema9"] <= prev_main["ema21"] and last_main["ema9"] > last_main["ema21"]
+    cross_down = prev_main["ema9"] >= prev_main["ema21"] and last_main["ema9"] < last_main["ema21"]
 
-    if (cross_up and trend_1h_up and adx_strong and vol_ok and 40 < last_5m["rsi"] < 70):
+    # استخدام ATR متغير حسب الفريم (5 دقائق أضيق من 15 دقيقة)
+    atr_multiplier = 2.0 if timeframe == "5m" else 2.5
+
+    if (cross_up and trend_1h_up and adx_strong and vol_ok and 40 < last_main["rsi"] < 70):
         return {"action": "ENTRY", "side": "LONG", "price": price,
-                "sl": price - 2.0 * last_5m["atr"], "tp": price + 4.0 * last_5m["atr"], 
-                "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "ترند"}
+                "sl": price - atr_multiplier * last_main["atr"], "tp": price + (atr_multiplier * 2) * last_main["atr"], 
+                "rsi": last_main["rsi"], "adx": last_main["adx"], "type": f"ترند {timeframe}"}
 
-    if (cross_down and trend_1h_down and adx_strong and vol_ok and 30 < last_5m["rsi"] < 60):
+    if (cross_down and trend_1h_down and adx_strong and vol_ok and 30 < last_main["rsi"] < 60):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
-                "sl": price + 2.0 * last_5m["atr"], "tp": price - 4.0 * last_5m["atr"], 
-                "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "ترند"}
+                "sl": price + atr_multiplier * last_main["atr"], "tp": price - (atr_multiplier * 2) * last_main["atr"], 
+                "rsi": last_main["rsi"], "adx": last_main["adx"], "type": f"ترند {timeframe}"}
 
-    breakout_vol = last_5m["volume"] > 2.5 * last_5m["vol_ma"] 
-    if (price > last_5m["highest_high_20"] and breakout_vol and 60 < last_5m["rsi"] < 80):
+    breakout_vol = last_main["volume"] > 2.5 * last_main["vol_ma"] 
+    if (price > last_main["highest_high_20"] and breakout_vol and 60 < last_main["rsi"] < 80):
         return {"action": "ENTRY", "side": "LONG", "price": price,
-                "sl": price - 1.5 * last_5m["atr"], "tp": price + 3.0 * last_5m["atr"], 
-                "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "اختراق ⚡"}
+                "sl": price - (atr_multiplier - 0.5) * last_main["atr"], "tp": price + (atr_multiplier * 2 - 1) * last_main["atr"], 
+                "rsi": last_main["rsi"], "adx": last_main["adx"], "type": f"اختراق {timeframe} ⚡"}
 
-    if (price < last_5m["lowest_low_20"] and breakout_vol and 20 < last_5m["rsi"] < 40):
+    if (price < last_main["lowest_low_20"] and breakout_vol and 20 < last_main["rsi"] < 40):
         return {"action": "ENTRY", "side": "SHORT", "price": price,
-                "sl": price + 1.5 * last_5m["atr"], "tp": price - 3.0 * last_5m["atr"], 
-                "rsi": last_5m["rsi"], "adx": last_5m["adx"], "type": "اختراق ⚡"}
+                "sl": price + (atr_multiplier - 0.5) * last_main["atr"], "tp": price - (atr_multiplier * 2 - 1) * last_main["atr"], 
+                "rsi": last_main["rsi"], "adx": last_main["adx"], "type": f"اختراق {timeframe} ⚡"}
 
     return None
 
 # ==========================================
-# 5. الفحص الرئيسي
+# 5. الفحص الرئيسي (يدعم الفريمين)
 # ==========================================
-def scan_symbol(exchange, symbol):
+def scan_symbol(exchange, symbol, timeframe):
     try:
+        state_key = (symbol, timeframe)
         if symbol not in exchange.markets:
             return
 
-        if symbol not in state:
-            state[symbol] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None, "entry_time": None}
+        if state_key not in state:
+            state[state_key] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None, "entry_time": None}
             
-        ohlcv_5m = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
+        ohlcv_main = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
         ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=50)
         
-        if len(ohlcv_5m) < 50 or len(ohlcv_1h) < 50: return
+        if len(ohlcv_main) < 50 or len(ohlcv_1h) < 50: return
 
-        df_5m = pd.DataFrame(ohlcv_5m, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_main = pd.DataFrame(ohlcv_main, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
         
-        df_5m = add_indicators(df_5m)
+        df_main = add_indicators(df_main)
         df_1h = add_indicators(df_1h)
 
-        current_candle_ts = int(df_5m.iloc[-2]["timestamp"])
-        if state[symbol]["last_candle_ts"] == current_candle_ts:
+        current_candle_ts = int(df_main.iloc[-2]["timestamp"])
+        if state[state_key]["last_candle_ts"] == current_candle_ts:
             return
-        state[symbol]["last_candle_ts"] = current_candle_ts
+        state[state_key]["last_candle_ts"] = current_candle_ts
 
-        pos = state[symbol]["position"]
-        entry = state[symbol]["entry"]
-        sl = state[symbol]["sl"]
-        tp = state[symbol]["tp"]
+        pos = state[state_key]["position"]
+        entry = state[state_key]["entry"]
+        sl = state[state_key]["sl"]
+        tp = state[state_key]["tp"]
 
-        signal = check_signal(df_5m, df_1h, pos, entry, sl, tp)
+        signal = check_signal(df_main, df_1h, timeframe, pos, entry, sl, tp)
 
         if not signal: return
 
@@ -344,7 +344,7 @@ def scan_symbol(exchange, symbol):
             return 
 
         if signal["action"] == "ENTRY":
-            state[symbol].update({
+            state[state_key].update({
                 "position": signal["side"], 
                 "entry": signal["price"], 
                 "sl": signal["sl"], 
@@ -358,7 +358,7 @@ def scan_symbol(exchange, symbol):
             if pos == "SHORT": pnl = -pnl
             
             exit_time_utc = datetime.now(timezone.utc)
-            entry_time_utc = state[symbol]["entry_time"]
+            entry_time_utc = state[state_key]["entry_time"]
             
             duration_str = "غير محدد"
             entry_str = "-"
@@ -374,22 +374,22 @@ def scan_symbol(exchange, symbol):
                 entry_str = entry_time_utc.astimezone(KSA_TZ).strftime("%I:%M %p")
                 exit_str = exit_time_utc.astimezone(KSA_TZ).strftime("%I:%M %p")
 
-            state[symbol].update({"position": None, "entry": None, "sl": None, "tp": None, "entry_time": None})
+            state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None, "entry_time": None})
             
             daily_pnl["value"] += (pnl * LEVERAGE) * RISK_PCT / 100
-            send(msg_exit(symbol, pos, signal["price"], entry, signal["reason"], pnl, duration_str, entry_str, exit_str))
+            send(msg_exit(symbol, pos, timeframe, signal["price"], entry, signal["reason"], pnl, duration_str, entry_str, exit_str))
             
             if daily_pnl["value"] <= -MAX_DAILY_LOSS:
                 send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nوصلت للحد الأقصى للخسارة اليومية.")
 
     except Exception as e:
-        print(f"[ERROR] Scan {symbol}: {e}", flush=True)
+        print(f"[ERROR] Scan {symbol} ({timeframe}): {e}", flush=True)
 
 # ==========================================
 # 6. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V7 Bot (Local Time)...", flush=True)
+    print("[INIT] Starting V9 Bot (Multi-Timeframe)...", flush=True)
     
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
@@ -400,19 +400,20 @@ def trading_loop():
     })
     exchange.load_markets()
 
-    send(f"🛡️ <b>تم تشغيل البوت (V7) - التوقيت المحلي</b>\n"
-         f"➖➖➖➖➖➖➖➖\n"
-         f"📈 <b>الاستراتيجية:</b> ترند واختراق\n"
-         f"🛑 <b>وقف الخسارة:</b> واسع (2.0 ATR)\n"
-         f"⏰ <b>التوقيت:</b> توقيت السعودية (UTC+3)\n"
+    send(f"🛡️ <b>تم تشغيل البوت (V9) - الفريم المزدوج</b>\n"
+         f"📈 <b>الفريمات:</b> 5 دقائق و 15 دقيقة\n"
+         f"🛑 <b>وقف الخسارة:</b> ديناميكي (ATR)\n"
+         f"🧠 <b>فلتر القوة:</b> ADX أكبر من 30\n"
          f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f}\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
 
     while True:
         try:
+            # المرور على كل عملة وكل فريم
             for sym in FUTURES_SYMBOLS:
-                scan_symbol(exchange, sym)
-                time.sleep(1) 
+                for tf in TIMEFRAMES:
+                    scan_symbol(exchange, sym, tf)
+                    time.sleep(1) 
         except Exception as e:
             print(f"[FATAL] Loop error: {e}", flush=True)
         
