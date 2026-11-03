@@ -45,7 +45,7 @@ FUTURES_SYMBOLS = [
     "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT"
 ]
 
-TIMEFRAMES = ["5m", "15m"] 
+TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
@@ -74,6 +74,15 @@ def send(msg):
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
+def is_good_trading_time():
+    """يرجع True إذا كان الوقت مناسب للتداول (سيولة جيدة)"""
+    now = datetime.now(KSA_TZ)
+    hour = now.hour
+    # نمنع التداول من 2 صباحاً إلى 7 صباحاً بتوقيت السعودية
+    if 2 <= hour < 7:
+        return False
+    return True
+
 def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
     if side == "LONG":
         title = f"🟢 <b>إشارة لونق ({signal_type})</b>"
@@ -96,7 +105,6 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
 
 def msg_exit(sym, side, timeframe, price, entry, reason, pnl_pct, duration, entry_str, exit_str):
     title = f"⚪ <b>إغلاق صفقة لونق ({timeframe})</b>" if side == "LONG" else f"⚪ <b>إغلاق صفقة شورت ({timeframe})</b>"
-    status = "ربح ✅" if pnl_pct >= 0 else "خسارة ❌"
     reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯"}
     ar_reason = reasons_ar.get(reason, reason)
 
@@ -210,7 +218,8 @@ def run_websocket_loop():
 # ==========================================
 # 4. المؤشرات الفنية
 # ==========================================
-def ema(series, period): return series.ewm(span=period, adjust=False).mean()
+def ema(series, period): 
+    return series.ewm(span=period, adjust=False).mean()
 
 def rsi(series, period=14):
     delta = series.diff()
@@ -267,15 +276,24 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
     if position is not None: 
         return None
 
-    # ========== فلاتر الجودة القوية ==========
+    # فلتر وقت التداول
+    if not is_good_trading_time():
+        return None
+
+    # ========== فلاتر الجودة ==========
     trend_1h_up   = last_1h["close"] > last_1h["ema21"] and last_1h["close"] > last_1h["ema9"]
     trend_1h_down = last_1h["close"] < last_1h["ema21"] and last_1h["close"] < last_1h["ema9"]
     
-    vol_ok       = last_main["volume"] > 1.8 * last_main["vol_ma"]
-    adx_strong   = last_main["adx"] > 38
-    ema_spread   = abs(last_main["ema9"] - last_main["ema21"]) / price * 100 > 0.15
+    vol_ok = last_main["volume"] > 1.8 * last_main["vol_ma"]
+    
+    if timeframe in ["1h", "4h"]:
+        adx_strong = last_main["adx"] > 32
+    else:
+        adx_strong = last_main["adx"] > 38
 
-    # فلتر التقلب (مهم جداً)
+    ema_spread = abs(last_main["ema9"] - last_main["ema21"]) / price * 100 > 0.15
+
+    # فلتر التقلب
     atr_current = last_main["atr"]
     atr_avg = df_main["atr"].iloc[-20:].mean()
     volatility_ok = (0.75 * atr_avg) < atr_current < (1.9 * atr_avg)
@@ -283,9 +301,17 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
     cross_up   = prev_main["ema9"] <= prev_main["ema21"] and last_main["ema9"] > last_main["ema21"]
     cross_down = prev_main["ema9"] >= prev_main["ema21"] and last_main["ema9"] < last_main["ema21"]
 
-    atr_multiplier = 2.1 if timeframe == "5m" else 2.5
+    # مضاعف ATR حسب الفريم
+    if timeframe == "5m":
+        atr_multiplier = 2.1
+    elif timeframe == "15m":
+        atr_multiplier = 2.4
+    elif timeframe == "1h":
+        atr_multiplier = 2.7
+    else:  # 4h
+        atr_multiplier = 3.0
 
-    # ========== إشارات الترند القوية ==========
+    # ========== إشارات الترند ==========
     if (cross_up and trend_1h_up and adx_strong and vol_ok and ema_spread and volatility_ok
         and 46 < last_main["rsi"] < 63):
         return {
@@ -306,7 +332,7 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
             "type": f"ترند قوي {timeframe}"
         }
 
-    # ========== إشارات الاختراق القوية ==========
+    # ========== إشارات الاختراق ==========
     breakout_vol = last_main["volume"] > 3.2 * last_main["vol_ma"]
     
     if (price > last_main["highest_high_20"] and breakout_vol and adx_strong and volatility_ok
@@ -346,7 +372,8 @@ def scan_symbol(exchange, symbol, timeframe):
         ohlcv_main = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
         ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=50)
         
-        if len(ohlcv_main) < 50 or len(ohlcv_1h) < 50: return
+        if len(ohlcv_main) < 50 or len(ohlcv_1h) < 50: 
+            return
 
         df_main = pd.DataFrame(ohlcv_main, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -366,7 +393,8 @@ def scan_symbol(exchange, symbol, timeframe):
 
         signal = check_signal(df_main, df_1h, timeframe, pos, entry, sl, tp)
 
-        if not signal: return
+        if not signal: 
+            return
 
         today = datetime.now(KSA_TZ).date()
         if daily_pnl["date"] != today:
@@ -387,7 +415,8 @@ def scan_symbol(exchange, symbol, timeframe):
 
         elif signal["action"] == "EXIT":
             pnl = (signal["price"] - entry) / entry * 100
-            if pos == "SHORT": pnl = -pnl
+            if pos == "SHORT": 
+                pnl = -pnl
             
             exit_time_utc = datetime.now(timezone.utc)
             entry_time_utc = state[state_key]["entry_time"]
@@ -421,7 +450,7 @@ def scan_symbol(exchange, symbol, timeframe):
 # 6. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V10 Bot (High Quality Signals)...", flush=True)
+    print("[INIT] Starting V11 Bot (Multi-TF High Quality)...", flush=True)
     
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
@@ -432,10 +461,10 @@ def trading_loop():
     })
     exchange.load_markets()
 
-    send(f"🛡️ <b>تم تشغيل البوت (V10) - استراتيجية عالية الجودة</b>\n"
-         f"📈 <b>الفريمات:</b> 5 دقائق و 15 دقيقة\n"
-         f"🛑 <b>وقف الخسارة:</b> ديناميكي (ATR)\n"
-         f"🧠 <b>فلتر القوة:</b> ADX أكبر من 38 + فلتر تقلب\n"
+    send(f"🛡️ <b>تم تشغيل البوت (V11) - استراتيجية عالية الدقة</b>\n"
+         f"📈 <b>الفريمات:</b> 5m | 15m | 1h | 4h\n"
+         f"🛑 <b>وقف الخسارة:</b> ديناميكي حسب الفريم\n"
+         f"🧠 <b>فلاتر:</b> ADX + Volume + تقلب + وقت التداول\n"
          f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f}\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
 
