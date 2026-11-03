@@ -20,7 +20,7 @@ app = Flask(__name__)
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_active"}, 200
+    return {"status": "ok", "service": "trading_bot_active_v20"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -78,7 +78,6 @@ def fmt(p): return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
 def is_good_trading_time():
     now = datetime.now(KSA_TZ)
-    # نمنع التداول وقت السكون (2 صباحاً إلى 7 صباحاً)
     if 2 <= now.hour < 7: return False
     return True
 
@@ -90,7 +89,6 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
     fig, ax = plt.subplots(figsize=(12, 6))
     df_plot = df.tail(40).reset_index(drop=True)
     
-    # رسم الشموع
     for i in range(len(df_plot)):
         row = df_plot.iloc[i]
         color = '#26a69a' if row['close'] >= row['open'] else '#ef5350'
@@ -100,7 +98,6 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
         rect = mpatches.Rectangle((i - 0.3, bottom), 0.6, height, color=color)
         ax.add_patch(rect)
     
-    # رسم خط الترند
     half_idx = len(df_plot) // 2
     first_half, second_half = df_plot.iloc[:half_idx], df_plot.iloc[half_idx:]
     
@@ -122,14 +119,12 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
     p_range = max_p - min_p
     ax.set_ylim(min_p - (p_range * 0.1), max_p + (p_range * 0.1))
     
-    # الخطوط الأفقية
     ax.axhline(resistance, color='#32CD32', linestyle='--', linewidth=1.5)
     ax.axhline(support, color='#FF1493', linestyle='--', linewidth=1.5)
     ax.axhline(entry, color='#00BFFF', linestyle='-', linewidth=2, alpha=0.8)
     ax.axhline(tp, color='#00FF00', linestyle=':', linewidth=2)
     ax.axhline(sl, color='#FF0000', linestyle=':', linewidth=2)
     
-    # النصوص
     x_pos = len(df_plot) - 1
     ax.text(x_pos, resistance, f" Res: {fmt(resistance)} ", color='#32CD32', va='bottom', ha='right', fontweight='bold')
     ax.text(x_pos, support, f" Sup: {fmt(support)} ", color='#FF1493', va='top', ha='right', fontweight='bold')
@@ -170,11 +165,15 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type, support, resistan
             f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
             f"🎯 هدف الربح (TP): <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
             f"📊 RSI: <code>{rsi:.1f}</code> | ADX: <code>{adx:.1f}</code>\n"
-            f"💡 <i>بمجرد ربح 1%، قم بتعديل وقف الخسارة إلى سعر الدخول.</i>")
+            f"🛡️ <i>ميزة الـ Trailing Stop وتعديل وقف الخسارة مفعلة تلقائياً.</i>")
 
 def msg_exit(sym, side, timeframe, price, entry, reason):
     title = f"⚪ <b>إغلاق صفقة ({timeframe})</b>"
-    reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯"}
+    reasons_ar = {
+        "Stop Loss": "ضرب وقف الخسارة 🛑", 
+        "Take Profit": "تحقق هدف الربح 🎯",
+        "Breakeven Hit": "تم الخروج عند نقطة الدخول (حماية الأرباح) 🛡️"
+    }
     return (f"{title}\n"
             f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
             f"📥 الدخول: <code>{fmt(entry)}</code>\n"
@@ -213,24 +212,35 @@ def add_indicators(df):
     return df
 
 # ==========================================
-# 6. الفحص الرئيسي (الفلاتر الصارمة)
+# 6. الفحص الرئيسي (مع الـ Trailing Stop الآلي)
 # ==========================================
-def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None, tp=None):
+def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None, tp=None, breakeven_hit=False):
     if len(df_main) < 50 or len(df_1h) < 50: return None
     last, prev, last_1h = df_main.iloc[-2], df_main.iloc[-3], df_1h.iloc[-2]
     price = last["close"]
 
+    # إدارة الصفقات المفتوحة مع Trailing Stop تلقائي
     if position == "LONG":
-        if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
+        # فحص تحقيق الهدف أو وقف الخسارة
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
+        if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
+        
+        # إذا صعد السعر بنسبة 1% أو أكثر، نقوم برفع وقف الخسارة إلى نقطة الدخول تلقائياً (Breakeven)
+        if not breakeven_hit and entry_price and price >= entry_price * 1.01:
+            return {"action": "UPDATE_SL", "new_sl": entry_price, "reason": "Breakeven Activated"}
+
     if position == "SHORT":
-        if price >= sl: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Stop Loss"}
         if price <= tp: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Take Profit"}
+        if price >= sl: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Stop Loss"}
+        
+        # إذا هبط السعر بنسبة 1% أو أكثر في الشورت، ننزل وقف الخسارة لنقطة الدخول
+        if not breakeven_hit and entry_price and price <= entry_price * 0.99:
+            return {"action": "UPDATE_SL", "new_sl": entry_price, "reason": "Breakeven Activated"}
 
     if position is not None: return None
     if not is_good_trading_time(): return None
 
-    # فلاتر الجودة
+    # فلاتر الجودة الدقيقة
     trend_1h_up = last_1h["close"] > last_1h["ema21"] and last_1h["close"] > last_1h["ema9"]
     trend_1h_down = last_1h["close"] < last_1h["ema21"] and last_1h["close"] < last_1h["ema9"]
     vol_ok = last["volume"] > 1.8 * last["vol_ma"]
@@ -259,15 +269,28 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
 
     return None
 
+def fetch_data_safe(exchange, symbol, timeframe, limit=100, retries=3):
+    """دالة آمنة لجلب البيانات مع محاولات إعادة اتصال لتجنب أخطاء الشبكة"""
+    for i in range(retries):
+        try:
+            return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        except Exception as e:
+            if i == retries - 1: raise e
+            time.sleep(2)
+    return []
+
 def scan_symbol(exchange, symbol, timeframe):
     try:
         state_key = (symbol, timeframe)
         if symbol not in exchange.markets: return
         if state_key not in state:
-            state[state_key] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None}
+            state[state_key] = {
+                "position": None, "entry": None, "sl": None, "tp": None, 
+                "last_candle_ts": None, "breakeven_hit": False
+            }
             
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-        ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=50)
+        ohlcv = fetch_data_safe(exchange, symbol, timeframe, limit=100)
+        ohlcv_1h = fetch_data_safe(exchange, symbol, "1h", limit=50)
         if len(ohlcv) < 50 or len(ohlcv_1h) < 50: return
 
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -277,21 +300,37 @@ def scan_symbol(exchange, symbol, timeframe):
         df = add_indicators(df); df_1h = add_indicators(df_1h)
 
         current_candle_ts = int(df.iloc[-2]["timestamp"])
-        if state[state_key]["last_candle_ts"] == current_candle_ts: return
+        if state[state_key]["last_candle_ts"] == current_candle_ts and state[state_key]["position"] is None: 
+            return
         state[state_key]["last_candle_ts"] = current_candle_ts
 
-        pos, entry, sl, tp = state[state_key]["position"], state[state_key]["entry"], state[state_key]["sl"], state[state_key]["tp"]
-        signal = check_signal(df, df_1h, timeframe, pos, entry, sl, tp)
+        pos = state[state_key]["position"]
+        entry = state[state_key]["entry"]
+        sl = state[state_key]["sl"]
+        tp = state[state_key]["tp"]
+        be_hit = state[state_key]["breakeven_hit"]
+
+        signal = check_signal(df, df_1h, timeframe, pos, entry, sl, tp, be_hit)
         if not signal: return
 
         if signal["action"] == "ENTRY":
-            state[state_key].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
+            state[state_key].update({
+                "position": signal["side"], "entry": signal["price"], 
+                "sl": signal["sl"], "tp": signal["tp"], "breakeven_hit": False
+            })
             chart_buf = generate_chart(symbol, df, timeframe, signal["side"], signal["resistance"], signal["support"], signal["price"], signal["sl"], signal["tp"])
             caption = msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"], signal["support"], signal["resistance"])
             send_photo(chart_buf, caption)
 
+        elif signal["action"] == "UPDATE_SL":
+            state[state_key]["sl"] = signal["new_sl"]
+            state[state_key]["breakeven_hit"] = True
+            send(f"🛡️ <b>تحديث وقف الخسارة (Breakeven)</b>\n"
+                 f"🪙 الزوج: <code>{symbol.split(':')[0]}</code> ({timeframe})\n"
+                 f"✅ تم نقل وقف الخسارة تلقائياً إلى سعر الدخول: <code>{fmt(signal['new_sl'])}</code> لحماية الأرباح.")
+
         elif signal["action"] == "EXIT":
-            state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None})
+            state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None, "breakeven_hit": False})
             send(msg_exit(symbol, pos, timeframe, signal["price"], entry, signal["reason"]))
 
     except Exception as e:
@@ -301,12 +340,12 @@ def scan_symbol(exchange, symbol, timeframe):
 # 7. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V19 Bot (Professional Filters)...", flush=True)
+    print("[INIT] Starting V20 Bot (Professional + Trailing Stop)...", flush=True)
     exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
     exchange.load_markets()
 
-    send("🛡️ <b>تم تشغيل البوت (V19) - النسخة الاحترافية</b>\n"
-         "📊 <b>جديد:</b> فلاتر صارمة جداً (ADX + حجم + توافق الساعة) مع الشارت وخط الترند.")
+    send("🛡️ <b>تم تشغيل البوت (V20) بنجاح</b>\n"
+         "📊 <b>الميزات النشطة:</b> فلاتر صارمة + شارتات دقيقة + تفعيل وقف الخسارة المتحرك (Breakeven) تلقائياً.")
 
     while True:
         try:
