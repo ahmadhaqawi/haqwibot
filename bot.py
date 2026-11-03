@@ -146,8 +146,7 @@ def fmt(p):
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
 def is_good_trading_time():
-    now = datetime.now(KSA_TZ)
-    if 2 <= now.hour < 7: return False
+    # ✅ التداول مسموح 24 ساعة بدون أي حظر
     return True
 
 # ==========================================
@@ -324,7 +323,6 @@ async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, pr
         return
     last_whale_alert[key] = now
 
-    # تحديد عنوان الرسالة حسب نوع الصفقة: صفقة شراء / صفقة بيع
     trade_word = "صفقة شراء" if "شراء" in side_ar else "صفقة بيع"
 
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
@@ -602,7 +600,7 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
 # 8. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V21 Bot (Optimized + Whales Fixed)...", flush=True)
+    print("[INIT] Starting V21 Bot (24/7 Trading + Whales)...", flush=True)
     load_state()
 
     exchange = ccxt.okx({
@@ -625,6 +623,7 @@ def trading_loop():
 
     send("🛡️ <b>تم تشغيل البوت المحدّث (V21) بنجاح</b>\n"
          "⚡ <b>التحسينات النشطة:</b>\n"
+         "• 🕐 <b>تداول 24 ساعة</b> بدون حظر زمني.\n"
          "• متابعة حية وفورية للصفقات (Live Candle Exit).\n"
          "• حماية رأس المال الذكية (Dynamic Breakeven عند 50% من الهدف).\n"
          "• حفظ واسترجاع الصفقات بعد إعادة تشغيل السيرفر تلقائياً.\n"
