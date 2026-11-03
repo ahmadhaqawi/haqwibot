@@ -66,6 +66,19 @@ WEBSOCKET_SYMBOLS = [
     "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT",
 ]
 
+OKX_CONTRACT_SIZES = {
+    "BTC-USDT-SWAP": 0.01,
+    "ETH-USDT-SWAP": 0.1,
+    "SOL-USDT-SWAP": 1.0,
+    "BNB-USDT-SWAP": 0.01,
+    "XRP-USDT-SWAP": 100.0,
+    "DOGE-USDT-SWAP": 100.0,
+    "ADA-USDT-SWAP": 100.0,
+    "AVAX-USDT-SWAP": 1.0,
+    "LINK-USDT-SWAP": 1.0,
+    "SUI-USDT-SWAP": 1.0,
+}
+
 plt.style.use('dark_background')
 
 # ==========================================
@@ -302,7 +315,7 @@ def add_indicators(df):
     return df
 
 # ==========================================
-# 6. مراقبة الحيتان
+# 6. مراقبة الحيتان (Non-blocking & Accurate)
 # ==========================================
 async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, price):
     key = f"{platform}_{symbol_display}"
@@ -311,14 +324,17 @@ async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, pr
         return
     last_whale_alert[key] = now
 
+    # تحديد عنوان الرسالة حسب نوع الصفقة: صفقة شراء / صفقة بيع
+    trade_word = "صفقة شراء" if "شراء" in side_ar else "صفقة بيع"
+
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
-    msg = (f"🐋 <b>صفقة حوت ضخمة</b>\n"
+    msg = (f"🐋 <b>{trade_word} ({platform})</b>\n"
            f"🪙 الزوج: <code>{symbol_display}</code>\n"
            f"{emoji} النوع: <b>{side_ar}</b>\n"
            f"💰 القيمة: <code>${cost:,.0f}</code>\n"
            f"💵 السعر: <code>{fmt(price)}</code>\n"
            f"⏰ الوقت: <code>{now_str}</code>")
-    send(msg)
+    await asyncio.to_thread(send, msg)
 
 async def listen_to_binance():
     streams = "/".join([f"{sym.lower()}@aggTrade" for sym in WEBSOCKET_SYMBOLS])
@@ -328,10 +344,12 @@ async def listen_to_binance():
             async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
                 print("[WS] Binance connected", flush=True)
                 while True:
-                    data = json.loads(await ws.recv())
+                    raw = await ws.recv()
+                    data = json.loads(raw)
                     if 'data' in data and data['data'].get('e') == 'aggTrade':
                         t = data['data']
-                        price, qty = float(t['p']), float(t['q'])
+                        price = float(t['p'])
+                        qty = float(t['q'])
                         cost = price * qty
                         if cost >= WHALE_THRESHOLD_WS:
                             is_buy = (t['m'] == False)
@@ -353,17 +371,22 @@ async def listen_to_okx():
                 print("[WS] OKX connected", flush=True)
                 await ws.send(json.dumps({"op": "subscribe", "args": args}))
                 while True:
-                    data = json.loads(await ws.recv())
+                    raw = await ws.recv()
+                    data = json.loads(raw)
                     if 'data' in data and data['data']:
                         for t in data['data']:
+                            inst_id = t.get('instId', '')
                             price = float(t['px'])
-                            size = float(t['sz'])
-                            cost = price * size
+                            contracts = float(t['sz'])
+                            ct_val = OKX_CONTRACT_SIZES.get(inst_id, 1.0)
+                            coin_amount = contracts * ct_val
+                            cost = price * coin_amount
+
                             if cost >= WHALE_THRESHOLD_WS:
                                 side = t.get('side', 'buy')
                                 side_ar = "شراء (لونق)" if side == 'buy' else "بيع (شورت)"
                                 emoji = "🟢" if side == 'buy' else "🔴"
-                                sym_disp = t['instId'].replace("-SWAP", "").replace("-", "/")
+                                sym_disp = inst_id.replace("-SWAP", "").replace("-", "/")
                                 await process_whale_alert("OKX", sym_disp, side_ar, emoji, cost, price)
         except Exception as e:
             print(f"[WS OKX ERROR] {e}", flush=True)
@@ -377,19 +400,34 @@ async def listen_to_bybit():
             async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
                 print("[WS] Bybit connected", flush=True)
                 await ws.send(json.dumps({"op": "subscribe", "args": args}))
-                while True:
-                    data = json.loads(await ws.recv())
-                    if 'data' in data and data['data']:
-                        for t in data['data']:
-                            price = float(t['p'])
-                            size = float(t['v'])
-                            cost = price * size
-                            if cost >= WHALE_THRESHOLD_WS:
-                                is_buy = (t.get('S', 'Buy') == 'Buy')
-                                side_ar = "شراء (لونق)" if is_buy else "بيع (شورت)"
-                                emoji = "🟢" if is_buy else "🔴"
-                                sym_disp = t['s'].replace('USDT', '/USDT')
-                                await process_whale_alert("Bybit", sym_disp, side_ar, emoji, cost, price)
+
+                async def bybit_ping():
+                    while True:
+                        await asyncio.sleep(20)
+                        try:
+                            await ws.send(json.dumps({"op": "ping"}))
+                        except Exception:
+                            break
+
+                ping_task = asyncio.create_task(bybit_ping())
+
+                try:
+                    while True:
+                        raw = await ws.recv()
+                        data = json.loads(raw)
+                        if 'data' in data and data['data']:
+                            for t in data['data']:
+                                price = float(t['p'])
+                                size = float(t['v'])
+                                cost = price * size
+                                if cost >= WHALE_THRESHOLD_WS:
+                                    is_buy = (t.get('S', 'Buy') == 'Buy')
+                                    side_ar = "شراء (لونق)" if is_buy else "بيع (شورت)"
+                                    emoji = "🟢" if is_buy else "🔴"
+                                    sym_disp = t['s'].replace('USDT', '/USDT')
+                                    await process_whale_alert("Bybit", sym_disp, side_ar, emoji, cost, price)
+                finally:
+                    ping_task.cancel()
         except Exception as e:
             print(f"[WS BYBIT ERROR] {e}", flush=True)
             await asyncio.sleep(5)
@@ -402,7 +440,12 @@ async def run_websockets():
     )
 
 def run_websocket_loop():
-    asyncio.run(run_websockets())
+    while True:
+        try:
+            asyncio.run(run_websockets())
+        except Exception as e:
+            print(f"[FATAL WS LOOP ERROR] {e}", flush=True)
+            time.sleep(5)
 
 # ==========================================
 # 7. الفحص الدقيق والتحكم بالصفقات
@@ -540,8 +583,12 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
 
         elif signal["action"] == "EXIT":
             exit_price = signal["price"]
+
+            raw_pnl = ((exit_price - entry) / entry * 100) if pos == "LONG" else ((entry - exit_price) / entry * 100)
+            lev_pnl = raw_pnl * LEVERAGE
             daily_pnl["trades"] += 1
-            if (pos == "LONG" and exit_price > entry) or (pos == "SHORT" and exit_price < entry):
+            daily_pnl["value"] += lev_pnl
+            if lev_pnl > 0:
                 daily_pnl["wins"] += 1
 
             state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None, "breakeven_hit": False})
@@ -555,7 +602,7 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
 # 8. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V21 Bot (Optimized + Whales)...", flush=True)
+    print("[INIT] Starting V21 Bot (Optimized + Whales Fixed)...", flush=True)
     load_state()
 
     exchange = ccxt.okx({
@@ -572,41 +619,17 @@ def trading_loop():
         print(f"[MARKETS ERROR] {e}")
         active_symbols = FUTURES_SYMBOLS
 
-    # ==========================================
-    # 🧪 اختبار الشارت (احذف هذه الكتلة بعد التأكد)
-    # ==========================================
-    try:
-        test_ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", "15m", limit=100)
-        test_df = pd.DataFrame(test_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        test_df['datetime'] = pd.to_datetime(test_df['timestamp'], unit='ms')
-        test_df = add_indicators(test_df)
-        last_row = test_df.iloc[-1]
-        test_entry = float(last_row['close'])
-        buf = generate_chart(
-            "BTC/USDT:USDT", test_df, "15m", "LONG",
-            float(last_row['high20']), float(last_row['low20']),
-            test_entry, test_entry * 0.98, test_entry * 1.03
-        )
-        send_photo(buf, "🧪 <b>اختبار الشارت — كل شيء يعمل ✅</b>")
-        print("[TEST] Chart test sent to Telegram.", flush=True)
-    except Exception as e:
-        send(f"⚠️ خطأ اختبار الشارت: <code>{e}</code>")
-        print(f"[TEST ERROR] {e}", flush=True)
-    # ==========================================
-    # نهاية كتلة الاختبار
-    # ==========================================
-
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
-    print("[INIT] Whale monitor started.", flush=True)
+    print("[INIT] Whale monitor started via WebSockets.", flush=True)
 
-    send("🛡️ <b>تم تشغيل البوت المحدّث بنجاح</b>\n"
+    send("🛡️ <b>تم تشغيل البوت المحدّث (V21) بنجاح</b>\n"
          "⚡ <b>التحسينات النشطة:</b>\n"
          "• متابعة حية وفورية للصفقات (Live Candle Exit).\n"
          "• حماية رأس المال الذكية (Dynamic Breakeven عند 50% من الهدف).\n"
          "• حفظ واسترجاع الصفقات بعد إعادة تشغيل السيرفر تلقائياً.\n"
          "• خفض استهلاك الـ API بنسبة 60% وتسريع فحص الأزواج.\n"
-         f"🐋 <b>مراقب الحيتان مفعّل:</b> صفقات أكبر من <code>${WHALE_THRESHOLD_WS:,.0f}</code>")
+         f"🐋 <b>مراقب الحيتان مفعّل:</b> صفقات لحظية أكبر من <code>${WHALE_THRESHOLD_WS:,.0f}</code> عبر (Binance, OKX, Bybit).")
 
     while True:
         cycle_start = time.time()
