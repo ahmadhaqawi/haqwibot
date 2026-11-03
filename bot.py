@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone, timedelta
 import io
 import matplotlib
-matplotlib.use('Agg') # ضروري جداً للعمل على السيرفر بدون شاشة
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import ccxt
@@ -32,12 +32,17 @@ KSA_TZ = timezone(timedelta(hours=3))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# قائمة الـ 35 عملة (محدثة بأعلى سيولة وتذبذب)
 FUTURES_SYMBOLS = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", 
     "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
     "LINK/USDT:USDT", "DOT/USDT:USDT", "NEAR/USDT:USDT", "APT/USDT:USDT",
     "SUI/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT", "INJ/USDT:USDT",
-    "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT"
+    "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT",
+    "PEPE/USDT:USDT", "WIF/USDT:USDT", "TIA/USDT:USDT", "ORDI/USDT:USDT",
+    "SEI/USDT:USDT", "RUNE/USDT:USDT", "FET/USDT:USDT", "RNDR/USDT:USDT",
+    "IMX/USDT:USDT", "STX/USDT:USDT", "THETA/USDT:USDT", "ALGO/USDT:USDT",
+    "EGLD/USDT:USDT", "FLOW/USDT:USDT", "SAND/USDT:USDT"
 ]
 
 TIMEFRAMES = ["5m", "15m", "1h", "4h"]
@@ -86,7 +91,6 @@ def fmt(p):
 def is_good_trading_time():
     now = datetime.now(KSA_TZ)
     hour = now.hour
-    # منع التداول وقت السكون
     if 2 <= hour < 7: return False
     return True
 
@@ -97,16 +101,13 @@ def generate_chart(symbol, df, timeframe, side, resistance, support):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(10, 5))
     
-    # رسم السعر والمتوسطات
     ax.plot(df['datetime'], df['close'], label='Close Price', color='#00BFFF', linewidth=2)
     ax.plot(df['datetime'], df['ema9'], label='EMA 9', color='#FFD700', linestyle='--', alpha=0.8)
     ax.plot(df['datetime'], df['ema21'], label='EMA 21', color='#FF4500', linestyle='--', alpha=0.8)
     
-    # خطوط الدعم والمقاومة
     ax.axhline(resistance, color='#32CD32', linestyle='-', linewidth=1.5, label=f'Resistance ({fmt(resistance)})')
     ax.axhline(support, color='#FF1493', linestyle='-', linewidth=1.5, label=f'Support ({fmt(support)})')
     
-    # تظليل منطقة الاختراق
     if side == "LONG":
         ax.axhline(resistance, xmin=0.8, xmax=1.0, color='#32CD32', linewidth=4, alpha=0.5) 
     else:
@@ -297,7 +298,6 @@ def scan_symbol(exchange, symbol, timeframe):
         df_main = pd.DataFrame(ohlcv_main, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
         
-        # تحويل الوقت للرسم
         df_main['datetime'] = pd.to_datetime(df_main['timestamp'], unit='ms')
 
         df_main = add_indicators(df_main)
@@ -328,11 +328,9 @@ def scan_symbol(exchange, symbol, timeframe):
                 "entry_time": datetime.now(timezone.utc)
             })
             
-            # توليد الشارت
             chart_buf = generate_chart(symbol, df_main, timeframe, signal["side"], signal["resistance"], signal["support"])
             caption = msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"], signal["support"], signal["resistance"])
             
-            # إرسال الصورة مع النص
             send_photo(chart_buf, caption)
 
         elif signal["action"] == "EXIT":
@@ -370,7 +368,7 @@ def scan_symbol(exchange, symbol, timeframe):
 # 7. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V14 Bot (Charts Enabled)...", flush=True)
+    print("[INIT] Starting V15 Bot (35 Symbols)...", flush=True)
 
     exchange = ccxt.okx({
         'enableRateLimit': True,
@@ -378,7 +376,7 @@ def trading_loop():
     })
     exchange.load_markets()
 
-    send(f"🛡️ <b>تم تشغيل البوت (V14) - التوصيات مع الشارت</b>\n"
+    send(f"🛡️ <b>تم تشغيل البوت (V15) - 35 عملة</b>\n"
          f"📈 <b>الفريمات:</b> 5m | 15m | 1h | 4h\n"
          f"📊 <b>الشارت:</b> يتم إرفاق صورة تحليلية مع كل إشارة\n"
          f"🛑 <b>وقف الخسارة:</b> ديناميكي (ATR)\n"
