@@ -32,7 +32,7 @@ KSA_TZ = timezone(timedelta(hours=3))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# نفس قائمة الـ 35 عملة
+# قائمة الـ 35 عملة
 FUTURES_SYMBOLS = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", 
     "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
@@ -84,48 +84,57 @@ def is_good_trading_time():
     return True
 
 # ==========================================
-# 3. توليد الشارت (شموع + كتابة الدعم والمقاومة)
+# 3. توليد الشارت (شموع + دعم/مقاومة + أهداف)
 # ==========================================
-def generate_chart(symbol, df, timeframe, side, resistance, support):
+def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, tp):
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(12, 6)) # تكبير الشارت قليلاً ليتسع للبيانات
     
-    # نأخذ آخر 40 شمعة فقط لتكون الصورة واضحة
     df_plot = df.tail(40).reset_index(drop=True)
     
     # رسم الشموع
     for i in range(len(df_plot)):
         row = df_plot.iloc[i]
         color = '#26a69a' if row['close'] >= row['open'] else '#ef5350'
-        
-        # الفتيل (الظل)
         ax.plot([i, i], [row['low'], row['high']], color=color, linewidth=1)
-        
-        # جسم الشمعة
         height = abs(row['close'] - row['open'])
         bottom = min(row['close'], row['open'])
         rect = mpatches.Rectangle((i - 0.3, bottom), 0.6, height, color=color)
         ax.add_patch(rect)
     
-    # خطوط الدعم والمقاومة
-    ax.axhline(resistance, color='#32CD32', linestyle='--', linewidth=1.5)
-    ax.axhline(support, color='#FF1493', linestyle='--', linewidth=1.5)
-    
-    # كتابة الأرقام على الشارت
-    max_price = max(df_plot['high'].max(), resistance)
-    min_price = min(df_plot['low'].min(), support)
+    # حساب الحد الأعلى والأدنى للشارت ليشمل كل الخطوط
+    max_price = max(df_plot['high'].max(), resistance, tp, sl, entry)
+    min_price = min(df_plot['low'].min(), support, tp, sl, entry)
     price_range = max_price - min_price
     ax.set_ylim(min_price - (price_range * 0.1), max_price + (price_range * 0.1))
     
-    ax.text(0, resistance, f" Resistance: {fmt(resistance)}", color='#32CD32', va='bottom', fontweight='bold', fontsize=10)
-    ax.text(0, support, f" Support: {fmt(support)}", color='#FF1493', va='top', fontweight='bold', fontsize=10)
+    # رسم الخطوط
+    # 1. المقاومة والدعم
+    ax.axhline(resistance, color='#32CD32', linestyle='--', linewidth=1.5)
+    ax.axhline(support, color='#FF1493', linestyle='--', linewidth=1.5)
+    
+    # 2. سعر الدخول
+    ax.axhline(entry, color='#00BFFF', linestyle='-', linewidth=2, alpha=0.8)
+    
+    # 3. الهدف ووقف الخسارة
+    ax.axhline(tp, color='#00FF00', linestyle=':', linewidth=2)
+    ax.axhline(sl, color='#FF0000', linestyle=':', linewidth=2)
+    
+    # كتابة الأرقام على الشارت (على اليمين لتجنب التداخل مع الشموع)
+    x_pos = len(df_plot) - 1
+    ha_align = 'right'
+    
+    ax.text(x_pos, resistance, f" Resistance: {fmt(resistance)} ", color='#32CD32', va='bottom', ha=ha_align, fontweight='bold', fontsize=9)
+    ax.text(x_pos, support, f" Support: {fmt(support)} ", color='#FF1493', va='top', ha=ha_align, fontweight='bold', fontsize=9)
+    ax.text(x_pos, entry, f" ENTRY: {fmt(entry)} ", color='#00BFFF', va='center', ha=ha_align, fontweight='bold', fontsize=10)
+    ax.text(x_pos, tp, f" TP: {fmt(tp)} ", color='#00FF00', va='bottom', ha=ha_align, fontweight='bold', fontsize=9)
+    ax.text(x_pos, sl, f" SL: {fmt(sl)} ", color='#FF0000', va='top', ha=ha_align, fontweight='bold', fontsize=9)
     
     # تنسيق الشارت
     ax.set_title(f"{symbol} - {timeframe} | {side}", color='white', fontsize=14, fontweight='bold')
     ax.set_ylabel("Price (USDT)", color='white')
     
-    # ضبط المحور السيني
-    step = max(1, len(df_plot) // 8) # إظهار 8 تواريخ فقط
+    step = max(1, len(df_plot) // 8)
     ticks = range(0, len(df_plot), step)
     tick_labels = [df_plot.iloc[i]['datetime'].strftime('%H:%M') for i in ticks]
     ax.set_xticks(ticks)
@@ -133,8 +142,8 @@ def generate_chart(symbol, df, timeframe, side, resistance, support):
     
     plt.yticks(color='gray')
     ax.grid(color='gray', linestyle='--', linewidth=0.5, alpha=0.3)
-    
     plt.tight_layout()
+    
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=120)
     buf.seek(0)
@@ -182,7 +191,7 @@ def msg_exit(sym, side, timeframe, price, entry, reason, pnl_pct, duration, entr
             f"📝 السبب: {ar_reason}")
 
 # ==========================================
-# 5. المؤشرات الفنية (مختصرة)
+# 5. المؤشرات الفنية
 # ==========================================
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
 def rsi(s, p=14):
@@ -224,7 +233,6 @@ def check_signal(df_main, timeframe, position, entry_price=None, sl=None, tp=Non
     support = last["low20"]
     resistance = last["high20"]
 
-    # شروط مبسطة للتجربة (لضمان وصول رسائل لك)
     if cross_up:
         return {"action": "ENTRY", "side": "LONG", "price": price,
                 "sl": price - 1.5 * last["atr"], "tp": price + 3.0 * last["atr"],
@@ -271,13 +279,14 @@ def scan_symbol(exchange, symbol, timeframe):
         if signal["action"] == "ENTRY":
             state[state_key].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"], "entry_time": datetime.now(timezone.utc)})
             
-            chart_buf = generate_chart(symbol, df, timeframe, signal["side"], signal["resistance"], signal["support"])
+            # إرسال الشارت مع خطوط الدخول والخروج
+            chart_buf = generate_chart(symbol, df, timeframe, signal["side"], signal["resistance"], signal["support"], signal["price"], signal["sl"], signal["tp"])
             caption = msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"], signal["support"], signal["resistance"])
             send_photo(chart_buf, caption)
 
         elif signal["action"] == "EXIT":
             state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None, "entry_time": None})
-            send(msg_exit(symbol, pos, timeframe, signal["price"], entry, signal["reason"], 0, "0", "-", "-")) # إرسال مبسط للإغلاق
+            send(msg_exit(symbol, pos, timeframe, signal["price"], entry, signal["reason"], 0, "0", "-", "-"))
 
     except Exception as e:
         print(f"[ERROR] {symbol} ({timeframe}): {e}", flush=True)
@@ -286,12 +295,12 @@ def scan_symbol(exchange, symbol, timeframe):
 # 7. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V16 Bot (Candlesticks)...", flush=True)
+    print("[INIT] Starting V17 Bot (Full Chart)...", flush=True)
     exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
     exchange.load_markets()
 
-    send("🛡️ <b>تم تشغيل البوت (V16) - شارت الشموع</b>\n"
-         "📊 <b>جديد:</b> الشارت الآن يرسم شموعاً حقيقية مع كتابة الدعم والمقاومة فوق الخطوط.")
+    send("🛡️ <b>تم تشغيل البوت (V17)</b>\n"
+         "📊 <b>جديد:</b> الشارت الآن يوضح (الدخول، الهدف، ووقف الخسارة) بخطوط وأرقام واضحة.")
 
     while True:
         try:
