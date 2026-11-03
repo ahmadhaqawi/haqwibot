@@ -232,4 +232,224 @@ def adx(high, low, close, period=14):
     return dx.ewm(alpha=1/period, adjust=False).mean()
 
 def atr(df, period=14):
-    high, low, close = df["high"], df["low"], df["
+    high, low, close = df["high"], df["low"], df["close"]
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def add_indicators(df):
+    df["ema9"]   = ema(df["close"], 9)
+    df["ema21"]  = ema(df["close"], 21)
+    df["rsi"]    = rsi(df["close"], 14)
+    df["adx"]    = adx(df["high"], df["low"], df["close"], 14)
+    df["atr"]    = atr(df, 14)
+    df["vol_ma"] = df["volume"].rolling(20).mean()
+    df["highest_high_20"] = df["high"].rolling(20).max().shift(1)
+    df["lowest_low_20"]   = df["low"].rolling(20).min().shift(1)
+    return df
+
+def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None, tp=None):
+    if len(df_main) < 50 or len(df_1h) < 50: 
+        return None
+    
+    last_main = df_main.iloc[-2]      
+    prev_main = df_main.iloc[-3]
+    last_1h   = df_1h.iloc[-2]
+    price = last_main["close"]
+
+    # ========== إدارة الخروج ==========
+    if position == "LONG":
+        if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
+        if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
+    if position == "SHORT":
+        if price >= sl: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Stop Loss"}
+        if price <= tp: return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Take Profit"}
+
+    if position is not None: 
+        return None
+
+    # ========== فلاتر الجودة القوية ==========
+    trend_1h_up   = last_1h["close"] > last_1h["ema21"] and last_1h["close"] > last_1h["ema9"]
+    trend_1h_down = last_1h["close"] < last_1h["ema21"] and last_1h["close"] < last_1h["ema9"]
+    
+    vol_ok       = last_main["volume"] > 1.8 * last_main["vol_ma"]
+    adx_strong   = last_main["adx"] > 38
+    ema_spread   = abs(last_main["ema9"] - last_main["ema21"]) / price * 100 > 0.15
+
+    # فلتر التقلب (مهم جداً)
+    atr_current = last_main["atr"]
+    atr_avg = df_main["atr"].iloc[-20:].mean()
+    volatility_ok = (0.75 * atr_avg) < atr_current < (1.9 * atr_avg)
+
+    cross_up   = prev_main["ema9"] <= prev_main["ema21"] and last_main["ema9"] > last_main["ema21"]
+    cross_down = prev_main["ema9"] >= prev_main["ema21"] and last_main["ema9"] < last_main["ema21"]
+
+    atr_multiplier = 2.1 if timeframe == "5m" else 2.5
+
+    # ========== إشارات الترند القوية ==========
+    if (cross_up and trend_1h_up and adx_strong and vol_ok and ema_spread and volatility_ok
+        and 46 < last_main["rsi"] < 63):
+        return {
+            "action": "ENTRY", "side": "LONG", "price": price,
+            "sl": price - atr_multiplier * last_main["atr"],
+            "tp": price + (atr_multiplier * 2.3) * last_main["atr"],
+            "rsi": last_main["rsi"], "adx": last_main["adx"],
+            "type": f"ترند قوي {timeframe}"
+        }
+
+    if (cross_down and trend_1h_down and adx_strong and vol_ok and ema_spread and volatility_ok
+        and 37 < last_main["rsi"] < 54):
+        return {
+            "action": "ENTRY", "side": "SHORT", "price": price,
+            "sl": price + atr_multiplier * last_main["atr"],
+            "tp": price - (atr_multiplier * 2.3) * last_main["atr"],
+            "rsi": last_main["rsi"], "adx": last_main["adx"],
+            "type": f"ترند قوي {timeframe}"
+        }
+
+    # ========== إشارات الاختراق القوية ==========
+    breakout_vol = last_main["volume"] > 3.2 * last_main["vol_ma"]
+    
+    if (price > last_main["highest_high_20"] and breakout_vol and adx_strong and volatility_ok
+        and 63 < last_main["rsi"] < 76 and trend_1h_up):
+        return {
+            "action": "ENTRY", "side": "LONG", "price": price,
+            "sl": price - (atr_multiplier - 0.3) * last_main["atr"],
+            "tp": price + (atr_multiplier * 2.1) * last_main["atr"],
+            "rsi": last_main["rsi"], "adx": last_main["adx"],
+            "type": f"اختراق قوي {timeframe} ⚡"
+        }
+
+    if (price < last_main["lowest_low_20"] and breakout_vol and adx_strong and volatility_ok
+        and 24 < last_main["rsi"] < 37 and trend_1h_down):
+        return {
+            "action": "ENTRY", "side": "SHORT", "price": price,
+            "sl": price + (atr_multiplier - 0.3) * last_main["atr"],
+            "tp": price - (atr_multiplier * 2.1) * last_main["atr"],
+            "rsi": last_main["rsi"], "adx": last_main["adx"],
+            "type": f"اختراق قوي {timeframe} ⚡"
+        }
+
+    return None
+
+# ==========================================
+# 5. الفحص الرئيسي
+# ==========================================
+def scan_symbol(exchange, symbol, timeframe):
+    try:
+        state_key = (symbol, timeframe)
+        if symbol not in exchange.markets:
+            return
+
+        if state_key not in state:
+            state[state_key] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None, "entry_time": None}
+            
+        ohlcv_main = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+        ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=50)
+        
+        if len(ohlcv_main) < 50 or len(ohlcv_1h) < 50: return
+
+        df_main = pd.DataFrame(ohlcv_main, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        
+        df_main = add_indicators(df_main)
+        df_1h = add_indicators(df_1h)
+
+        current_candle_ts = int(df_main.iloc[-2]["timestamp"])
+        if state[state_key]["last_candle_ts"] == current_candle_ts:
+            return
+        state[state_key]["last_candle_ts"] = current_candle_ts
+
+        pos = state[state_key]["position"]
+        entry = state[state_key]["entry"]
+        sl = state[state_key]["sl"]
+        tp = state[state_key]["tp"]
+
+        signal = check_signal(df_main, df_1h, timeframe, pos, entry, sl, tp)
+
+        if not signal: return
+
+        today = datetime.now(KSA_TZ).date()
+        if daily_pnl["date"] != today:
+            daily_pnl["value"] = 0.0
+            daily_pnl["date"] = today
+        if daily_pnl["value"] <= -MAX_DAILY_LOSS:
+            return 
+
+        if signal["action"] == "ENTRY":
+            state[state_key].update({
+                "position": signal["side"], 
+                "entry": signal["price"], 
+                "sl": signal["sl"], 
+                "tp": signal["tp"],
+                "entry_time": datetime.now(timezone.utc)
+            })
+            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"]))
+
+        elif signal["action"] == "EXIT":
+            pnl = (signal["price"] - entry) / entry * 100
+            if pos == "SHORT": pnl = -pnl
+            
+            exit_time_utc = datetime.now(timezone.utc)
+            entry_time_utc = state[state_key]["entry_time"]
+            
+            duration_str = "غير محدد"
+            entry_str = "-"
+            exit_str = "-"
+            
+            if entry_time_utc:
+                time_diff = exit_time_utc - entry_time_utc
+                total_seconds = int(time_diff.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                duration_str = f"{hours} ساعة و {minutes} دقيقة" if hours > 0 else f"{minutes} دقيقة"
+                
+                entry_str = entry_time_utc.astimezone(KSA_TZ).strftime("%I:%M %p")
+                exit_str = exit_time_utc.astimezone(KSA_TZ).strftime("%I:%M %p")
+
+            state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None, "entry_time": None})
+            
+            daily_pnl["value"] += (pnl * LEVERAGE) * RISK_PCT / 100
+            send(msg_exit(symbol, pos, timeframe, signal["price"], entry, signal["reason"], pnl, duration_str, entry_str, exit_str))
+            
+            if daily_pnl["value"] <= -MAX_DAILY_LOSS:
+                send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nوصلت للحد الأقصى للخسارة اليومية.")
+
+    except Exception as e:
+        print(f"[ERROR] Scan {symbol} ({timeframe}): {e}", flush=True)
+
+# ==========================================
+# 6. التشغيل الرئيسي
+# ==========================================
+def trading_loop():
+    print("[INIT] Starting V10 Bot (High Quality Signals)...", flush=True)
+    
+    ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
+    ws_thread.start()
+
+    exchange = ccxt.okx({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'} 
+    })
+    exchange.load_markets()
+
+    send(f"🛡️ <b>تم تشغيل البوت (V10) - استراتيجية عالية الجودة</b>\n"
+         f"📈 <b>الفريمات:</b> 5 دقائق و 15 دقيقة\n"
+         f"🛑 <b>وقف الخسارة:</b> ديناميكي (ATR)\n"
+         f"🧠 <b>فلتر القوة:</b> ADX أكبر من 38 + فلتر تقلب\n"
+         f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f}\n"
+         f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
+
+    while True:
+        try:
+            for sym in FUTURES_SYMBOLS:
+                for tf in TIMEFRAMES:
+                    scan_symbol(exchange, sym, tf)
+                    time.sleep(1) 
+        except Exception as e:
+            print(f"[FATAL] Loop error: {e}", flush=True)
+        
+        time.sleep(SCAN_INTERVAL)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    trading_loop()
