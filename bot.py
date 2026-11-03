@@ -56,9 +56,7 @@ STATE_FILE = "bot_state.json"
 state = {}
 daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
 
-# ==========================================
-# إعدادات مراقبة الحيتان
-# ==========================================
+# إعدادات الحيتان
 WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "1000000"))
 WHALE_COOLDOWN     = int(os.getenv("WHALE_COOLDOWN", "300"))
 last_whale_alert   = {}
@@ -71,7 +69,7 @@ WEBSOCKET_SYMBOLS = [
 plt.style.use('dark_background')
 
 # ==========================================
-# إدارة حفظ واسترجاع الحالة (Persistence)
+# إدارة حفظ واسترجاع الحالة
 # ==========================================
 def load_state():
     global state, daily_pnl
@@ -574,11 +572,35 @@ def trading_loop():
         print(f"[MARKETS ERROR] {e}")
         active_symbols = FUTURES_SYMBOLS
 
+    # ==========================================
+    # 🧪 اختبار الشارت (احذف هذه الكتلة بعد التأكد)
+    # ==========================================
+    try:
+        test_ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", "15m", limit=100)
+        test_df = pd.DataFrame(test_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        test_df['datetime'] = pd.to_datetime(test_df['timestamp'], unit='ms')
+        test_df = add_indicators(test_df)
+        last_row = test_df.iloc[-1]
+        test_entry = float(last_row['close'])
+        buf = generate_chart(
+            "BTC/USDT:USDT", test_df, "15m", "LONG",
+            float(last_row['high20']), float(last_row['low20']),
+            test_entry, test_entry * 0.98, test_entry * 1.03
+        )
+        send_photo(buf, "🧪 <b>اختبار الشارت — كل شيء يعمل ✅</b>")
+        print("[TEST] Chart test sent to Telegram.", flush=True)
+    except Exception as e:
+        send(f"⚠️ خطأ اختبار الشارت: <code>{e}</code>")
+        print(f"[TEST ERROR] {e}", flush=True)
+    # ==========================================
+    # نهاية كتلة الاختبار
+    # ==========================================
+
     ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
     ws_thread.start()
     print("[INIT] Whale monitor started.", flush=True)
 
-    send("🛡️ <b>تم تشغيل البوت المحدّث بنجاح (V21)</b>\n"
+    send("🛡️ <b>تم تشغيل البوت المحدّث بنجاح</b>\n"
          "⚡ <b>التحسينات النشطة:</b>\n"
          "• متابعة حية وفورية للصفقات (Live Candle Exit).\n"
          "• حماية رأس المال الذكية (Dynamic Breakeven عند 50% من الهدف).\n"
