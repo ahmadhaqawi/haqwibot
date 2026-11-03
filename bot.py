@@ -9,6 +9,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.patches as mpatches
+import numpy as np
 import ccxt
 import pandas as pd
 import requests
@@ -32,7 +33,6 @@ KSA_TZ = timezone(timedelta(hours=3))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# قائمة الـ 35 عملة
 FUTURES_SYMBOLS = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", 
     "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
@@ -47,8 +47,6 @@ FUTURES_SYMBOLS = [
 
 TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
-RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1"))
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 LEVERAGE = 5 
 
 state = {}
@@ -84,11 +82,11 @@ def is_good_trading_time():
     return True
 
 # ==========================================
-# 3. توليد الشارت (شموع + دعم/مقاومة + أهداف)
+# 3. توليد الشارت (شموع + خط ترند + أهداف)
 # ==========================================
 def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, tp):
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(12, 6)) # تكبير الشارت قليلاً ليتسع للبيانات
+    fig, ax = plt.subplots(figsize=(12, 6))
     
     df_plot = df.tail(40).reset_index(drop=True)
     
@@ -102,25 +100,53 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
         rect = mpatches.Rectangle((i - 0.3, bottom), 0.6, height, color=color)
         ax.add_patch(rect)
     
+    # --- حساب ورسم خط الترند ---
+    # نقسم الشارت إلى نصفين للبحث عن القيعان والقمم
+    half_idx = len(df_plot) // 2
+    first_half = df_plot.iloc[:half_idx]
+    second_half = df_plot.iloc[half_idx:]
+    
+    # خط الترند الصاعد (يربط أدنى قاع في النصف الأول بأدنى قاع في النصف الثاني)
+    if side == "LONG":
+        p1_idx = first_half['low'].idxmin()
+        p1_val = first_half['low'].min()
+        p2_idx = second_half['low'].idxmin()
+        p2_val = second_half['low'].min()
+        
+        # حساب ميل الخط وتمديده لآخر الشارت
+        slope = (p2_val - p1_val) / (p2_idx - p1_idx) if p2_idx != p1_idx else 0
+        end_idx = len(df_plot) - 1
+        end_val = p1_val + slope * (end_idx - p1_idx)
+        
+        ax.plot([p1_idx, end_idx], [p1_val, end_val], color='#FFD700', linewidth=2, linestyle='-', label='Uptrend Line')
+    
+    # خط الترند الهابط (يربط أعلى قمة في النصف الأول بأعلى قمة في النصف الثاني)
+    elif side == "SHORT":
+        p1_idx = first_half['high'].idxmax()
+        p1_val = first_half['high'].max()
+        p2_idx = second_half['high'].idxmax()
+        p2_val = second_half['high'].max()
+        
+        slope = (p2_val - p1_val) / (p2_idx - p1_idx) if p2_idx != p1_idx else 0
+        end_idx = len(df_plot) - 1
+        end_val = p1_val + slope * (end_idx - p1_idx)
+        
+        ax.plot([p1_idx, end_idx], [p1_val, end_val], color='#FFD700', linewidth=2, linestyle='-', label='Downtrend Line')
+
     # حساب الحد الأعلى والأدنى للشارت ليشمل كل الخطوط
     max_price = max(df_plot['high'].max(), resistance, tp, sl, entry)
     min_price = min(df_plot['low'].min(), support, tp, sl, entry)
     price_range = max_price - min_price
     ax.set_ylim(min_price - (price_range * 0.1), max_price + (price_range * 0.1))
     
-    # رسم الخطوط
-    # 1. المقاومة والدعم
+    # رسم الخطوط الأفقية
     ax.axhline(resistance, color='#32CD32', linestyle='--', linewidth=1.5)
     ax.axhline(support, color='#FF1493', linestyle='--', linewidth=1.5)
-    
-    # 2. سعر الدخول
     ax.axhline(entry, color='#00BFFF', linestyle='-', linewidth=2, alpha=0.8)
-    
-    # 3. الهدف ووقف الخسارة
     ax.axhline(tp, color='#00FF00', linestyle=':', linewidth=2)
     ax.axhline(sl, color='#FF0000', linestyle=':', linewidth=2)
     
-    # كتابة الأرقام على الشارت (على اليمين لتجنب التداخل مع الشموع)
+    # كتابة الأرقام على الشارت
     x_pos = len(df_plot) - 1
     ha_align = 'right'
     
@@ -142,6 +168,10 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
     
     plt.yticks(color='gray')
     ax.grid(color='gray', linestyle='--', linewidth=0.5, alpha=0.3)
+    
+    # إضافة وسيلة إيضاح صغيرة لخط الترند
+    ax.legend(loc='upper left', facecolor='black', edgecolor='white')
+    
     plt.tight_layout()
     
     buf = io.BytesIO()
@@ -151,7 +181,7 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
     return buf
 
 # ==========================================
-# 4. صياغة الرسائل
+# 4. صياغة الرسائل والمؤشرات
 # ==========================================
 def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type, support, resistance):
     if side == "LONG":
@@ -175,24 +205,16 @@ def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type, support, resistan
             f"📊 RSI: <code>{rsi:.1f}</code> | ADX: <code>{adx:.1f}</code>\n"
             f"💡 <i>بمجرد ربح 1%، قم بتعديل وقف الخسارة إلى سعر الدخول.</i>")
 
-def msg_exit(sym, side, timeframe, price, entry, reason, pnl_pct, duration, entry_str, exit_str):
-    title = f"⚪ <b>إغلاق صفقة لونق ({timeframe})</b>" if side == "LONG" else f"⚪ <b>إغلاق صفقة شورت ({timeframe})</b>"
+def msg_exit(sym, side, timeframe, price, entry, reason):
+    title = f"⚪ <b>إغلاق صفقة ({timeframe})</b>"
     reasons_ar = {"Stop Loss": "ضرب وقف الخسارة 🛑", "Take Profit": "تحقق هدف الربح 🎯"}
     ar_reason = reasons_ar.get(reason, reason)
-    leveraged_pnl = pnl_pct * LEVERAGE
-
     return (f"{title}\n"
             f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
-            f"📥 الدخول: <code>{fmt(entry)}</code> (⏰ {entry_str})\n"
-            f"📤 الخروج: <code>{fmt(price)}</code> (⏰ {exit_str})\n"
-            f"📊 النتيجة: <code>{pnl_pct:+.2f}%</code>\n"
-            f"🔥 <b>بالرافعة ({LEVERAGE}x):</b> <code>{leveraged_pnl:+.2f}%</code>\n"
-            f"⏱️ <b>مدة الصفقة:</b> <code>{duration}</code>\n"
+            f"📥 الدخول: <code>{fmt(entry)}</code>\n"
+            f"📤 الخروج: <code>{fmt(price)}</code>\n"
             f"📝 السبب: {ar_reason}")
 
-# ==========================================
-# 5. المؤشرات الفنية
-# ==========================================
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
 def rsi(s, p=14):
     d = s.diff(); g = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
@@ -248,14 +270,14 @@ def check_signal(df_main, timeframe, position, entry_price=None, sl=None, tp=Non
     return None
 
 # ==========================================
-# 6. الفحص الرئيسي
+# 5. الفحص الرئيسي
 # ==========================================
 def scan_symbol(exchange, symbol, timeframe):
     try:
         state_key = (symbol, timeframe)
         if symbol not in exchange.markets: return
         if state_key not in state:
-            state[state_key] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None, "entry_time": None}
+            state[state_key] = {"position": None, "entry": None, "sl": None, "tp": None, "last_candle_ts": None}
             
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
         if len(ohlcv) < 50: return
@@ -277,30 +299,29 @@ def scan_symbol(exchange, symbol, timeframe):
         if not signal: return
 
         if signal["action"] == "ENTRY":
-            state[state_key].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"], "entry_time": datetime.now(timezone.utc)})
+            state[state_key].update({"position": signal["side"], "entry": signal["price"], "sl": signal["sl"], "tp": signal["tp"]})
             
-            # إرسال الشارت مع خطوط الدخول والخروج
             chart_buf = generate_chart(symbol, df, timeframe, signal["side"], signal["resistance"], signal["support"], signal["price"], signal["sl"], signal["tp"])
             caption = msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"], signal["support"], signal["resistance"])
             send_photo(chart_buf, caption)
 
         elif signal["action"] == "EXIT":
-            state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None, "entry_time": None})
-            send(msg_exit(symbol, pos, timeframe, signal["price"], entry, signal["reason"], 0, "0", "-", "-"))
+            state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None})
+            send(msg_exit(symbol, pos, timeframe, signal["price"], entry, signal["reason"]))
 
     except Exception as e:
         print(f"[ERROR] {symbol} ({timeframe}): {e}", flush=True)
 
 # ==========================================
-# 7. التشغيل الرئيسي
+# 6. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V17 Bot (Full Chart)...", flush=True)
+    print("[INIT] Starting V18 Bot (Trendline Added)...", flush=True)
     exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
     exchange.load_markets()
 
-    send("🛡️ <b>تم تشغيل البوت (V17)</b>\n"
-         "📊 <b>جديد:</b> الشارت الآن يوضح (الدخول، الهدف، ووقف الخسارة) بخطوط وأرقام واضحة.")
+    send("🛡️ <b>تم تشغيل البوت (V18)</b>\n"
+         "📊 <b>جديد:</b> تم إضافة خط الترند الأصفر (Trendline) لجميع الشارتات.")
 
     while True:
         try:
