@@ -231,7 +231,7 @@ def msg_entry(sym, side, price, sl, tp, rsi_val, adx_val, signal_type, support, 
             f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
             f"⚙️ الرافعة: <b>{LEVERAGE}x</b> (الربح المستهدف: +{reward*LEVERAGE:.1f}%)\n"
             f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
-            f"⏰ وقت الدخول: <code>{now_str}</code> (مكة)\n"
+            f"⏰ وقت الدخول: <code>{now_str}</code>\n"
             f"🟢 المقاومة: <code>{fmt(resistance)}</code>\n"
             f"🔴 الدعم: <code>{fmt(support)}</code>\n"
             f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}% | رافعة: -{risk*LEVERAGE:.1f}%)\n"
@@ -317,7 +317,7 @@ async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, pr
            f"{emoji} النوع: <b>{side_ar}</b>\n"
            f"💰 القيمة: <code>${cost:,.0f}</code>\n"
            f"💵 السعر: <code>{fmt(price)}</code>\n"
-           f"⏰ الوقت: <code>{now_str}</code> (مكة)")
+           f"⏰ الوقت: <code>{now_str}</code>")
     send(msg)
 
 async def listen_to_binance():
