@@ -15,63 +15,64 @@ import requests
 from flask import Flask
 
 # ==========================================
-# إعدادات الـ Logging
+# Logging
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("TradingBot")
+logger = logging.getLogger("ScalpBot")
 
 app = Flask(__name__)
 
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_active"}, 200
+    return {"status": "ok", "service": "scalping_bot_active"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 # ==========================================
-# 1. الإعدادات
+# الإعدادات - سكالبينج عدواني
 # ==========================================
 KSA_TZ = timezone(timedelta(hours=3))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "500000"))
-WHALE_COOLDOWN = int(os.getenv("WHALE_COOLDOWN", "600"))
+WHALE_THRESHOLD_WS = float(os.getenv("WHALE_THRESHOLD_WS", "400000"))
+WHALE_COOLDOWN = int(os.getenv("WHALE_COOLDOWN", "300"))
 last_whale_alert: Dict[str, float] = {}
 
 WEBSOCKET_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 FUTURES_SYMBOLS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-    "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
-    "LINK/USDT:USDT", "DOT/USDT:USDT", "NEAR/USDT:USDT", "APT/USDT:USDT",
-    "SUI/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT", "INJ/USDT:USDT",
-    "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT"
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+    "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
+    "AVAX/USDT:USDT", "LINK/USDT:USDT", "SUI/USDT:USDT", "NEAR/USDT:USDT"
 ]
 
-TIMEFRAMES = ["5m", "15m"]
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "45"))
-RISK_PCT = float(os.getenv("RISK_PER_TRADE", "1.0"))
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3.0"))
+TIMEFRAMES = ["1m"]
+HIGHER_TF = "5m"
+SCAN_INTERVAL = 20
+RISK_PCT = float(os.getenv("RISK_PER_TRADE", "0.7"))
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "2.5"))
 LEVERAGE = 5
-TRAIL_ACTIVATE_PCT = 1.0   # يبدأ الـ Trailing بعد ربح 1%
-TRAIL_DISTANCE_PCT = 0.6   # يبعد الوقف 0.6% عن أعلى سعر
 
-# حالة البوت
+ATR_MULT_SL = 1.3
+ATR_MULT_TP = 2.2
+TRAIL_ACTIVATE_PCT = 0.45
+TRAIL_DISTANCE_PCT = 0.35
+
 state: Dict[tuple, Dict[str, Any]] = {}
 daily_pnl = {"value": 0.0, "date": datetime.now(KSA_TZ).date()}
 
 # ==========================================
-# 2. إرسال رسائل تيليجرام
+# تيليجرام
 # ==========================================
 def send(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -81,82 +82,64 @@ def send(msg: str):
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": cid,
-                    "text": msg,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                },
-                timeout=10
+                json={"chat_id": cid, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=8
             )
         except Exception as e:
-            logger.error(f"فشل إرسال تيليجرام إلى {cid}: {e}")
+            logger.error(f"Telegram error: {e}")
 
 def fmt(p: float) -> str:
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
-def msg_entry(sym: str, side: str, price: float, sl: float, tp: float,
-              rsi: float, adx: float, signal_type: str) -> str:
-    title = f"🟢 <b>إشارة لونق ({signal_type})</b>" if side == "LONG" else f"🔴 <b>إشارة شورت ({signal_type})</b>"
+def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type):
+    title = f"⚡ <b>سكالب لونق</b>" if side == "LONG" else f"⚡ <b>سكالب شورت</b>"
     risk = abs(price - sl) / price * 100
     reward = abs(tp - price) / price * 100
-    now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
+    now_str = datetime.now(KSA_TZ).strftime("%I:%M:%S %p")
 
     return (
-        f"{title}\n"
-        f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
-        f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
-        f"💵 سعر الدخول: <code>{fmt(price)}</code>\n"
-        f"⏰ وقت الدخول: <code>{now_str}</code>\n"
-        f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
-        f"🎯 هدف الربح: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
-        f"📊 RSI: <code>{rsi:.1f}</code> | ADX: <code>{adx:.1f}</code>\n"
-        f"💡 <i>سيتم تفعيل Trailing Stop تلقائياً بعد ربح {TRAIL_ACTIVATE_PCT}%</i>"
+        f"{title} | {signal_type}\n"
+        f"🪙 <code>{sym.split(':')[0]}</code>\n"
+        f"💵 الدخول: <code>{fmt(price)}</code>\n"
+        f"🛑 الوقف: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
+        f"🎯 الهدف: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
+        f"📊 RSI: {rsi:.1f} | ADX: {adx:.1f}\n"
+        f"⏰ {now_str}"
     )
 
-def msg_exit(sym: str, side: str, timeframe: str, price: float, entry: float,
-             reason: str, pnl_pct: float, duration: str, entry_str: str, exit_str: str) -> str:
-    title = f"⚪ <b>إغلاق صفقة لونق ({timeframe})</b>" if side == "LONG" else f"⚪ <b>إغلاق صفقة شورت ({timeframe})</b>"
-    status = "ربح ✅" if pnl_pct >= 0 else "خسارة ❌"
-    reasons_ar = {
-        "Stop Loss": "ضرب وقف الخسارة 🛑",
-        "Take Profit": "تحقق هدف الربح 🎯",
-        "Trailing Stop": "ضرب الـ Trailing Stop 🔄"
+def msg_exit(sym, side, price, entry, reason, pnl_pct, duration, entry_str, exit_str):
+    emoji = "✅" if pnl_pct >= 0 else "❌"
+    title = f"{emoji} إغلاق سكالب {'لونق' if side == 'LONG' else 'شورت'}"
+    reasons = {
+        "Stop Loss": "وقف خسارة",
+        "Take Profit": "هدف ربح",
+        "Trailing Stop": "تريلينج"
     }
-    ar_reason = reasons_ar.get(reason, reason)
-    leveraged_pnl = pnl_pct * LEVERAGE
+    ar_reason = reasons.get(reason, reason)
+    lev_pnl = pnl_pct * LEVERAGE
 
     return (
         f"{title}\n"
-        f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
-        f"📥 الدخول: <code>{fmt(entry)}</code> (⏰ {entry_str})\n"
-        f"📤 الخروج: <code>{fmt(price)}</code> (⏰ {exit_str})\n"
-        f"📊 النتيجة: <code>{pnl_pct:+.2f}%</code> ({status})\n"
-        f"🔥 <b>بالرافعة ({LEVERAGE}x):</b> <code>{leveraged_pnl:+.2f}%</code>\n"
-        f"⏱️ <b>مدة الصفقة:</b> <code>{duration}</code>\n"
-        f"📝 السبب: {ar_reason}"
+        f"🪙 <code>{sym.split(':')[0]}</code>\n"
+        f"📥 {fmt(entry)} → 📤 {fmt(price)}\n"
+        f"📊 النتيجة: <b>{pnl_pct:+.2f}%</b> | بالرافعة: <b>{lev_pnl:+.2f}%</b>\n"
+        f"⏱️ {duration} | السبب: {ar_reason}"
     )
 
 # ==========================================
-# 3. مراقبة الحيتان (WebSocket)
+# الحيتان
 # ==========================================
-async def process_whale_alert(platform: str, symbol_display: str, side_ar: str,
-                              emoji: str, cost: float, price: float):
+async def process_whale_alert(platform, symbol_display, side_ar, emoji, cost, price):
     key = f"{platform}_{symbol_display}"
     now = time.time()
     if now - last_whale_alert.get(key, 0) < WHALE_COOLDOWN:
         return
     last_whale_alert[key] = now
 
-    now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     msg = (
-        f"🐋 <b>صفقة ضخمة</b>\n"
-        f"🪙 الزوج: <code>{symbol_display}</code>\n"
-        f"{emoji} النوع: <b>{side_ar}</b>\n"
-        f"💰 القيمة: <code>${cost:,.0f}</code>\n"
-        f"💵 السعر: <code>{fmt(price)}</code>\n"
-        f"⏰ الوقت: <code>{now_str}</code>\n"
-        f"🏛 المنصة: <b>{platform}</b>"
+        f"🐋 <b>حوت</b>\n"
+        f"🪙 {symbol_display} | {emoji} {side_ar}\n"
+        f"💰 ${cost:,.0f} @ {fmt(price)}"
     )
     send(msg)
 
@@ -165,315 +148,253 @@ async def listen_to_binance():
     uri = f"wss://fstream.binance.com/stream?streams={streams}"
     while True:
         try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as websocket:
-                logger.info("متصل بـ Binance WebSocket")
+            async with websockets.connect(uri, ping_interval=15, ping_timeout=15) as ws:
                 while True:
-                    message = await websocket.recv()
-                    data = json.loads(message)
+                    msg = await ws.recv()
+                    data = json.loads(msg)
                     if 'data' in data and data['data'].get('e') == 'aggTrade':
-                        trade = data['data']
-                        price = float(trade['p'])
-                        quantity = float(trade['q'])
-                        cost = price * quantity
+                        t = data['data']
+                        price, qty = float(t['p']), float(t['q'])
+                        cost = price * qty
                         if cost >= WHALE_THRESHOLD_WS:
-                            side_ar = "شراء (لونق)" if trade['m'] is False else "بيع (شورت)"
-                            emoji = "🟢" if trade['m'] is False else "🔴"
-                            symbol_display = trade['s'].replace('USDT', '/USDT')
-                            await process_whale_alert("Binance", symbol_display, side_ar, emoji, cost, price)
-        except Exception as e:
-            logger.warning(f"Binance WS انقطع: {e} | إعادة الاتصال بعد 5 ثواني")
-            await asyncio.sleep(5)
+                            side_ar = "شراء" if not t['m'] else "بيع"
+                            emoji = "🟢" if not t['m'] else "🔴"
+                            await process_whale_alert("Binance", t['s'].replace("USDT", "/USDT"), side_ar, emoji, cost, price)
+        except Exception:
+            await asyncio.sleep(4)
 
 async def listen_to_okx():
-    args = [{"channel": "trades", "instId": sym.replace("USDT", "-USDT-SWAP")} for sym in WEBSOCKET_SYMBOLS]
+    args = [{"channel": "trades", "instId": s.replace("USDT", "-USDT-SWAP")} for s in WEBSOCKET_SYMBOLS]
     uri = "wss://ws.okx.com:8443/ws/v5/public"
     while True:
         try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as websocket:
-                await websocket.send(json.dumps({"op": "subscribe", "args": args}))
-                logger.info("متصل بـ OKX WebSocket")
+            async with websockets.connect(uri, ping_interval=15, ping_timeout=15) as ws:
+                await ws.send(json.dumps({"op": "subscribe", "args": args}))
                 while True:
-                    message = await websocket.recv()
-                    data = json.loads(message)
-                    if 'data' in data and data['data']:
-                        for trade in data['data']:
-                            price = float(trade['px'])
-                            size = float(trade['sz'])
-                            # ملاحظة: في OKX قد يكون الحجم بعدد العقود
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    if 'data' in data:
+                        for t in data['data']:
+                            price, size = float(t['px']), float(t['sz'])
                             cost = price * size
                             if cost >= WHALE_THRESHOLD_WS:
-                                side = trade.get('side', 'buy')
-                                side_ar = "شراء (لونق)" if side == 'buy' else "بيع (شورت)"
-                                emoji = "🟢" if side == 'buy' else "🔴"
-                                symbol_display = trade['instId'].replace("-SWAP", "").replace("-", "/")
-                                await process_whale_alert("OKX", symbol_display, side_ar, emoji, cost, price)
-        except Exception as e:
-            logger.warning(f"OKX WS انقطع: {e} | إعادة الاتصال بعد 5 ثواني")
-            await asyncio.sleep(5)
+                                side = t.get('side', 'buy')
+                                side_ar = "شراء" if side == "buy" else "بيع"
+                                emoji = "🟢" if side == "buy" else "🔴"
+                                sym = t['instId'].replace("-SWAP", "").replace("-", "/")
+                                await process_whale_alert("OKX", sym, side_ar, emoji, cost, price)
+        except Exception:
+            await asyncio.sleep(4)
 
 async def listen_to_bybit():
-    args = [f"publicTrade.{sym}" for sym in WEBSOCKET_SYMBOLS]
+    args = [f"publicTrade.{s}" for s in WEBSOCKET_SYMBOLS]
     uri = "wss://stream.bybit.com/v5/public/linear"
     while True:
         try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as websocket:
-                await websocket.send(json.dumps({"op": "subscribe", "args": args}))
-                logger.info("متصل بـ Bybit WebSocket")
+            async with websockets.connect(uri, ping_interval=15, ping_timeout=15) as ws:
+                await ws.send(json.dumps({"op": "subscribe", "args": args}))
                 while True:
-                    message = await websocket.recv()
-                    data = json.loads(message)
-                    if 'data' in data and data['data']:
-                        for trade in data['data']:
-                            price = float(trade['p'])
-                            size = float(trade['v'])
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    if 'data' in data:
+                        for t in data['data']:
+                            price, size = float(t['p']), float(t['v'])
                             cost = price * size
                             if cost >= WHALE_THRESHOLD_WS:
-                                side = trade.get('S', 'Buy')
-                                side_ar = "شراء (لونق)" if side == 'Buy' else "بيع (شورت)"
-                                emoji = "🟢" if side == 'Buy' else "🔴"
-                                symbol_display = trade['s'].replace('USDT', '/USDT')
-                                await process_whale_alert("Bybit", symbol_display, side_ar, emoji, cost, price)
-        except Exception as e:
-            logger.warning(f"Bybit WS انقطع: {e} | إعادة الاتصال بعد 5 ثواني")
-            await asyncio.sleep(5)
+                                side = t.get('S', 'Buy')
+                                side_ar = "شراء" if side == "Buy" else "بيع"
+                                emoji = "🟢" if side == "Buy" else "🔴"
+                                await process_whale_alert("Bybit", t['s'].replace("USDT", "/USDT"), side_ar, emoji, cost, price)
+        except Exception:
+            await asyncio.sleep(4)
 
 async def run_websockets():
-    await asyncio.gather(
-        listen_to_binance(),
-        listen_to_okx(),
-        listen_to_bybit()
-    )
+    await asyncio.gather(listen_to_binance(), listen_to_okx(), listen_to_bybit())
 
 def run_websocket_loop():
     asyncio.run(run_websockets())
 
 # ==========================================
-# 4. المؤشرات الفنية
+# المؤشرات
 # ==========================================
-def ema(series: pd.Series, period: int) -> pd.Series:
+def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def rsi(series, period=7):
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
     rs = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
-def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+def adx(high, low, close, period=10):
     up = high.diff()
     down = -low.diff()
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
     atr_val = tr.ewm(alpha=1/period, adjust=False).mean()
     plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / (atr_val + 1e-9))
     minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / (atr_val + 1e-9))
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)) * 100
+    dx = abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9) * 100
     return dx.ewm(alpha=1/period, adjust=False).mean()
 
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
+def atr(df, period=10):
     tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs()
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_indicators(df):
     df = df.copy()
-    df["ema9"] = ema(df["close"], 9)
+    df["ema8"] = ema(df["close"], 8)
     df["ema21"] = ema(df["close"], 21)
-    df["rsi"] = rsi(df["close"], 14)
-    df["adx"] = adx(df["high"], df["low"], df["close"], 14)
-    df["atr"] = atr(df, 14)
-    df["vol_ma"] = df["volume"].rolling(20).mean()
-    df["highest_high_20"] = df["high"].rolling(20).max().shift(1)
-    df["lowest_low_20"] = df["low"].rolling(20).min().shift(1)
+    df["rsi"] = rsi(df["close"], 7)
+    df["adx"] = adx(df["high"], df["low"], df["close"], 10)
+    df["atr"] = atr(df, 10)
+    df["vol_ma"] = df["volume"].rolling(12).mean()
+    df["high_5"] = df["high"].rolling(5).max().shift(1)
+    df["low_5"] = df["low"].rolling(5).min().shift(1)
     return df
 
-def check_signal(df_main: pd.DataFrame, df_1h: pd.DataFrame, timeframe: str,
-                 position: Optional[str], entry_price: Optional[float] = None,
-                 sl: Optional[float] = None, tp: Optional[float] = None,
-                 highest_since_entry: Optional[float] = None,
-                 lowest_since_entry: Optional[float] = None) -> Optional[Dict]:
-    if len(df_main) < 50 or len(df_1h) < 50:
+def check_signal(df, df_htf, position, entry=None, sl=None, tp=None, highest=None, lowest=None):
+    if len(df) < 30 or len(df_htf) < 30:
         return None
 
-    last = df_main.iloc[-2]   # آخر شمعة مغلقة
-    prev = df_main.iloc[-3]
+    last = df.iloc[-2]
+    prev = df.iloc[-3]
     price = float(last["close"])
+    htf_last = df_htf.iloc[-2]
 
-    # ===== إدارة الصفقات المفتوحة =====
+    # إدارة الصفقة المفتوحة
     if position == "LONG":
-        # تحديث أعلى سعر منذ الدخول (للـ Trailing)
-        if highest_since_entry is None or price > highest_since_entry:
-            highest_since_entry = price
-
-        # تفعيل Trailing Stop
-        if entry_price and highest_since_entry:
-            profit_pct = (highest_since_entry - entry_price) / entry_price * 100
-            if profit_pct >= TRAIL_ACTIVATE_PCT:
-                new_sl = highest_since_entry * (1 - TRAIL_DISTANCE_PCT / 100)
+        if highest is None or price > highest:
+            highest = price
+        if entry and highest:
+            profit = (highest - entry) / entry * 100
+            if profit >= TRAIL_ACTIVATE_PCT:
+                new_sl = highest * (1 - TRAIL_DISTANCE_PCT / 100)
                 if sl is None or new_sl > sl:
                     sl = new_sl
-
         if sl and price <= sl:
-            reason = "Trailing Stop" if (entry_price and (highest_since_entry - entry_price) / entry_price * 100 >= TRAIL_ACTIVATE_PCT) else "Stop Loss"
-            return {"action": "EXIT", "side": "LONG", "price": price, "reason": reason, "sl": sl, "highest": highest_since_entry}
-
+            reason = "Trailing Stop" if (entry and (highest - entry)/entry*100 >= TRAIL_ACTIVATE_PCT) else "Stop Loss"
+            return {"action": "EXIT", "side": "LONG", "price": price, "reason": reason, "sl": sl, "highest": highest}
         if tp and price >= tp:
-            return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit", "sl": sl, "highest": highest_since_entry}
+            return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit", "sl": sl, "highest": highest}
 
     elif position == "SHORT":
-        if lowest_since_entry is None or price < lowest_since_entry:
-            lowest_since_entry = price
-
-        if entry_price and lowest_since_entry:
-            profit_pct = (entry_price - lowest_since_entry) / entry_price * 100
-            if profit_pct >= TRAIL_ACTIVATE_PCT:
-                new_sl = lowest_since_entry * (1 + TRAIL_DISTANCE_PCT / 100)
+        if lowest is None or price < lowest:
+            lowest = price
+        if entry and lowest:
+            profit = (entry - lowest) / entry * 100
+            if profit >= TRAIL_ACTIVATE_PCT:
+                new_sl = lowest * (1 + TRAIL_DISTANCE_PCT / 100)
                 if sl is None or new_sl < sl:
                     sl = new_sl
-
         if sl and price >= sl:
-            reason = "Trailing Stop" if (entry_price and (entry_price - lowest_since_entry) / entry_price * 100 >= TRAIL_ACTIVATE_PCT) else "Stop Loss"
-            return {"action": "EXIT", "side": "SHORT", "price": price, "reason": reason, "sl": sl, "lowest": lowest_since_entry}
-
+            reason = "Trailing Stop" if (entry and (entry - lowest)/entry*100 >= TRAIL_ACTIVATE_PCT) else "Stop Loss"
+            return {"action": "EXIT", "side": "SHORT", "price": price, "reason": reason, "sl": sl, "lowest": lowest}
         if tp and price <= tp:
-            return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Take Profit", "sl": sl, "lowest": lowest_since_entry}
+            return {"action": "EXIT", "side": "SHORT", "price": price, "reason": "Take Profit", "sl": sl, "lowest": lowest}
 
     if position is not None:
-        # نرجع الحالة المحدثة فقط (للـ Trailing)
-        return {"action": "UPDATE", "sl": sl, "highest": highest_since_entry, "lowest": lowest_since_entry}
+        return {"action": "UPDATE", "sl": sl, "highest": highest, "lowest": lowest}
 
-    # ===== إشارات الدخول =====
-    trend_1h_up = df_1h.iloc[-2]["close"] > df_1h.iloc[-2]["ema21"]
-    trend_1h_down = df_1h.iloc[-2]["close"] < df_1h.iloc[-2]["ema21"]
-    vol_ok = last["volume"] > 1.2 * last["vol_ma"]
-    adx_strong = last["adx"] > 30
+    # شروط الدخول العدوانية
+    vol_spike = last["volume"] > 1.8 * last["vol_ma"]
+    adx_ok = last["adx"] > 22
+    htf_up = htf_last["close"] > htf_last["ema21"]
+    htf_down = htf_last["close"] < htf_last["ema21"]
 
-    cross_up = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
-    cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
+    momentum_up = (last["ema8"] > last["ema21"] and 
+                   prev["ema8"] <= prev["ema21"] and 
+                   last["rsi"] > 52 and last["rsi"] < 78 and
+                   price > last["high_5"] and vol_spike and adx_ok and htf_up)
 
-    atr_mult = 2.0 if timeframe == "5m" else 2.5
+    momentum_down = (last["ema8"] < last["ema21"] and 
+                     prev["ema8"] >= prev["ema21"] and 
+                     last["rsi"] < 48 and last["rsi"] > 22 and
+                     price < last["low_5"] and vol_spike and adx_ok and htf_down)
 
-    # ترند
-    if (cross_up and trend_1h_up and adx_strong and vol_ok and 40 < last["rsi"] < 70):
+    if momentum_up:
+        sl_price = price - ATR_MULT_SL * last["atr"]
+        tp_price = price + ATR_MULT_TP * last["atr"]
         return {
             "action": "ENTRY", "side": "LONG", "price": price,
-            "sl": price - atr_mult * last["atr"],
-            "tp": price + (atr_mult * 2) * last["atr"],
-            "rsi": last["rsi"], "adx": last["adx"], "type": f"ترند {timeframe}"
+            "sl": sl_price, "tp": tp_price,
+            "rsi": last["rsi"], "adx": last["adx"], "type": "زخم 1م ⚡"
         }
 
-    if (cross_down and trend_1h_down and adx_strong and vol_ok and 30 < last["rsi"] < 60):
+    if momentum_down:
+        sl_price = price + ATR_MULT_SL * last["atr"]
+        tp_price = price - ATR_MULT_TP * last["atr"]
         return {
             "action": "ENTRY", "side": "SHORT", "price": price,
-            "sl": price + atr_mult * last["atr"],
-            "tp": price - (atr_mult * 2) * last["atr"],
-            "rsi": last["rsi"], "adx": last["adx"], "type": f"ترند {timeframe}"
-        }
-
-    # اختراق
-    breakout_vol = last["volume"] > 2.5 * last["vol_ma"]
-    if (price > last["highest_high_20"] and breakout_vol and 60 < last["rsi"] < 80):
-        return {
-            "action": "ENTRY", "side": "LONG", "price": price,
-            "sl": price - (atr_mult - 0.5) * last["atr"],
-            "tp": price + (atr_mult * 2 - 1) * last["atr"],
-            "rsi": last["rsi"], "adx": last["adx"], "type": f"اختراق {timeframe} ⚡"
-        }
-
-    if (price < last["lowest_low_20"] and breakout_vol and 20 < last["rsi"] < 40):
-        return {
-            "action": "ENTRY", "side": "SHORT", "price": price,
-            "sl": price + (atr_mult - 0.5) * last["atr"],
-            "tp": price - (atr_mult * 2 - 1) * last["atr"],
-            "rsi": last["rsi"], "adx": last["adx"], "type": f"اختراق {timeframe} ⚡"
+            "sl": sl_price, "tp": tp_price,
+            "rsi": last["rsi"], "adx": last["adx"], "type": "زخم 1م ⚡"
         }
 
     return None
 
 # ==========================================
-# 5. الفحص الرئيسي
+# الفحص
 # ==========================================
-def scan_symbol(exchange, symbol: str, timeframe: str):
+def scan_symbol(exchange, symbol):
     try:
-        state_key = (symbol, timeframe)
-
+        state_key = (symbol, "1m")
         if symbol not in exchange.markets:
             return
 
         if state_key not in state:
             state[state_key] = {
-                "position": None,
-                "entry": None,
-                "sl": None,
-                "tp": None,
-                "last_candle_ts": None,
-                "entry_time": None,
-                "highest": None,
-                "lowest": None
+                "position": None, "entry": None, "sl": None, "tp": None,
+                "last_candle_ts": None, "entry_time": None,
+                "highest": None, "lowest": None
             }
 
-        ohlcv_main = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-        ohlcv_1h = exchange.fetch_ohlcv(symbol, "1h", limit=50)
+        ohlcv = exchange.fetch_ohlcv(symbol, "1m", limit=60)
+        ohlcv_htf = exchange.fetch_ohlcv(symbol, HIGHER_TF, limit=40)
 
-        if len(ohlcv_main) < 50 or len(ohlcv_1h) < 50:
+        if len(ohlcv) < 30 or len(ohlcv_htf) < 30:
             return
 
-        df_main = pd.DataFrame(ohlcv_main, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_htf = pd.DataFrame(ohlcv_htf, columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-        df_main = add_indicators(df_main)
-        df_1h = add_indicators(df_1h)
+        df = add_indicators(df)
+        df_htf = add_indicators(df_htf)
 
-        current_candle_ts = int(df_main.iloc[-2]["timestamp"])
-        if state[state_key]["last_candle_ts"] == current_candle_ts:
+        current_ts = int(df.iloc[-2]["timestamp"])
+        if state[state_key]["last_candle_ts"] == current_ts:
             return
-        state[state_key]["last_candle_ts"] = current_candle_ts
+        state[state_key]["last_candle_ts"] = current_ts
 
-        pos = state[state_key]["position"]
-        entry = state[state_key]["entry"]
-        sl = state[state_key]["sl"]
-        tp = state[state_key]["tp"]
-        highest = state[state_key]["highest"]
-        lowest = state[state_key]["lowest"]
-
-        signal = check_signal(
-            df_main, df_1h, timeframe, pos, entry, sl, tp, highest, lowest
-        )
+        st = state[state_key]
+        signal = check_signal(df, df_htf, st["position"], st["entry"], st["sl"], st["tp"], st["highest"], st["lowest"])
 
         if not signal:
             return
 
-        # تحديث الـ Trailing فقط
         if signal["action"] == "UPDATE":
-            if "sl" in signal and signal["sl"] is not None:
-                state[state_key]["sl"] = signal["sl"]
+            if signal.get("sl") is not None:
+                st["sl"] = signal["sl"]
             if "highest" in signal:
-                state[state_key]["highest"] = signal["highest"]
+                st["highest"] = signal["highest"]
             if "lowest" in signal:
-                state[state_key]["lowest"] = signal["lowest"]
+                st["lowest"] = signal["lowest"]
             return
 
-        # فحص الحد اليومي
         today = datetime.now(KSA_TZ).date()
         if daily_pnl["date"] != today:
             daily_pnl["value"] = 0.0
             daily_pnl["date"] = today
-
         if daily_pnl["value"] <= -MAX_DAILY_LOSS:
             return
 
         if signal["action"] == "ENTRY":
-            state[state_key].update({
+            st.update({
                 "position": signal["side"],
                 "entry": signal["price"],
                 "sl": signal["sl"],
@@ -482,96 +403,72 @@ def scan_symbol(exchange, symbol: str, timeframe: str):
                 "highest": signal["price"] if signal["side"] == "LONG" else None,
                 "lowest": signal["price"] if signal["side"] == "SHORT" else None
             })
-            send(msg_entry(
-                symbol, signal["side"], signal["price"],
-                signal["sl"], signal["tp"],
-                signal["rsi"], signal["adx"], signal["type"]
-            ))
-            logger.info(f"إشارة دخول | {symbol} | {timeframe} | {signal['side']} @ {signal['price']}")
+            send(msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"],
+                           signal["rsi"], signal["adx"], signal["type"]))
+            logger.info(f"ENTRY {signal['side']} | {symbol} @ {signal['price']}")
 
         elif signal["action"] == "EXIT":
-            pnl = (signal["price"] - entry) / entry * 100
-            if pos == "SHORT":
+            pnl = (signal["price"] - st["entry"]) / st["entry"] * 100
+            if st["position"] == "SHORT":
                 pnl = -pnl
 
-            exit_time_utc = datetime.now(timezone.utc)
-            entry_time_utc = state[state_key]["entry_time"]
+            exit_time = datetime.now(timezone.utc)
+            entry_time = st["entry_time"]
+            duration = "—"
+            entry_str = exit_str = "—"
+            if entry_time:
+                diff = int((exit_time - entry_time).total_seconds())
+                duration = f"{diff//60}د و {diff%60}ث" if diff >= 60 else f"{diff}ث"
+                entry_str = entry_time.astimezone(KSA_TZ).strftime("%I:%M:%S")
+                exit_str = exit_time.astimezone(KSA_TZ).strftime("%I:%M:%S")
 
-            duration_str = "غير محدد"
-            entry_str = "-"
-            exit_str = "-"
+            daily_pnl["value"] += pnl * (RISK_PCT / 1.5)
 
-            if entry_time_utc:
-                time_diff = exit_time_utc - entry_time_utc
-                total_seconds = int(time_diff.total_seconds())
-                hours = total_seconds // 3600
-                minutes = (total_seconds % 3600) // 60
-                duration_str = f"{hours} ساعة و {minutes} دقيقة" if hours > 0 else f"{minutes} دقيقة"
-                entry_str = entry_time_utc.astimezone(KSA_TZ).strftime("%I:%M %p")
-                exit_str = exit_time_utc.astimezone(KSA_TZ).strftime("%I:%M %p")
+            send(msg_exit(symbol, st["position"], signal["price"], st["entry"],
+                          signal["reason"], pnl, duration, entry_str, exit_str))
+            logger.info(f"EXIT {st['position']} | {symbol} | {pnl:+.2f}% | {signal['reason']}")
 
-            # حساب الـ PnL بشكل أدق (بناءً على نسبة المخاطرة)
-            risk_amount = RISK_PCT
-            actual_pnl_contribution = (pnl / abs((entry - state[state_key]["sl"]) / entry * 100)) * risk_amount if state[state_key]["sl"] else (pnl * LEVERAGE * risk_amount / 100)
-            daily_pnl["value"] += actual_pnl_contribution
-
-            state[state_key].update({
-                "position": None,
-                "entry": None,
-                "sl": None,
-                "tp": None,
-                "entry_time": None,
-                "highest": None,
-                "lowest": None
+            st.update({
+                "position": None, "entry": None, "sl": None, "tp": None,
+                "entry_time": None, "highest": None, "lowest": None
             })
 
-            send(msg_exit(
-                symbol, pos, timeframe, signal["price"], entry,
-                signal["reason"], pnl, duration_str, entry_str, exit_str
-            ))
-            logger.info(f"إغلاق صفقة | {symbol} | {timeframe} | PnL: {pnl:+.2f}% | السبب: {signal['reason']}")
-
             if daily_pnl["value"] <= -MAX_DAILY_LOSS:
-                send(f"🛑 <b>تم إيقاف البوت مؤقتاً</b>\nوصلت للحد الأقصى للخسارة اليومية ({MAX_DAILY_LOSS}%).")
+                send(f"🛑 تم إيقاف البوت | وصلنا لحد الخسارة اليومية")
 
     except Exception as e:
-        logger.error(f"خطأ في فحص {symbol} ({timeframe}): {e}", exc_info=False)
+        logger.error(f"Scan error {symbol}: {e}")
 
 # ==========================================
-# 6. التشغيل الرئيسي
+# التشغيل
 # ==========================================
 def trading_loop():
-    logger.info("بدء تشغيل البوت المحسّن (V10) - Multi-Timeframe + Trailing Stop")
+    logger.info("تشغيل بوت السكالبينج العدواني...")
 
-    ws_thread = threading.Thread(target=run_websocket_loop, daemon=True)
-    ws_thread.start()
+    threading.Thread(target=run_websocket_loop, daemon=True).start()
 
     exchange = ccxt.okx({
         'enableRateLimit': True,
         'options': {'defaultType': 'swap'}
     })
     exchange.load_markets()
-    logger.info(f"تم تحميل الأسواق من OKX | عدد الرموز: {len(FUTURES_SYMBOLS)}")
 
     send(
-        f"🛡️ <b>تم تشغيل البوت المحسّن (V10)</b>\n"
-        f"📈 <b>الفريمات:</b> 5 دقائق و 15 دقيقة\n"
-        f"🛑 <b>وقف الخسارة:</b> ديناميكي (ATR) + Trailing Stop\n"
-        f"🧠 <b>فلتر القوة:</b> ADX > 30\n"
-        f"🐋 <b>مراقب الحيتان:</b> أكبر من ${WHALE_THRESHOLD_WS:,.0f}\n"
-        f"⚙️ الرافعة: <b>{LEVERAGE}x</b>\n"
-        f"📉 الحد اليومي للخسارة: <b>{MAX_DAILY_LOSS}%</b>"
+        f"⚡ <b>بوت سكالبينج عدواني اشتغل</b>\n"
+        f"⏱ الفريم: 1 دقيقة\n"
+        f"🎯 وقف ضيق + هدف سريع\n"
+        f"🔄 Trailing بدري\n"
+        f"🐋 مراقبة الحيتان مفعّلة\n"
+        f"📉 حد الخسارة اليومي: {MAX_DAILY_LOSS}%"
     )
 
     while True:
         try:
             for sym in FUTURES_SYMBOLS:
-                for tf in TIMEFRAMES:
-                    scan_symbol(exchange, sym, tf)
-                    time.sleep(0.35)  # تأخير خفيف لتجنب Rate Limit
+                scan_symbol(exchange, sym)
+                time.sleep(0.25)
         except Exception as e:
-            logger.error(f"خطأ في اللوب الرئيسي: {e}")
-
+            logger.error(f"Loop error: {e}")
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
