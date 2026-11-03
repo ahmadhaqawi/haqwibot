@@ -3,6 +3,11 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+import io
+import matplotlib
+matplotlib.use('Agg') # ضروري جداً للعمل على السيرفر بدون شاشة
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import ccxt
 import pandas as pd
 import requests
@@ -45,7 +50,7 @@ state = {}
 daily_pnl = {"value": 0.0, "date": datetime.now(KSA_TZ).date()}
 
 # ==========================================
-# 2. إرسال رسائل تيليجرام
+# 2. إرسال رسائل تيليجرام (نص + صورة)
 # ==========================================
 def send(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
@@ -61,17 +66,71 @@ def send(msg):
         except Exception as e:
             print(f"[TG ERROR] Failed to send to {cid}: {e}")
 
+def send_photo(photo_buf, caption):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
+        return
+    chat_ids = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(",") if cid.strip()]
+    for cid in chat_ids:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                data={"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
+                files={"photo": ("chart.png", photo_buf, "image/png")},
+                timeout=15)
+        except Exception as e:
+            print(f"[TG ERROR] Failed to send photo to {cid}: {e}")
+
 def fmt(p): 
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
 def is_good_trading_time():
     now = datetime.now(KSA_TZ)
     hour = now.hour
-    # نمنع التداول من 2 صباحاً إلى 7 صباحاً بتوقيت السعودية (وقت سكون السوق)
-    if 2 <= hour < 7: 
-        return False
+    # منع التداول وقت السكون
+    if 2 <= hour < 7: return False
     return True
 
+# ==========================================
+# 3. توليد الشارت
+# ==========================================
+def generate_chart(symbol, df, timeframe, side, resistance, support):
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(10, 5))
+    
+    # رسم السعر والمتوسطات
+    ax.plot(df['datetime'], df['close'], label='Close Price', color='#00BFFF', linewidth=2)
+    ax.plot(df['datetime'], df['ema9'], label='EMA 9', color='#FFD700', linestyle='--', alpha=0.8)
+    ax.plot(df['datetime'], df['ema21'], label='EMA 21', color='#FF4500', linestyle='--', alpha=0.8)
+    
+    # خطوط الدعم والمقاومة
+    ax.axhline(resistance, color='#32CD32', linestyle='-', linewidth=1.5, label=f'Resistance ({fmt(resistance)})')
+    ax.axhline(support, color='#FF1493', linestyle='-', linewidth=1.5, label=f'Support ({fmt(support)})')
+    
+    # تظليل منطقة الاختراق
+    if side == "LONG":
+        ax.axhline(resistance, xmin=0.8, xmax=1.0, color='#32CD32', linewidth=4, alpha=0.5) 
+    else:
+        ax.axhline(support, xmin=0.8, xmax=1.0, color='#FF1493', linewidth=4, alpha=0.5)
+
+    ax.set_title(f"{symbol} - {timeframe} | {side}", color='white', fontsize=14, fontweight='bold')
+    ax.set_ylabel("Price (USDT)", color='white')
+    
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    plt.xticks(rotation=45, color='gray')
+    plt.yticks(color='gray')
+    ax.grid(color='gray', linestyle='--', linewidth=0.5, alpha=0.3)
+    ax.legend(loc='upper left', facecolor='black', edgecolor='white')
+    
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ==========================================
+# 4. صياغة الرسائل
+# ==========================================
 def msg_entry(sym, side, price, sl, tp, rsi, adx, signal_type, support, resistance):
     if side == "LONG":
         title = f"🟢 <b>توصية شراء (LONG) - {signal_type}</b>"
@@ -110,7 +169,7 @@ def msg_exit(sym, side, timeframe, price, entry, reason, pnl_pct, duration, entr
             f"📝 السبب: {ar_reason}")
 
 # ==========================================
-# 3. المؤشرات الفنية
+# 5. المؤشرات الفنية
 # ==========================================
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
@@ -157,7 +216,6 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
     last_1h   = df_1h.iloc[-2]
     price = last_main["close"]
 
-    # إدارة الخروج
     if position == "LONG":
         if price <= sl: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Stop Loss"}
         if price >= tp: return {"action": "EXIT", "side": "LONG", "price": price, "reason": "Take Profit"}
@@ -168,7 +226,6 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
     if position is not None: return None
     if not is_good_trading_time(): return None
 
-    # فلاتر الجودة
     trend_1h_up   = last_1h["close"] > last_1h["ema21"] and last_1h["close"] > last_1h["ema9"]
     trend_1h_down = last_1h["close"] < last_1h["ema21"] and last_1h["close"] < last_1h["ema9"]
     vol_ok = last_main["volume"] > 1.8 * last_main["vol_ma"]
@@ -191,11 +248,9 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
     elif timeframe == "1h": atr_mult = 2.7
     else: atr_mult = 3.0
 
-    # حساب الدعم والمقاومة بناءً على آخر 20 شمعة
     support = last_main["lowest_low_20"]
     resistance = last_main["highest_high_20"]
 
-    # إشارات الترند
     if (cross_up and trend_1h_up and adx_strong and vol_ok and ema_spread and volatility_ok and 46 < last_main["rsi"] < 63):
         return {"action": "ENTRY", "side": "LONG", "price": price,
                 "sl": price - atr_mult * last_main["atr"], "tp": price + (atr_mult * 2.3) * last_main["atr"],
@@ -208,7 +263,6 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
                 "rsi": last_main["rsi"], "adx": last_main["adx"], "type": f"ترند قوي {timeframe}",
                 "support": support, "resistance": resistance}
 
-    # إشارات الاختراق
     breakout_vol = last_main["volume"] > 3.2 * last_main["vol_ma"]
     if (price > resistance and breakout_vol and adx_strong and volatility_ok and 63 < last_main["rsi"] < 76 and trend_1h_up):
         return {"action": "ENTRY", "side": "LONG", "price": price,
@@ -225,7 +279,7 @@ def check_signal(df_main, df_1h, timeframe, position, entry_price=None, sl=None,
     return None
 
 # ==========================================
-# 4. الفحص الرئيسي
+# 6. الفحص الرئيسي
 # ==========================================
 def scan_symbol(exchange, symbol, timeframe):
     try:
@@ -243,6 +297,9 @@ def scan_symbol(exchange, symbol, timeframe):
         df_main = pd.DataFrame(ohlcv_main, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
         
+        # تحويل الوقت للرسم
+        df_main['datetime'] = pd.to_datetime(df_main['timestamp'], unit='ms')
+
         df_main = add_indicators(df_main)
         df_1h = add_indicators(df_1h)
 
@@ -271,9 +328,12 @@ def scan_symbol(exchange, symbol, timeframe):
                 "entry_time": datetime.now(timezone.utc)
             })
             
-            # إرسال الرسالة النصية فقط
-            msg = msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"], signal["support"], signal["resistance"])
-            send(msg)
+            # توليد الشارت
+            chart_buf = generate_chart(symbol, df_main, timeframe, signal["side"], signal["resistance"], signal["support"])
+            caption = msg_entry(symbol, signal["side"], signal["price"], signal["sl"], signal["tp"], signal["rsi"], signal["adx"], signal["type"], signal["support"], signal["resistance"])
+            
+            # إرسال الصورة مع النص
+            send_photo(chart_buf, caption)
 
         elif signal["action"] == "EXIT":
             pnl = (signal["price"] - entry) / entry * 100
@@ -307,10 +367,10 @@ def scan_symbol(exchange, symbol, timeframe):
         print(f"[ERROR] Scan {symbol} ({timeframe}): {e}", flush=True)
 
 # ==========================================
-# 5. التشغيل الرئيسي
+# 7. التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V13 Bot (Pure Text Strategy)...", flush=True)
+    print("[INIT] Starting V14 Bot (Charts Enabled)...", flush=True)
 
     exchange = ccxt.okx({
         'enableRateLimit': True,
@@ -318,9 +378,9 @@ def trading_loop():
     })
     exchange.load_markets()
 
-    send(f"🛡️ <b>تم تشغيل البوت (V13) - التوصيات النصية</b>\n"
+    send(f"🛡️ <b>تم تشغيل البوت (V14) - التوصيات مع الشارت</b>\n"
          f"📈 <b>الفريمات:</b> 5m | 15m | 1h | 4h\n"
-         f"🟢 <b>ميزة:</b> إرفاق الدعم والمقاومة في كل توصية\n"
+         f"📊 <b>الشارت:</b> يتم إرفاق صورة تحليلية مع كل إشارة\n"
          f"🛑 <b>وقف الخسارة:</b> ديناميكي (ATR)\n"
          f"🧠 <b>فلاتر:</b> ADX + Volume + تقلب + وقت التداول\n"
          f"⚙️ الرافعة: <b>{LEVERAGE}x</b>")
