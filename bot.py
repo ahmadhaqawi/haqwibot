@@ -1,5 +1,4 @@
 import os
-import sys
 import threading
 import time
 import json
@@ -20,7 +19,7 @@ app = Flask(__name__)
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_v23_okx_demo"}, 200
+    return {"status": "ok", "service": "trading_bot_v24_okx_demo"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -31,10 +30,9 @@ def run_flask():
 # ==========================================
 KSA_TZ = timezone(timedelta(hours=3))
 
-# مفاتيح OKX (يفضل نقلها لـ Environment Variables لاحقاً)
-OKX_API_KEY = os.getenv("OKX_API_KEY", "22d97f9d-4d6d-4b6c-9925-15ae216c0e80")
-OKX_SECRET = os.getenv("OKX_SECRET", "1F7CD5E159B28B561C497CA491117DE3")
-OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "Haq@84221")
+OKX_API_KEY = os.getenv("OKX_API_KEY", "")
+OKX_SECRET = os.getenv("OKX_SECRET", "")
+OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -47,22 +45,19 @@ FUTURES_SYMBOLS = [
     "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT",
 ]
 
-TIMEFRAMES = ["15m", "1h", "4h"]          # قللت الـ 5m عشان الاستقرار
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "45"))
+TIMEFRAMES = ["15m", "1h", "4h"]
+SCAN_INTERVAL = 45
 LEVERAGE = 5
-POSITION_SIZE_USDT = 20                   # هامش كل صفقة بالدولار (تجريبي)
-MARGIN_MODE = "isolated"                  # isolated أو cross
+POSITION_SIZE_USDT = 50
+MAX_OPEN_POSITIONS = 5
+MARGIN_MODE = "isolated"
 STATE_FILE = "bot_state.json"
 
 plt.style.use('dark_background')
 
-# ==========================================
-# المتغيرات المشتركة
-# ==========================================
 state_lock = threading.Lock()
 state = {}
 daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
-last_daily_summary_date = None
 
 # ==========================================
 # إدارة الحالة
@@ -170,7 +165,7 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
         return None
 
 # ==========================================
-# الرسائل
+# الرسائل (شراء + بيع + المكسب)
 # ==========================================
 def msg_entry(sym, side, price, sl, tp, rsi_val, adx_val, signal_type, support, resistance, real_order=False):
     title = f"🟢 <b>توصية شراء (LONG)</b>" if side == "LONG" else f"🔴 <b>توصية بيع (SHORT)</b>"
@@ -193,18 +188,18 @@ def msg_entry(sym, side, price, sl, tp, rsi_val, adx_val, signal_type, support, 
 def msg_exit(sym, side, timeframe, exit_price, entry_price, reason):
     raw = ((exit_price - entry_price) / entry_price * 100) if side == "LONG" else ((entry_price - exit_price) / entry_price * 100)
     lev = raw * LEVERAGE
-    icon = "🟢" if lev > 0 else "🔴"
+    icon = "🟢" if lev > 0 else "🔴" if lev < 0 else "⚪"
     reasons = {
         "Take Profit": "تحقق هدف الربح 🎯",
         "Stop Loss": "ضرب وقف الخسارة 🛑",
         "Breakeven Hit": "خروج عند نقطة الدخول 🛡️"
     }
     return (f"{icon} <b>إغلاق صفقة ({timeframe})</b>\n"
-            f"🪙 {sym.split(':')[0]} ({side})\n"
-            f"📥 دخول: <code>{fmt(entry_price)}</code>\n"
-            f"📤 خروج: <code>{fmt(exit_price)}</code>\n"
-            f"📈 العائد: <b>{lev:+.2f}%</b>\n"
-            f"📝 {reasons.get(reason, reason)}")
+            f"🪙 الزوج: <code>{sym.split(':')[0]}</code> ({side})\n"
+            f"📥 سعر الدخول: <code>{fmt(entry_price)}</code>\n"
+            f"📤 سعر الخروج: <code>{fmt(exit_price)}</code>\n"
+            f"📈 العائد الصافي: <b>{lev:+.2f}%</b> (مع الرافعة {LEVERAGE}x)\n"
+            f"📝 السبب: {reasons.get(reason, reason)}")
 
 # ==========================================
 # المؤشرات
@@ -243,7 +238,7 @@ def add_indicators(df):
     return df
 
 # ==========================================
-# دوال التداول الحقيقية على OKX Demo
+# دوال التداول على OKX Demo
 # ==========================================
 def create_exchange():
     exchange = ccxt.okx({
@@ -254,7 +249,7 @@ def create_exchange():
         'options': {'defaultType': 'swap'},
         'timeout': 20000
     })
-    exchange.set_sandbox_mode(True)   # مهم جداً → Demo
+    exchange.set_sandbox_mode(True)
     return exchange
 
 def set_leverage_safe(exchange, symbol, leverage):
@@ -266,14 +261,10 @@ def set_leverage_safe(exchange, symbol, leverage):
         return False
 
 def calculate_amount(exchange, symbol, usdt_margin, price, leverage):
-    """يحسب كمية العقود بناءً على الهامش المطلوب"""
     try:
         market = exchange.market(symbol)
         contract_size = float(market.get('contractSize', 1))
-        # القيمة الاسمية ≈ amount * contract_size * price
-        # الهامش ≈ (amount * contract_size * price) / leverage
         amount = (usdt_margin * leverage) / (price * contract_size)
-        # تقريب حسب دقة السوق
         amount = float(exchange.amount_to_precision(symbol, amount))
         return max(amount, float(market.get('limits', {}).get('amount', {}).get('min', 0.01)))
     except Exception as e:
@@ -281,7 +272,6 @@ def calculate_amount(exchange, symbol, usdt_margin, price, leverage):
         return 0.01
 
 def open_real_position(exchange, symbol, side, entry_price, sl, tp):
-    """يفتح صفقة حقيقية على Demo"""
     try:
         set_leverage_safe(exchange, symbol, LEVERAGE)
         amount = calculate_amount(exchange, symbol, POSITION_SIZE_USDT, entry_price, LEVERAGE)
@@ -289,40 +279,30 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
             return False, "كمية غير صالحة"
 
         order_side = 'buy' if side == "LONG" else 'sell'
-        params = {
-            'tdMode': MARGIN_MODE,
-            'reduceOnly': False,
-        }
+        params = {'tdMode': MARGIN_MODE, 'reduceOnly': False}
 
-        # أمر الدخول
         order = exchange.create_order(symbol, 'market', order_side, amount, None, params)
-        print(f"[ORDER OPENED] {symbol} {side} amount={amount} → {order.get('id')}")
+        print(f"[ORDER OPENED] {symbol} {side} amount={amount}")
 
-        # محاولة وضع TP و SL (reduce-only)
         try:
             close_side = 'sell' if side == "LONG" else 'buy'
-            # Stop Loss
             exchange.create_order(symbol, 'market', close_side, amount, None, {
-                'tdMode': MARGIN_MODE,
-                'reduceOnly': True,
+                'tdMode': MARGIN_MODE, 'reduceOnly': True,
                 'stopLoss': {'triggerPrice': sl, 'type': 'market'}
             })
-            # Take Profit
             exchange.create_order(symbol, 'market', close_side, amount, None, {
-                'tdMode': MARGIN_MODE,
-                'reduceOnly': True,
+                'tdMode': MARGIN_MODE, 'reduceOnly': True,
                 'takeProfit': {'triggerPrice': tp, 'type': 'market'}
             })
         except Exception as e:
-            print(f"[TP/SL ATTACH WARNING] {e}")
+            print(f"[TP/SL WARNING] {e}")
 
         return True, order.get('id')
     except Exception as e:
-        print(f"[OPEN POSITION ERROR] {symbol}: {e}")
+        print(f"[OPEN ERROR] {symbol}: {e}")
         return False, str(e)
 
 def close_real_position(exchange, symbol, side):
-    """يغلق الصفقة المفتوحة"""
     try:
         positions = exchange.fetch_positions([symbol])
         for pos in positions:
@@ -330,8 +310,7 @@ def close_real_position(exchange, symbol, side):
                 close_side = 'sell' if pos['side'] == 'long' else 'buy'
                 amount = abs(float(pos['contracts']))
                 exchange.create_order(symbol, 'market', close_side, amount, None, {
-                    'tdMode': MARGIN_MODE,
-                    'reduceOnly': True
+                    'tdMode': MARGIN_MODE, 'reduceOnly': True
                 })
                 print(f"[POSITION CLOSED] {symbol}")
                 return True
@@ -446,7 +425,14 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
         if not signal: return
 
         if signal["action"] == "ENTRY":
+            with state_lock:
+                open_count = sum(1 for v in state.values() if v.get("position") is not None)
+            if open_count >= MAX_OPEN_POSITIONS:
+                print(f"[SKIP] Max open positions ({MAX_OPEN_POSITIONS}) reached")
+                return
+
             success, info = open_real_position(exchange, symbol, signal["side"], signal["price"], signal["sl"], signal["tp"])
+            
             with state_lock:
                 state[state_key].update({
                     "position": signal["side"], "entry": signal["price"],
@@ -474,7 +460,7 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
                 state[state_key]["sl"] = signal["new_sl"]
                 state[state_key]["breakeven_hit"] = True
             save_state()
-            send(f"🛡️ Breakeven → {symbol.split(':')[0]} | الوقف الآن عند سعر الدخول")
+            send(f"🛡️ <b>Breakeven</b>\n🪙 {symbol.split(':')[0]} | تم نقل الوقف إلى سعر الدخول")
 
         elif signal["action"] == "EXIT":
             close_real_position(exchange, symbol, pos)
@@ -496,15 +482,20 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
 # التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    global last_daily_summary_date
-    print("[INIT] Starting V23 OKX Demo Bot...", flush=True)
+    print("[INIT] Starting V24 OKX Demo Bot...", flush=True)
     load_state()
+
+    if not OKX_API_KEY or not OKX_SECRET or not OKX_PASSPHRASE:
+        print("[ERROR] OKX API credentials missing in Environment Variables")
+        send("❌ مفاتيح OKX غير موجودة في Environment Variables")
+        return
 
     exchange = create_exchange()
     try:
         exchange.load_markets()
         balance = exchange.fetch_balance()
-        print(f"[OKX DEMO] Connected successfully. USDT balance: {balance.get('USDT', {}).get('free', 0)}")
+        usdt_balance = balance.get('USDT', {}).get('free', 0)
+        print(f"[OKX DEMO] Connected. USDT balance: {usdt_balance}")
         active_symbols = [s for s in FUTURES_SYMBOLS if s in exchange.markets]
         print(f"[OKX] {len(active_symbols)} symbols ready")
     except Exception as e:
@@ -512,11 +503,12 @@ def trading_loop():
         send(f"❌ فشل الاتصال بـ OKX Demo:\n<code>{e}</code>")
         return
 
-    send("🛡️ <b>تم تشغيل البوت V23 على OKX Demo</b>\n"
-         f"• الرافعة: {LEVERAGE}x | الهامش لكل صفقة: {POSITION_SIZE_USDT} USDT\n"
+    send("🛡️ <b>تم تشغيل البوت V24 على OKX Demo</b>\n"
+         f"• الرافعة: {LEVERAGE}x\n"
+         f"• حجم الصفقة: {POSITION_SIZE_USDT} USDT\n"
+         f"• أقصى صفقات مفتوحة: {MAX_OPEN_POSITIONS}\n"
          f"• الوضع: {MARGIN_MODE}\n"
-         "• مراقبة الحيتان: <b>موقوفة</b>\n"
-         "• الصفقات تُفتح وتُغلق فعلياً على الحساب التجريبي")
+         "• مراقبة الحيتان: <b>موقوفة</b>")
 
     while True:
         cycle_start = time.time()
