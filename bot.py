@@ -48,7 +48,7 @@ LEVERAGE = 5
 POSITION_SIZE_USDT = 50
 MAX_OPEN_POSITIONS = 5
 MARGIN_MODE = "isolated"
-REENTRY_COOLDOWN_SEC = 1200  # 20 دقيقة بعد الإغلاق قبل إعادة الدخول لنفس الرمز
+REENTRY_COOLDOWN_SEC = 1200  # 20 دقيقة بعد الإغلاق
 
 DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
@@ -59,6 +59,7 @@ state_lock = threading.Lock()
 state = {}
 daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
 active_symbols_cache = []
+_signal_log_throttle = {}   # ✅ Fix #11 - منع إغراق اللوج
 
 # ==========================================
 # Flask
@@ -216,7 +217,7 @@ def msg_entry(sym, side, price, sl, tp, rsi_val, adx_val, signal_type, support, 
             f"🛑 وقف الخسارة: <code>{fmt(sl)}</code> (-{risk:.2f}%)\n"
             f"🎯 هدف الربح: <code>{fmt(tp)}</code> (+{reward:.2f}%)\n"
             f"📊 RSI: {rsi_val:.1f} | ADX: {adx_val:.1f}\n"
-            f"🛡️ Breakeven مفعل تلقائياً")
+            f"🛡️ Breakeven عند 50% من المسافة للهدف")
 
 def msg_exit(sym, side, timeframe, exit_price, entry_price, reason):
     raw = ((exit_price - entry_price) / entry_price * 100) if side == "LONG" else ((entry_price - exit_price) / entry_price * 100)
@@ -306,6 +307,7 @@ def get_current_price(exchange, symbol):
         return None
 
 def calculate_amount(exchange, symbol, usdt_margin, price, leverage):
+    """✅ Fix #8 - فحص الرصيد الحر قبل تجاوز الحد الأدنى"""
     try:
         market = exchange.market(symbol)
         contract_size = float(market.get('contractSize', 1))
@@ -317,9 +319,17 @@ def calculate_amount(exchange, symbol, usdt_margin, price, leverage):
         min_amt = float(market.get('limits', {}).get('amount', {}).get('min', 1.0))
 
         if amount < min_amt:
-            if min_amt * contract_size * price <= (usdt_margin * leverage * 1.3):
+            # الحد الأدنى أكبر من المخطط - نحتاج نتأكد من الرصيد
+            required_margin = (min_amt * contract_size * price) / leverage
+            try:
+                free_usdt = exchange.fetch_balance().get('USDT', {}).get('free', 0)
+            except Exception:
+                free_usdt = 0
+
+            if required_margin <= free_usdt * 0.9:
+                print(f"[MIN SIZE OK] {symbol}: min={min_amt} | margin={required_margin:.2f} | free={free_usdt:.2f}")
                 return min_amt
-            print(f"[AMOUNT SKIP] {symbol}: calc={amount} < min={min_amt}")
+            print(f"[AMOUNT SKIP] {symbol}: calc={amount} < min={min_amt} | required={required_margin:.2f} > free*0.9={free_usdt*0.9:.2f}")
             return 0.0
         return amount
     except Exception as e:
@@ -327,13 +337,12 @@ def calculate_amount(exchange, symbol, usdt_margin, price, leverage):
         return 0.0
 
 def _cancel_pending_algo_orders(exchange, symbol):
-    """يلغي الأوامر العادية + الأوامر الخوارزمية (algo) على OKX."""
     try:
         market = exchange.market(symbol)
         inst_id = market['id']
         n = 0
 
-        # 1. أوامر خوارزمية معلقة (order-algo)
+        # أوامر خوارزمية معلقة
         try:
             algo_resp = exchange.privateGetTradeOrdersAlgoPending({
                 'instId': inst_id,
@@ -350,7 +359,7 @@ def _cancel_pending_algo_orders(exchange, symbol):
         except Exception as e:
             print(f"[FETCH ALGO ERROR] {symbol}: {e}")
 
-        # 2. أوامر عادية معلقة (احتياط)
+        # أوامر عادية معلقة
         try:
             orders = exchange.fetch_open_orders(symbol)
             for o in orders:
@@ -370,12 +379,12 @@ def _cancel_pending_algo_orders(exchange, symbol):
         return 0
 
 def _place_sl(exchange, symbol, close_side, amount, trigger):
-    """وقف خسارة كأمر شرطي مستقل متوافق مع OKX V5"""
+    """وقف خسارة كأمر شرطي - ✅ Fix #1: reduceOnly كـ string في RAW API"""
     trigger_str = str(exchange.price_to_precision(symbol, trigger))
     amount_str = str(exchange.amount_to_precision(symbol, amount))
     market = exchange.market(symbol)
 
-    # 1. المحاولة الموحدة لـ CCXT
+    # المحاولة الموحدة لـ CCXT (boolean مقبول هنا)
     try:
         return exchange.create_order(symbol, 'market', close_side, amount, None, {
             'tdMode': MARGIN_MODE,
@@ -387,7 +396,7 @@ def _place_sl(exchange, symbol, close_side, amount, trigger):
     except Exception as e1:
         print(f"[SL UNIFIED FAILED] {symbol}: {e1} → trying raw OKX algo endpoint")
 
-    # 2. المسار المباشر للأوامر الخوارزمية في OKX (trade/order-algo)
+    # المسار المباشر - ✅ reduceOnly كـ string
     try:
         req = {
             'instId': market['id'],
@@ -395,7 +404,7 @@ def _place_sl(exchange, symbol, close_side, amount, trigger):
             'side': close_side,
             'ordType': 'conditional',
             'sz': amount_str,
-            'reduceOnly': True,
+            'reduceOnly': 'true',          # ✅ Fix #1
             'slTriggerPx': trigger_str,
             'slOrdPx': '-1',
         }
@@ -407,12 +416,11 @@ def _place_sl(exchange, symbol, close_side, amount, trigger):
         raise e2
 
 def _place_tp(exchange, symbol, close_side, amount, trigger):
-    """هدف ربح كأمر شرطي مستقل متوافق مع OKX V5"""
+    """هدف ربح كأمر شرطي - ✅ Fix #1: reduceOnly كـ string في RAW API"""
     trigger_str = str(exchange.price_to_precision(symbol, trigger))
     amount_str = str(exchange.amount_to_precision(symbol, amount))
     market = exchange.market(symbol)
 
-    # 1. المحاولة الموحدة لـ CCXT
     try:
         return exchange.create_order(symbol, 'market', close_side, amount, None, {
             'tdMode': MARGIN_MODE,
@@ -424,7 +432,6 @@ def _place_tp(exchange, symbol, close_side, amount, trigger):
     except Exception as e1:
         print(f"[TP UNIFIED FAILED] {symbol}: {e1} → trying raw OKX algo endpoint")
 
-    # 2. المسار المباشر للأوامر الخوارزمية في OKX (trade/order-algo)
     try:
         req = {
             'instId': market['id'],
@@ -432,7 +439,7 @@ def _place_tp(exchange, symbol, close_side, amount, trigger):
             'side': close_side,
             'ordType': 'conditional',
             'sz': amount_str,
-            'reduceOnly': True,
+            'reduceOnly': 'true',          # ✅ Fix #1
             'tpTriggerPx': trigger_str,
             'tpOrdPx': '-1',
         }
@@ -442,6 +449,32 @@ def _place_tp(exchange, symbol, close_side, amount, trigger):
     except Exception as e2:
         print(f"[TP RAW FAILED] {symbol}: {e2}")
         raise e2
+
+def _verify_sl_tp_exists(exchange, symbol):
+    """✅ Fix #2 - يتأكد من وجود SL و TP فعلياً على المنصة"""
+    try:
+        market = exchange.market(symbol)
+        for attempt in range(3):
+            time.sleep(0.5)
+            try:
+                algo = exchange.privateGetTradeOrdersAlgoPending({
+                    'instId': market['id'],
+                    'ordType': 'conditional',
+                })
+                pending = algo.get('data') or []
+                has_sl = any(o.get('slTriggerPx') for o in pending)
+                has_tp = any(o.get('tpTriggerPx') for o in pending)
+                if has_sl:
+                    print(f"[SL/TP VERIFIED] {symbol} | SL={'✅' if has_sl else '❌'} TP={'✅' if has_tp else '❌'}")
+                    if not has_tp:
+                        print(f"[NO TP WARNING] {symbol}: TP غير موجود")
+                    return has_sl, has_tp
+            except Exception as e:
+                print(f"[VERIFY ALGO WARN] {symbol} (attempt {attempt+1}): {e}")
+        return False, False
+    except Exception as e:
+        print(f"[VERIFY SL/TP ERROR] {symbol}: {e}")
+        return False, False
 
 def open_real_position(exchange, symbol, side, entry_price, sl, tp):
     try:
@@ -457,7 +490,7 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
         sl_formatted = float(exchange.price_to_precision(symbol, sl))
         tp_formatted = float(exchange.price_to_precision(symbol, tp))
 
-        # ---------- المحاولة 1: SL/TP مرفقة بأمر الدخول ----------
+        # المحاولة 1: SL/TP مرفقة
         order = None
         attached_ok = False
         try:
@@ -474,7 +507,7 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
         except Exception as e:
             print(f"[ATTACHED FAILED] {symbol}: {e} → fallback to separate algo orders")
 
-        # ---------- المحاولة 2: فتح + SL/TP منفصلة ----------
+        # المحاولة 2: فتح + SL/TP منفصلة
         if not attached_ok:
             order = exchange.create_order(symbol, 'market', order_side, amount, None, {'tdMode': MARGIN_MODE})
             print(f"[ORDER OPENED] {symbol} {side} amt={amount} id={order.get('id')}")
@@ -493,7 +526,6 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
             except Exception as e2:
                 print(f"[TP ALGO ERR] {symbol}: {e2}")
 
-            # إن فشل SL على صفقة مفتوحة → إغلاق طارئ
             if not sl_ok:
                 print(f"[SL FAILED] {symbol} → emergency close")
                 try:
@@ -505,7 +537,7 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
                     print(f"[EMERGENCY CLOSE FAILED] {symbol}: {em}")
                 return False, f"فشل SL → إغلاق طارئ: {symbol}"
 
-        # ---------- التحقق من وجود المركز فعليًا ----------
+        # التحقق من وجود المركز
         pos_verified = False
         for _ in range(3):
             time.sleep(0.4)
@@ -527,6 +559,19 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
             except Exception:
                 pass
             return False, "لم يتم التحقق من وجود المركز على المنصة"
+
+        # ✅ Fix #2: التحقق من SL/TP فعلياً
+        has_sl, has_tp = _verify_sl_tp_exists(exchange, symbol)
+        if not has_sl:
+            print(f"[NAKED POSITION] {symbol}: لا يوجد SL → إغلاق طارئ")
+            try:
+                exchange.create_order(symbol, 'market', close_side, amount, None, {
+                    'tdMode': MARGIN_MODE, 'reduceOnly': True
+                })
+                print(f"[NAKED CLOSED] {symbol}")
+            except Exception:
+                pass
+            return False, "الصفقة بلا حماية → تم إغلاقها طارئاً"
 
         return True, order.get('id')
 
@@ -558,7 +603,7 @@ def close_real_position(exchange, symbol, side):
         return False
 
 def update_breakeven(exchange, symbol, side, amount, entry_price, tp, fallback_sl=None):
-    """نقل الوقف للدخول. إذا فشل، يستعيد SL الأصلي (fallback_sl)."""
+    """✅ Fix #4: إغلاق طارئ إذا فشل SL@BE وفشل fallback"""
     try:
         _cancel_pending_algo_orders(exchange, symbol)
         close_side = 'sell' if side == "LONG" else 'buy'
@@ -579,27 +624,40 @@ def update_breakeven(exchange, symbol, side, amount, entry_price, tp, fallback_s
                 print(f"[TP RE-SET] {symbol} @ {tp_formatted}")
             except Exception as e:
                 print(f"[TP RE-SET ERR] {e}")
-        else:
-            # فشل SL@BE → استعد الحماية القديمة فورًا
-            if fallback_sl is not None:
-                try:
-                    fb = float(exchange.price_to_precision(symbol, fallback_sl))
-                    _place_sl(exchange, symbol, close_side, amount, fb)
-                    print(f"[SL RESTORED] {symbol} @ {fb}")
-                except Exception as e:
-                    print(f"[SL RESTORE ERR] {symbol}: {e}")
-            try:
-                _place_tp(exchange, symbol, close_side, amount, tp_formatted)
-                print(f"[TP RE-SET after restore] {symbol} @ {tp_formatted}")
-            except Exception as e:
-                print(f"[TP RE-SET ERR after restore] {e}")
+            return True
 
-        return sl_ok
+        # فشل SL@BE → حاول استعادة SL الأصلي
+        if fallback_sl is not None:
+            try:
+                fb = float(exchange.price_to_precision(symbol, fallback_sl))
+                _place_sl(exchange, symbol, close_side, amount, fb)
+                print(f"[SL RESTORED] {symbol} @ {fb}")
+                try:
+                    _place_tp(exchange, symbol, close_side, amount, tp_formatted)
+                except Exception:
+                    pass
+                return False
+            except Exception as e:
+                print(f"[SL RESTORE FAILED] {symbol}: {e}")
+
+        # لا حماية نهائياً → إغلاق طارئ
+        print(f"[EMERGENCY CLOSE] {symbol}: breakeven فشل بلا حماية")
+        try:
+            exchange.create_order(symbol, 'market', close_side, amount, None, {
+                'tdMode': MARGIN_MODE, 'reduceOnly': True
+            })
+        except Exception as e:
+            print(f"[EMERGENCY CLOSE FAILED] {symbol}: {e}")
+        send(f"🚨 <b>إغلاق طارئ</b>\n"
+             f"🪙 {symbol.split(':')[0]}\n"
+             f"فشل Breakeven + فشل استعادة الأصل → أغلقنا الصفقة لحماية الرصيد")
+        return False
     except Exception as e:
         print(f"[BREAKEVEN ERROR] {e}")
         return False
 
 def reconcile_state_with_exchange(exchange):
+    """✅ Fix #5: تنبيه تيليجرام على الصفقات اليتيمة"""
     try:
         all_positions = exchange.fetch_positions()
         live = {}
@@ -608,6 +666,7 @@ def reconcile_state_with_exchange(exchange):
                 live[p['symbol']] = p['side']
 
         cleaned = 0
+        orphans = []
         with state_lock:
             for key, data in state.items():
                 if data.get('position') is None:
@@ -623,9 +682,18 @@ def reconcile_state_with_exchange(exchange):
             known = {k[0] for k, v in state.items() if v.get('position')}
             for sym, s in live.items():
                 if sym not in known:
-                    print(f"[RECONCILE] {sym} ({s}) موجود على المنصة بس مو مسجّل → يبقى غير مُدار")
+                    print(f"[RECONCILE] {sym} ({s}) يتيمة على المنصة - غير مُدارة")
+                    orphans.append((sym, s))
         save_state()
-        print(f"[RECONCILE] live={len(live)} | cleaned={cleaned}")
+        print(f"[RECONCILE] live={len(live)} | cleaned={cleaned} | orphans={len(orphans)}")
+
+        if orphans:
+            lines = [f"⚠️ <b>صفقات يتيمة على المنصة</b>\n"]
+            for sym, s in orphans:
+                lines.append(f"🪙 {sym.split(':')[0]} ({s.upper()})")
+            lines.append("\n📌 موجودة على OKX لكن مو مسجلة عند البوت")
+            lines.append("🛠️ أغلقها يدوياً أو أضفها للـ state")
+            send("\n".join(lines))
     except Exception as e:
         print(f"[RECONCILE ERROR] {e}")
 
@@ -750,16 +818,21 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_trend, df_main=None):
         signal = check_signal(df, df_trend, timeframe, pos, pos_data["entry"], pos_data["sl"],
                               pos_data["tp"], pos_data["breakeven_hit"])
 
+        # ✅ Fix #11: throttle للوج الفلترة
         if not signal and pos is None:
             last = df.iloc[-2]; prev = df.iloc[-3]
             c_up = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
             c_dn = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
             if c_up or c_dn:
-                vol_ratio = last["volume"] / max(last["vol_ma"], 1e-9) if not pd.isna(last["vol_ma"]) else 0
-                spread = abs(last["ema9"] - last["ema21"]) / last["close"] * 100
-                print(f"[SIGNAL FILTERED] {symbol} {timeframe} | cross={'UP' if c_up else 'DN'} "
-                      f"adx={last['adx']:.1f} rsi={last['rsi']:.1f} volx={vol_ratio:.2f} "
-                      f"spread={spread:.3f}% atr={last['atr']:.6f}")
+                log_key = (symbol, timeframe)
+                last_log = _signal_log_throttle.get(log_key, 0)
+                if time.time() - last_log > 300:  # 5 دقائق
+                    vol_ratio = last["volume"] / max(last["vol_ma"], 1e-9) if not pd.isna(last["vol_ma"]) else 0
+                    spread = abs(last["ema9"] - last["ema21"]) / last["close"] * 100
+                    print(f"[SIGNAL FILTERED] {symbol} {timeframe} | cross={'UP' if c_up else 'DN'} "
+                          f"adx={last['adx']:.1f} rsi={last['rsi']:.1f} volx={vol_ratio:.2f} "
+                          f"spread={spread:.3f}% atr={last['atr']:.6f}")
+                    _signal_log_throttle[log_key] = time.time()
             return
 
         if not signal:
@@ -888,6 +961,22 @@ def trading_loop():
         send(f"❌ فشل الاتصال بـ OKX Demo:\n<code>{e}</code>")
         return
 
+    # ✅ Fix #3: التحقق من وضع الحساب
+    try:
+        acct = exchange.privateGetAccountConfig()
+        data = (acct.get('data') or [{}])[0]
+        acct_lv = data.get('acctLv', '?')
+        pos_mode = data.get('posMode', '?')
+        print(f"[ACCOUNT] acctLv={acct_lv} | posMode={pos_mode}")
+        if pos_mode == 'long_short_mode':
+            send(f"⛔ <b>الحساب في long_short_mode</b>\n"
+                 f"البوت يحتاج <b>net_mode</b>.\n"
+                 f"غيّره من: OKX → Account → Position Mode")
+            print("[FATAL] long_short_mode غير مدعوم، إيقاف")
+            return
+    except Exception as e:
+        print(f"[ACCT CONFIG WARN] {e} — سنكمل على افتراض net_mode")
+
     active_symbols = [s for s in FUTURES_SYMBOLS if s in exchange.markets]
     missing = [s for s in FUTURES_SYMBOLS if s not in exchange.markets]
     if missing:
@@ -912,7 +1001,8 @@ def trading_loop():
          f"• أقصى صفقات مفتوحة: {MAX_OPEN_POSITIONS}\n"
          f"• عدد الأزواج: {len(active_symbols)}\n"
          f"• الوضع: {MARGIN_MODE}\n"
-         f"• حماية SL/TP: مرفقة على OKX ✅")
+         f"• حماية SL/TP: مرفقة على OKX ✅\n"
+         f"• التحقق التلقائي: نعم ✅")
 
     last_heartbeat = 0
     while True:
@@ -924,26 +1014,34 @@ def trading_loop():
                     daily_pnl.update({"date": today, "trades": 0, "wins": 0, "value": 0.0})
                     save_state()
 
+            # ✅ Fix #10: لو 4h أو 1h فشل، نتخطى فقط الـ timeframe المرتبط
             for sym in active_symbols:
                 ohlcv_4h = fetch_data_safe(exchange, sym, "4h", 60)
-                if len(ohlcv_4h) < 50: continue
-                df_4h = pd.DataFrame(ohlcv_4h, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                df_4h = add_indicators(df_4h)
+                df_4h = None
+                if len(ohlcv_4h) >= 50:
+                    df_4h = pd.DataFrame(ohlcv_4h, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df_4h = add_indicators(df_4h)
 
                 ohlcv_1h = fetch_data_safe(exchange, sym, "1h", 60)
-                if len(ohlcv_1h) < 50: continue
-                df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                df_1h = add_indicators(df_1h)
+                df_1h = None
+                if len(ohlcv_1h) >= 50:
+                    df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df_1h = add_indicators(df_1h)
 
-                # 15m (تأكيد من 1h)
-                scan_symbol_timeframe(exchange, sym, "15m", df_1h)
-                time.sleep(0.04)
-                # 1h (تأكيد من 4h، ببيانات 1h)
-                scan_symbol_timeframe(exchange, sym, "1h", df_4h, df_main=df_1h)
-                time.sleep(0.04)
-                # 4h (تحقق ذاتي)
-                scan_symbol_timeframe(exchange, sym, "4h", df_4h, df_main=df_4h)
-                time.sleep(0.04)
+                # 15m يحتاج 1h للترند
+                if df_1h is not None:
+                    scan_symbol_timeframe(exchange, sym, "15m", df_1h)
+                    time.sleep(0.04)
+
+                # 1h يحتاج 4h للترند + 1h كبيانات
+                if df_4h is not None and df_1h is not None:
+                    scan_symbol_timeframe(exchange, sym, "1h", df_4h, df_main=df_1h)
+                    time.sleep(0.04)
+
+                # 4h تحقق ذاتي
+                if df_4h is not None:
+                    scan_symbol_timeframe(exchange, sym, "4h", df_4h, df_main=df_4h)
+                    time.sleep(0.04)
 
             if time.time() - last_heartbeat > 300:
                 with state_lock:
