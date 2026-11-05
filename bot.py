@@ -24,7 +24,7 @@ KSA_TZ = timezone(timedelta(hours=3))
 
 OKX_API_KEY = os.getenv("OKX_API_KEY", "")
 OKX_SECRET = os.getenv("OKX_SECRET", "")
-OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", os.getenv("OKX_PASSWORD", "")) # دعم لكلا الاسمين
+OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", os.getenv("OKX_PASSWORD", ""))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -48,7 +48,11 @@ LEVERAGE = 5
 POSITION_SIZE_USDT = 50
 MAX_OPEN_POSITIONS = 5
 MARGIN_MODE = "isolated"
-REENTRY_COOLDOWN_SEC = 1200  # 20 دقيقة بعد الإغلاق
+REENTRY_COOLDOWN_SEC = 1200  # 20 دقيقة
+
+# ⏰ وقت إرسال التقرير اليومي (بتوقيت السعودية)
+DAILY_REPORT_HOUR_KSA = 23
+DAILY_REPORT_MINUTE_KSA = 55
 
 DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
@@ -60,6 +64,7 @@ state = {}
 daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
 active_symbols_cache = []
 _signal_log_throttle = {}
+_last_report_date = None  # ✅ لتفادي إرسال التقرير مرتين
 
 # ==========================================
 # Flask
@@ -155,6 +160,75 @@ def fmt(p):
     if p is None or (isinstance(p, float) and np.isnan(p)):
         return "0.00"
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
+
+# ==========================================
+# 📊 التقرير اليومي (جديد)
+# ==========================================
+def send_daily_report():
+    try:
+        with state_lock:
+            pnl = daily_pnl["value"]
+            trades = daily_pnl["trades"]
+            wins = daily_pnl["wins"]
+            report_date = daily_pnl["date"]
+            open_positions = {
+                f"{k[0].split(':')[0]} ({v['position']})": {
+                    "entry": v.get("entry"),
+                    "sl": v.get("sl"),
+                    "tp": v.get("tp")
+                }
+                for k, v in state.items() if v.get("position")
+            }
+
+        losses = trades - wins
+        win_rate = (wins / trades * 100) if trades > 0 else 0
+        pnl_icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+        perf_label = "أرباح" if pnl > 0 else "خسائر" if pnl < 0 else "متعادل"
+
+        lines = [
+            f"📊 <b>تقرير نهاية اليوم</b>",
+            f"🗓️ التاريخ: <code>{report_date}</code>",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"{pnl_icon} <b>{perf_label}</b>: <b>{pnl:+.2f}%</b>",
+            f"📈 عدد الصفقات: <b>{trades}</b>",
+            f"✅ صفقات رابحة: <b>{wins}</b>",
+            f"❌ صفقات خاسرة: <b>{losses}</b>",
+            f"🎯 نسبة النجاح: <b>{win_rate:.1f}%</b>",
+            f"━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        if open_positions:
+            lines.append(f"💼 <b>صفقات مفتوحة ({len(open_positions)}):</b>")
+            for name, info in open_positions.items():
+                entry = info.get("entry") or 0
+                sl = info.get("sl") or 0
+                tp = info.get("tp") or 0
+                lines.append(f"  • {name} | دخول: <code>{fmt(entry)}</code>")
+                lines.append(f"    SL: <code>{fmt(sl)}</code> | TP: <code>{fmt(tp)}</code>")
+            lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+        else:
+            lines.append("💼 لا توجد صفقات مفتوحة حالياً")
+            lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+
+        lines.append(f"⚙️ الرافعة: {LEVERAGE}x | الحجم: {POSITION_SIZE_USDT} USDT")
+
+        send("\n".join(lines))
+        print(f"[DAILY REPORT] Sent for {report_date} | pnl={pnl:+.2f}% | trades={trades}")
+    except Exception as e:
+        print(f"[REPORT ERROR] {e}")
+
+def maybe_send_daily_report():
+    """يرسل التقرير عند بلوغ الوقت المحدد (بتوقيت السعودية) — مرة واحدة يومياً"""
+    global _last_report_date
+    now = datetime.now(KSA_TZ)
+    today = str(now.date())
+
+    # أرسل فقط عند الساعة المحددة (خلال أول 60 ثانية من الدقيقة)
+    if now.hour == DAILY_REPORT_HOUR_KSA and now.minute == DAILY_REPORT_MINUTE_KSA:
+        if _last_report_date != today:
+            send_daily_report()
+            _last_report_date = today
+            print(f"[DAILY REPORT] Marked {today} as sent")
 
 # ==========================================
 # الشارت
@@ -274,7 +348,7 @@ def add_indicators(df):
     return df
 
 # ==========================================
-# OKX Trading (مع تعديل posSide)
+# OKX Trading
 # ==========================================
 def create_exchange():
     exchange = ccxt.okx({
@@ -371,7 +445,7 @@ def _place_sl(exchange, symbol, close_side, amount, trigger):
         })
     except Exception as e1:
         print(f"[SL UNIFIED FAILED] {symbol}: {e1} → raw")
-    
+
     req = {
         'instId': market['id'], 'tdMode': MARGIN_MODE, 'side': close_side,
         'posSide': 'net', 'ordType': 'conditional', 'sz': amount_str,
@@ -435,7 +509,7 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
         attached_ok = False
         try:
             params = {
-                'tdMode': MARGIN_MODE, 'posSide': 'net', # ✅ إضافة posSide
+                'tdMode': MARGIN_MODE, 'posSide': 'net',
                 'slTriggerPx': str(sl_formatted), 'slOrdPx': '-1',
                 'tpTriggerPx': str(tp_formatted), 'tpOrdPx': '-1',
             }
@@ -445,7 +519,6 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
             print(f"[ATTACHED FAILED] {symbol}: {e} → fallback")
 
         if not attached_ok:
-            # ✅ إضافة posSide في الأمر الأساسي
             order = exchange.create_order(symbol, 'market', order_side, amount, None, {
                 'tdMode': MARGIN_MODE, 'posSide': 'net'
             })
@@ -753,7 +826,7 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_trend, df_main=None):
 
             chart = generate_chart(symbol, df, timeframe, signal["side"], signal["resistance"], signal["support"], actual_price, actual_sl, actual_tp)
             caption = msg_entry(symbol, signal["side"], actual_price, actual_sl, actual_tp, signal["rsi"], signal["adx"], signal["type"], signal["support"], signal["resistance"], real_order=success)
-            
+
             if chart: send_photo(chart, caption)
             else: send(caption)
 
@@ -806,8 +879,8 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_trend, df_main=None):
 # التشغيل الرئيسي
 # ==========================================
 def trading_loop():
-    global active_symbols_cache
-    print("[INIT] Starting V25 OKX Demo Bot (posSide fixed)...", flush=True)
+    global active_symbols_cache, _last_report_date
+    print("[INIT] Starting V25 OKX Demo Bot (with daily report)...", flush=True)
 
     if not OKX_API_KEY or not OKX_SECRET or not OKX_PASSPHRASE:
         send("❌ مفاتيح OKX غير موجودة في Environment Variables")
@@ -849,19 +922,33 @@ def trading_loop():
     load_state()
     reconcile_state_with_exchange(exchange)
 
+    # تعيين _last_report_date لو أرسلنا التقرير اليوم مسبقاً (بعد إعادة تشغيل)
+    today_str = str(datetime.now(KSA_TZ).date())
+    if daily_pnl.get("date") == today_str and daily_pnl.get("trades", 0) > 0:
+        pass  # سيتم إرساله في وقته
+
     send("🛡️ <b>تم تشغيل البوت V25 على OKX Demo</b>\n"
          f"• الرافعة: {LEVERAGE}x\n"
          f"• حجم الصفقة: {POSITION_SIZE_USDT} USDT\n"
          f"• وضع المركز: Net Mode ✅\n"
-         f"• حماية SL/TP: مرفقة على OKX ✅")
+         f"• حماية SL/TP: مرفقة على OKX ✅\n"
+         f"• 📊 التقرير اليومي: {DAILY_REPORT_HOUR_KSA:02d}:{DAILY_REPORT_MINUTE_KSA:02d} بتوقيت السعودية")
 
     last_heartbeat = 0
     while True:
         cycle_start = time.time()
         try:
+            # 🔔 فحص إرسال التقرير اليومي
+            maybe_send_daily_report()
+
             today = str(datetime.now(KSA_TZ).date())
             with state_lock:
                 if daily_pnl["date"] != today:
+                    # ✅ أرسل التقرير قبل التصفير (إذا لم يُرسل بالطريقة المجدولة)
+                    if _last_report_date != daily_pnl["date"]:
+                        send_daily_report()
+                        _last_report_date = daily_pnl["date"]
+
                     daily_pnl.update({"date": today, "trades": 0, "wins": 0, "value": 0.0})
                     save_state()
 
