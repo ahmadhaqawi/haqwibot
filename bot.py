@@ -21,6 +21,18 @@ app = Flask(__name__)
 def health_check():
     return {"status": "ok", "service": "trading_bot_v24_okx_demo"}, 200
 
+@app.route("/debug")
+def debug_info():
+    with state_lock:
+        active = {f"{k[0]}|{k[1]}": v for k, v in state.items() if v.get("position")}
+    return {
+        "open_positions": active,
+        "open_count": len(active),
+        "daily_pnl": daily_pnl,
+        "symbols_count": len(FUTURES_SYMBOLS),
+        "time_ksa": datetime.now(KSA_TZ).isoformat(),
+    }, 200
+
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
@@ -37,12 +49,19 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# 20 زوج (تم استبدال BNB/USDT:USDT لأنه غير متوفر على OKX Futures بـ SEI)
 FUTURES_SYMBOLS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-    "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
-    "LINK/USDT:USDT", "DOT/USDT:USDT", "NEAR/USDT:USDT", "APT/USDT:USDT",
-    "SUI/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT", "INJ/USDT:USDT",
-    "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT",
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT",
+    "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
+    "DOT/USDT:USDT", "NEAR/USDT:USDT", "APT/USDT:USDT", "SUI/USDT:USDT",
+    "ARB/USDT:USDT", "OP/USDT:USDT", "INJ/USDT:USDT", "ATOM/USDT:USDT",
+    "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT", "SEI/USDT:USDT",
+]
+
+# بدائل في حال نقص أي زوج على OKX Demo
+FALLBACK_SYMBOLS = [
+    "TRX/USDT:USDT", "WLD/USDT:USDT", "TIA/USDT:USDT",
+    "JUP/USDT:USDT", "PEPE/USDT:USDT", "ORDI/USDT:USDT",
 ]
 
 TIMEFRAMES = ["15m", "1h", "4h"]
@@ -51,7 +70,10 @@ LEVERAGE = 5
 POSITION_SIZE_USDT = 50
 MAX_OPEN_POSITIONS = 5
 MARGIN_MODE = "isolated"
-STATE_FILE = "bot_state.json"
+
+# دعم Render Disk (لو مربوط) وإلا fallback للملف المحلي
+DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
+STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
 
 plt.style.use('dark_background')
 
@@ -76,9 +98,11 @@ def load_state():
                 with state_lock:
                     state = loaded
                     daily_pnl = data.get("daily_pnl", daily_pnl)
-                print(f"[STATE] Loaded {len(state)} positions.")
+                print(f"[STATE] Loaded {len(state)} positions from {STATE_FILE}")
         except Exception as e:
             print(f"[STATE ERROR] {e}")
+    else:
+        print(f"[STATE] No state file at {STATE_FILE}, starting fresh")
 
 def save_state():
     try:
@@ -113,6 +137,7 @@ def send_photo(photo_buf, caption):
         return
     for cid in [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]:
         try:
+            photo_buf.seek(0)  # مهم: إعادة المؤشر لبداية البايتس
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
                 data={"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
@@ -165,7 +190,7 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
         return None
 
 # ==========================================
-# الرسائل (شراء + بيع + المكسب)
+# الرسائل
 # ==========================================
 def msg_entry(sym, side, price, sl, tp, rsi_val, adx_val, signal_type, support, resistance, real_order=False):
     title = f"🟢 <b>توصية شراء (LONG)</b>" if side == "LONG" else f"🔴 <b>توصية بيع (SHORT)</b>"
@@ -238,7 +263,7 @@ def add_indicators(df):
     return df
 
 # ==========================================
-# دوال التداول على OKX Demo
+# OKX Trading
 # ==========================================
 def create_exchange():
     exchange = ccxt.okx({
@@ -266,10 +291,36 @@ def calculate_amount(exchange, symbol, usdt_margin, price, leverage):
         contract_size = float(market.get('contractSize', 1))
         amount = (usdt_margin * leverage) / (price * contract_size)
         amount = float(exchange.amount_to_precision(symbol, amount))
-        return max(amount, float(market.get('limits', {}).get('amount', {}).get('min', 0.01)))
+        min_amt = float(market.get('limits', {}).get('amount', {}).get('min', 0.01))
+        return max(amount, min_amt)
     except Exception as e:
         print(f"[AMOUNT CALC ERROR] {e}")
         return 0.01
+
+def _cancel_pending_algo_orders(exchange, symbol):
+    """إلغاء كل أوامر SL/TP المعلقة للزوج"""
+    try:
+        try:
+            orders = exchange.fetch_open_orders(symbol, params={'stop': True})
+        except Exception:
+            orders = exchange.fetch_open_orders(symbol)
+        n = 0
+        for o in orders:
+            try:
+                exchange.cancel_order(o['id'], symbol, params={'stop': True})
+                n += 1
+            except Exception:
+                try:
+                    exchange.cancel_order(o['id'], symbol)
+                    n += 1
+                except Exception as e:
+                    print(f"[CANCEL WARN] {o.get('id')}: {e}")
+        if n > 0:
+            print(f"[CANCEL] {symbol}: cancelled {n} pending orders")
+        return n
+    except Exception as e:
+        print(f"[FETCH ALGO ERROR] {symbol}: {e}")
+        return 0
 
 def open_real_position(exchange, symbol, side, entry_price, sl, tp):
     try:
@@ -278,24 +329,37 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
         if amount <= 0:
             return False, "كمية غير صالحة"
 
+        _cancel_pending_algo_orders(exchange, symbol)
         order_side = 'buy' if side == "LONG" else 'sell'
-        params = {'tdMode': MARGIN_MODE, 'reduceOnly': False}
 
-        order = exchange.create_order(symbol, 'market', order_side, amount, None, params)
-        print(f"[ORDER OPENED] {symbol} {side} amount={amount}")
-
+        # المحاولة 1: SL/TP مرفقة بأمر الدخول
         try:
-            close_side = 'sell' if side == "LONG" else 'buy'
-            exchange.create_order(symbol, 'market', close_side, amount, None, {
-                'tdMode': MARGIN_MODE, 'reduceOnly': True,
-                'stopLoss': {'triggerPrice': sl, 'type': 'market'}
-            })
-            exchange.create_order(symbol, 'market', close_side, amount, None, {
-                'tdMode': MARGIN_MODE, 'reduceOnly': True,
-                'takeProfit': {'triggerPrice': tp, 'type': 'market'}
-            })
+            params = {
+                'tdMode': MARGIN_MODE,
+                'stopLoss':   {'triggerPrice': float(sl), 'orderPrice': -1},
+                'takeProfit': {'triggerPrice': float(tp), 'orderPrice': -1},
+            }
+            order = exchange.create_order(symbol, 'market', order_side, amount, None, params)
+            print(f"[ORDER + SL/TP ATTACHED] {symbol} {side} amt={amount} id={order.get('id')}")
+            return True, order.get('id')
         except Exception as e:
-            print(f"[TP/SL WARNING] {e}")
+            print(f"[ATTACHED FAILED] {e} → fallback to separate algo orders")
+
+        # المحاولة 2: صفقة + أوامر STOP منفصلة
+        order = exchange.create_order(symbol, 'market', order_side, amount, None,
+                                      {'tdMode': MARGIN_MODE})
+        print(f"[ORDER OPENED] {symbol} {side} amt={amount} id={order.get('id')}")
+
+        close_side = 'sell' if side == "LONG" else 'buy'
+        for label, trig in (("SL", sl), ("TP", tp)):
+            try:
+                exchange.create_order(symbol, 'market', close_side, amount, None, {
+                    'tdMode': MARGIN_MODE, 'reduceOnly': True,
+                    'triggerPrice': float(trig), 'orderPrice': -1, 'stop': True,
+                })
+                print(f"[{label} ALGO PLACED] {symbol} @ {trig}")
+            except Exception as e2:
+                print(f"[{label} ALGO ERR] trig={trig}: {e2}")
 
         return True, order.get('id')
     except Exception as e:
@@ -304,7 +368,9 @@ def open_real_position(exchange, symbol, side, entry_price, sl, tp):
 
 def close_real_position(exchange, symbol, side):
     try:
+        _cancel_pending_algo_orders(exchange, symbol)
         positions = exchange.fetch_positions([symbol])
+        closed = False
         for pos in positions:
             if float(pos.get('contracts', 0)) > 0:
                 close_side = 'sell' if pos['side'] == 'long' else 'buy'
@@ -313,11 +379,62 @@ def close_real_position(exchange, symbol, side):
                     'tdMode': MARGIN_MODE, 'reduceOnly': True
                 })
                 print(f"[POSITION CLOSED] {symbol}")
-                return True
-        return False
+                closed = True
+        return closed
     except Exception as e:
         print(f"[CLOSE ERROR] {e}")
         return False
+
+def update_breakeven(exchange, symbol, side, amount, entry_price, tp):
+    """نقل الوقف لسعر الدخول فعلياً على المنصة"""
+    try:
+        _cancel_pending_algo_orders(exchange, symbol)
+        close_side = 'sell' if side == "LONG" else 'buy'
+        for label, trig in (("SL@BE", entry_price), ("TP", tp)):
+            try:
+                exchange.create_order(symbol, 'market', close_side, amount, None, {
+                    'tdMode': MARGIN_MODE, 'reduceOnly': True,
+                    'triggerPrice': float(trig), 'orderPrice': -1, 'stop': True,
+                })
+                print(f"[{label} SET] {symbol} @ {trig}")
+            except Exception as e:
+                print(f"[{label} SET ERR] {e}")
+        return True
+    except Exception as e:
+        print(f"[BREAKEVEN ERROR] {e}")
+        return False
+
+def reconcile_state_with_exchange(exchange):
+    """يطابق state مع صفقات OKX الفعلية عند الإقلاع"""
+    try:
+        all_positions = exchange.fetch_positions()
+        live = {}
+        for p in all_positions:
+            if float(p.get('contracts', 0)) > 0:
+                live[p['symbol']] = p['side']  # 'long' | 'short'
+
+        cleaned = 0
+        with state_lock:
+            for key, data in state.items():
+                if data.get('position') is None:
+                    continue
+                sym = key[0]
+                expected = 'long' if data['position'] == 'LONG' else 'short'
+                if sym not in live or live[sym] != expected:
+                    print(f"[RECONCILE] {sym} ({data['position']}) → لا يطابق المنصة، تصفير")
+                    data.update({'position': None, 'entry': None, 'sl': None,
+                                 'tp': None, 'breakeven_hit': False})
+                    cleaned += 1
+
+            # إضافة مواقف موجودة على المنصة بس مو مسجلة عندنا
+            known = {k[0] for k, v in state.items() if v.get('position')}
+            for sym, s in live.items():
+                if sym not in known:
+                    print(f"[RECONCILE] {sym} ({s}) موجود على المنصة بس مو مسجّل → يبقى غير مُدار")
+        save_state()
+        print(f"[RECONCILE] live={len(live)} | cleaned={cleaned}")
+    except Exception as e:
+        print(f"[RECONCILE ERROR] {e}")
 
 # ==========================================
 # منطق الإشارة
@@ -421,7 +538,8 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
         if pos is None and pos_data["last_candle_ts"] == current_ts:
             return
 
-        signal = check_signal(df, df_1h, timeframe, pos, pos_data["entry"], pos_data["sl"], pos_data["tp"], pos_data["breakeven_hit"])
+        signal = check_signal(df, df_1h, timeframe, pos, pos_data["entry"], pos_data["sl"],
+                              pos_data["tp"], pos_data["breakeven_hit"])
         if not signal: return
 
         if signal["action"] == "ENTRY":
@@ -431,8 +549,9 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
                 print(f"[SKIP] Max open positions ({MAX_OPEN_POSITIONS}) reached")
                 return
 
-            success, info = open_real_position(exchange, symbol, signal["side"], signal["price"], signal["sl"], signal["tp"])
-            
+            success, info = open_real_position(exchange, symbol, signal["side"],
+                                               signal["price"], signal["sl"], signal["tp"])
+
             with state_lock:
                 state[state_key].update({
                     "position": signal["side"], "entry": signal["price"],
@@ -456,11 +575,29 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
                 send(f"⚠️ فشل فتح الصفقة على {symbol.split(':')[0]}: {info}")
 
         elif signal["action"] == "UPDATE_SL":
+            real_amt = 0
+            try:
+                for p in exchange.fetch_positions([symbol]):
+                    if float(p.get('contracts', 0)) > 0:
+                        real_amt = abs(float(p['contracts']))
+                        break
+            except Exception as e:
+                print(f"[FETCH POS ERROR] {e}")
+
+            ok = False
+            if real_amt > 0:
+                ok = update_breakeven(exchange, symbol, pos, real_amt,
+                                      signal["new_sl"], pos_data["tp"])
+
             with state_lock:
                 state[state_key]["sl"] = signal["new_sl"]
                 state[state_key]["breakeven_hit"] = True
             save_state()
-            send(f"🛡️ <b>Breakeven</b>\n🪙 {symbol.split(':')[0]} | تم نقل الوقف إلى سعر الدخول")
+
+            if ok:
+                send(f"🛡️ <b>Breakeven</b>\n🪙 {symbol.split(':')[0]} | تم نقل الوقف على المنصة إلى الدخول")
+            else:
+                send(f"⚠️ فشل نقل الوقف على {symbol.split(':')[0]} — راجع اللوجز")
 
         elif signal["action"] == "EXIT":
             close_real_position(exchange, symbol, pos)
@@ -471,7 +608,11 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
                 daily_pnl["trades"] += 1
                 daily_pnl["value"] += lev_pnl
                 if lev_pnl > 0: daily_pnl["wins"] += 1
-                state[state_key].update({"position": None, "entry": None, "sl": None, "tp": None, "breakeven_hit": False})
+                state[state_key].update({
+                    "position": None, "entry": None, "sl": None, "tp": None,
+                    "breakeven_hit": False,
+                    "last_candle_ts": current_ts,
+                })
             save_state()
             send(msg_exit(symbol, pos, timeframe, signal["price"], pos_data["entry"], signal["reason"]))
 
@@ -483,7 +624,6 @@ def scan_symbol_timeframe(exchange, symbol, timeframe, df_1h):
 # ==========================================
 def trading_loop():
     print("[INIT] Starting V24 OKX Demo Bot...", flush=True)
-    load_state()
 
     if not OKX_API_KEY or not OKX_SECRET or not OKX_PASSPHRASE:
         print("[ERROR] OKX API credentials missing in Environment Variables")
@@ -496,20 +636,39 @@ def trading_loop():
         balance = exchange.fetch_balance()
         usdt_balance = balance.get('USDT', {}).get('free', 0)
         print(f"[OKX DEMO] Connected. USDT balance: {usdt_balance}")
-        active_symbols = [s for s in FUTURES_SYMBOLS if s in exchange.markets]
-        print(f"[OKX] {len(active_symbols)} symbols ready")
     except Exception as e:
         print(f"[CONNECTION ERROR] {e}")
         send(f"❌ فشل الاتصال بـ OKX Demo:\n<code>{e}</code>")
         return
 
+    # إعادة بناء قائمة الرموز النشطة + تعويض الناقص
+    active_symbols = [s for s in FUTURES_SYMBOLS if s in exchange.markets]
+    missing = [s for s in FUTURES_SYMBOLS if s not in exchange.markets]
+    if missing:
+        print(f"[MISSING SYMBOLS] {missing} — جاري التعويض من FALLBACK")
+        for cand in FALLBACK_SYMBOLS:
+            if len(active_symbols) >= 20:
+                break
+            if cand in exchange.markets and cand not in active_symbols:
+                active_symbols.append(cand)
+                print(f"[FALLBACK USED] {cand}")
+
+    print(f"[OKX] {len(active_symbols)} symbols ready")
+    print(f"[STATE FILE] {STATE_FILE}")
+
+    # تحميل الحالة + مطابقة مع المنصة
+    load_state()
+    reconcile_state_with_exchange(exchange)
+
     send("🛡️ <b>تم تشغيل البوت V24 على OKX Demo</b>\n"
          f"• الرافعة: {LEVERAGE}x\n"
          f"• حجم الصفقة: {POSITION_SIZE_USDT} USDT\n"
          f"• أقصى صفقات مفتوحة: {MAX_OPEN_POSITIONS}\n"
+         f"• عدد الأزواج: {len(active_symbols)}\n"
          f"• الوضع: {MARGIN_MODE}\n"
-         "• مراقبة الحيتان: <b>موقوفة</b>")
+         f"• حماية SL/TP: مرفقة على OKX ✅")
 
+    last_heartbeat = 0
     while True:
         cycle_start = time.time()
         try:
@@ -528,6 +687,18 @@ def trading_loop():
 
                 for tf in TIMEFRAMES:
                     scan_symbol_timeframe(exchange, sym, tf, df_1h)
+
+            # Heartbeat كل 5 دقائق
+            if time.time() - last_heartbeat > 300:
+                with state_lock:
+                    open_ct = sum(1 for v in state.values() if v.get("position"))
+                    pnl_v = daily_pnl["value"]
+                    wins = daily_pnl["wins"]
+                    trades = daily_pnl["trades"]
+                print(f"[HEARTBEAT] {datetime.now(KSA_TZ).strftime('%H:%M:%S')} | "
+                      f"open={open_ct} | trades_today={trades} wins={wins} | "
+                      f"pnl={pnl_v:+.2f}% | symbols={len(active_symbols)}", flush=True)
+                last_heartbeat = time.time()
 
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
