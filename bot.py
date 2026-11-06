@@ -61,7 +61,7 @@ daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_v27_safe"}, 200
+    return {"status": "ok", "service": "trading_bot_v28_usd_pnl"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -166,28 +166,37 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
         return None
 
 # ==========================================
-# الرسائل
+# الرسائل (تم إضافة الدولار في الدخول والخروج)
 # ==========================================
 def msg_entry(sym, side, price, sl, tp, rsi_val, adx_val, real_order):
     title = f"🟢 <b>شراء (LONG)</b>" if side == "LONG" else f"🔴 <b>بيع (SHORT)</b>"
     status = "✅ تم فتح الصفقة آلياً" if real_order else "إشارة فقط"
+    
+    sl_pct = abs(price - sl) / price
+    tp_pct = abs(tp - price) / price
+    risk_usd = POSITION_SIZE_USDT * sl_pct * LEVERAGE
+    reward_usd = POSITION_SIZE_USDT * tp_pct * LEVERAGE
+    
     return (f"{title} | {status}\n"
             f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
             f"💵 الدخول: <code>{fmt(price)}</code>\n"
-            f"🛑 SL: <code>{fmt(sl)}</code>\n"
-            f"🎯 TP: <code>{fmt(tp)}</code>\n"
+            f"🛑 SL: <code>{fmt(sl)}</code> (خسارة: <b>-{risk_usd:.2f} USDT</b>)\n"
+            f"🎯 TP: <code>{fmt(tp)}</code> (ربح: <b>+{reward_usd:.2f} USDT</b>)\n"
             f"📊 RSI: {rsi_val:.1f} | ADX: {adx_val:.1f}")
 
 def msg_exit(sym, side, timeframe, exit_price, entry_price, reason):
     raw = ((exit_price - entry_price) / entry_price * 100) if side == "LONG" else ((entry_price - exit_price) / entry_price * 100)
     lev = raw * LEVERAGE
     pnl_usd = POSITION_SIZE_USDT * (lev / 100.0)
+    
     icon = "🟢" if lev > 0 else "🔴"
     reasons = {"Take Profit": "تحقق الهدف 🎯", "Stop Loss": "ضرب وقف الخسارة 🛑", "Breakeven Hit": "خروج آمن 🛡️", "Manual/External": "إغلاق مباشر من المنصة ⚡"}
+    
     return (f"{icon} <b>إغلاق صفقة ({timeframe})</b>\n"
             f"🪙 {sym.split(':')[0]} ({side})\n"
             f"📥 الدخول: <code>{fmt(entry_price)}</code> | 📤 الخروج: <code>{fmt(exit_price)}</code>\n"
-            f"📈 العائد: <b>{lev:+.2f}%</b> (~{pnl_usd:+.2f} USDT)\n"
+            f"📈 النسبة: <b>{lev:+.2f}%</b>\n"
+            f"💰 <b>الربح/الخسارة: {pnl_usd:+.2f} USDT</b>\n"
             f"📝 السبب: {reasons.get(reason, reason)}")
 
 # ==========================================
@@ -271,13 +280,8 @@ def place_sl_tp(ex, sym, side, amt, trigger, is_sl):
     amt_str = str(ex.amount_to_precision(sym, amt))
     market = ex.market(sym)
     req = {
-        'instId': market['id'],
-        'tdMode': MARGIN_MODE,
-        'side': side,
-        'posSide': 'net',
-        'ordType': 'conditional',
-        'sz': amt_str,
-        'reduceOnly': 'true'
+        'instId': market['id'], 'tdMode': MARGIN_MODE, 'side': side,
+        'posSide': 'net', 'ordType': 'conditional', 'sz': amt_str, 'reduceOnly': 'true'
     }
     if is_sl: req.update({'slTriggerPx': trig_str, 'slOrdPx': '-1'})
     else: req.update({'tpTriggerPx': trig_str, 'tpOrdPx': '-1'})
@@ -290,7 +294,6 @@ def open_position(ex, sym, side, price, sl, tp):
         
         try: ex.set_leverage(LEVERAGE, sym, params={'mgnMode': MARGIN_MODE})
         except Exception: pass
-        
         cancel_pending(ex, sym)
         
         order_side = 'buy' if side == "LONG" else 'sell'
@@ -328,26 +331,18 @@ def check_signal(df_15m, df_1h, df_4h, timeframe, position, entry=None, sl=None,
     last_15m, current_15m = df_15m.iloc[-2], df_15m.iloc[-1]
     last_1h, last_4h = df_1h.iloc[-2], df_4h.iloc[-2]
 
-    # إدارة المراكز المفتوحة
     if position == "LONG":
-        if current_15m["high"] >= tp:
-            return {"action": "EXIT", "side": "LONG", "price": tp, "reason": "Take Profit"}
-        if current_15m["low"] <= sl:
-            return {"action": "EXIT", "side": "LONG", "price": sl, "reason": "Breakeven Hit" if be_hit else "Stop Loss"}
-        if not be_hit and current_15m["high"] >= entry + (tp - entry) * 0.5:
-            return {"action": "UPDATE_SL", "new_sl": entry}
+        if current_15m["high"] >= tp: return {"action": "EXIT", "side": "LONG", "price": tp, "reason": "Take Profit"}
+        if current_15m["low"] <= sl: return {"action": "EXIT", "side": "LONG", "price": sl, "reason": "Breakeven Hit" if be_hit else "Stop Loss"}
+        if not be_hit and current_15m["high"] >= entry + (tp - entry) * 0.5: return {"action": "UPDATE_SL", "new_sl": entry}
             
     elif position == "SHORT":
-        if current_15m["low"] <= tp:
-            return {"action": "EXIT", "side": "SHORT", "price": tp, "reason": "Take Profit"}
-        if current_15m["high"] >= sl:
-            return {"action": "EXIT", "side": "SHORT", "price": sl, "reason": "Breakeven Hit" if be_hit else "Stop Loss"}
-        if not be_hit and current_15m["low"] <= entry - (entry - tp) * 0.5:
-            return {"action": "UPDATE_SL", "new_sl": entry}
+        if current_15m["low"] <= tp: return {"action": "EXIT", "side": "SHORT", "price": tp, "reason": "Take Profit"}
+        if current_15m["high"] >= sl: return {"action": "EXIT", "side": "SHORT", "price": sl, "reason": "Breakeven Hit" if be_hit else "Stop Loss"}
+        if not be_hit and current_15m["low"] <= entry - (entry - tp) * 0.5: return {"action": "UPDATE_SL", "new_sl": entry}
 
     if position is not None: return None
 
-    # شروط الدخول
     price = last_15m["close"]
     trend_up_15m = last_15m["ema9"] > last_15m["ema21"]
     trend_up_1h = last_1h["close"] > last_1h["ema21"] and last_1h["ema9"] > last_1h["ema21"]
@@ -396,7 +391,6 @@ def process_symbol(ex, sym):
                 state[state_key] = {"position": None, "entry": None, "sl": None, "tp": None, "last_exit_ts": 0, "breakeven_hit": False}
             pos_data = state[state_key].copy()
 
-        # 1. التزامن مع مراكز المنصة الحقيقية (تفادي Double Exit)
         if pos_data.get("position") is not None:
             open_pos = [p for p in ex.fetch_positions([sym]) if abs(float(p.get('contracts', 0))) > 0]
             if not open_pos:
@@ -412,12 +406,10 @@ def process_symbol(ex, sym):
                 send(msg_exit(sym, pos_data["position"], "15m", last_price, pos_data["entry"], "Manual/External"))
                 return
 
-        # 2. فحص كول داون إعادة الدخول
         if pos_data.get("position") is None:
             if time.time() - pos_data.get("last_exit_ts", 0) < REENTRY_COOLDOWN_SEC:
                 return
 
-        # 3. جلب البيانات وحساب المؤشرات
         df_1h_data = fetch_data(ex, sym, "1h")
         df_4h_data = fetch_data(ex, sym, "4h")
         df_15m_data = fetch_data(ex, sym, "15m")
@@ -427,11 +419,9 @@ def process_symbol(ex, sym):
         df_1h = add_indicators(pd.DataFrame(df_1h_data, columns=["timestamp", "open", "high", "low", "close", "volume"]))
         df_4h = add_indicators(pd.DataFrame(df_4h_data, columns=["timestamp", "open", "high", "low", "close", "volume"]))
 
-        # 4. التحقق من الإشارة
         signal = check_signal(df_15m, df_1h, df_4h, "15m", pos_data["position"], pos_data["entry"], pos_data["sl"], pos_data["tp"], pos_data.get("breakeven_hit", False))
         if not signal: return
 
-        # سيناريو الدخول
         if signal["action"] == "ENTRY":
             with state_lock:
                 open_count = sum(1 for v in state.values() if v.get("position") is not None)
@@ -452,7 +442,6 @@ def process_symbol(ex, sym):
             if chart: send_photo(chart, caption)
             else: send(caption)
 
-        # سيناريو نقل الوقف إلى نقطة الدخول (Breakeven)
         elif signal["action"] == "UPDATE_SL":
             cancel_pending(ex, sym)
             amount = calculate_amount(ex, sym, POSITION_SIZE_USDT, pos_data["entry"], LEVERAGE)
@@ -464,11 +453,10 @@ def process_symbol(ex, sym):
                     state[state_key]["sl"] = signal["new_sl"]
                     state[state_key]["breakeven_hit"] = True
                 save_state()
-                send(f"🛡️ <b>تفعيل الحجز (Breakeven)</b>\n🪙 الزوج: <code>{sym.split(':')[0]}</code>\nتم نقل الوقف إلى سعر الدخول: <code>{fmt(signal['new_sl'])}</code>")
+                send(f"🛡️ <b>تفعيل الحجز (Breakeven)</b>\n🪙 الزوج: <code>{sym.split(':')[0]}</code>\nتم نقل الوقف إلى سعر الدخول: <code>{fmt(signal['new_sl'])}</code> لحماية رأس المال.")
             except Exception as e:
                 print(f"[BE UPDATE ERR] {e}")
 
-        # سيناريو الخروج المباشر
         elif signal["action"] == "EXIT":
             if not close_position(ex, sym): return
             
@@ -488,7 +476,7 @@ def process_symbol(ex, sym):
 # حلقة التداول الرئيسية
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V27 Bot...", flush=True)
+    print("[INIT] Starting V28 Bot (USD PnL)...", flush=True)
     if not OKX_API_KEY: return send("❌ مفاتيح API غير موجودة")
 
     ex = create_exchange()
@@ -501,10 +489,10 @@ def trading_loop():
     except Exception as e:
         return send(f"❌ فشل الاتصال بالمنصة: {e}")
 
-    send(f"🛡️ <b>تم تشغيل البوت V27</b>\n"
+    send(f"🛡️ <b>تم تشغيل البوت V28</b>\n"
          f"⚙️ الوضع: <b>{mode_str}</b>\n"
-         f"📊 الحد الأقصى للصفقات المتزامنة: {MAX_OPEN_POSITIONS}\n"
-         f"🛡️ دعم Breakeven التلقائي والمزامنة المباشرة مفعل.")
+         f"📊 الحد الأقصى للصفقات: {MAX_OPEN_POSITIONS}\n"
+         f"💰 <b>ميزة جديدة:</b> عرض الأرباح والخسائر بالدولار (USDT).")
 
     active_symbols = [s for s in FUTURES_SYMBOLS if s in ex.markets]
 
