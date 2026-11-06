@@ -75,7 +75,7 @@ STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
 state_lock = threading.Lock()
 trade_lock = threading.RLock()   
 state = {}
-meta = {"paused": False, "last_report": "", "loss_alert": ""}
+meta = {"paused": False, "last_report": "", "loss_alert": "", "last_heartbeat": ""}
 daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
 
 _data_cache = {}
@@ -87,7 +87,7 @@ _equity_cache = {"ts": 0, "value": 0.0}
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_v34_fixed_sync"}, 200
+    return {"status": "ok", "service": "trading_bot_v35_robust"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -789,7 +789,6 @@ def sync_positions(ex, active_symbols):
                     emergency_close(ex, sym, "مركز غير معروف وتعذر حمايته.")
                     continue
                 
-                # ✅ إصلاح خطأ KeyError: التأكد من إنشاء الخانة قبل التحديث
                 with state_lock:
                     if sym not in state:
                         state[sym] = new_sym_state()
@@ -901,12 +900,16 @@ def telegram_listener(active_symbols):
             time.sleep(5)
 
 # ==========================================
-# التقرير اليومي
+# التقرير اليومي (تم تحسينه ليعمل في أي وقت بعد 11:55)
 # ==========================================
 def maybe_send_daily_report(ex):
     now = datetime.now(KSA_TZ)
     today = str(now.date())
-    if now.hour == 23 and now.minute >= 55 and meta.get("last_report") != today:
+    
+    # التحقق: هل نحن في وقت التقرير (من 11:55 مساءً حتى 12:15 صباحاً كهامش أمان)؟
+    is_report_time = (now.hour == 23 and now.minute >= 55) or (now.hour == 0 and now.minute < 15)
+    
+    if is_report_time and meta.get("last_report") != today:
         roll_daily()
         wr = (daily_pnl["wins"] / daily_pnl["trades"] * 100) if daily_pnl["trades"] else 0
         send(f"📋 <b>التقرير اليومي</b> — {today}\n━━━━━━━━━━━━━━━\n"
@@ -916,6 +919,23 @@ def maybe_send_daily_report(ex):
              f"💼 الرصيد: {get_equity(ex, force=True):,.2f} USDT\n━━━━━━━━━━━━━━━")
         meta["last_report"] = today
         save_state()
+        log.info("[DAILY REPORT] Sent successfully.")
+
+# ==========================================
+# نبضة الحياة (Heartbeat) لطمأنتك
+# ==========================================
+def maybe_send_heartbeat(ex):
+    now = datetime.now(KSA_TZ)
+    current_hour = now.strftime("%Y-%m-%d %H")
+    if meta.get("last_heartbeat") != current_hour and now.minute < 5:
+        meta["last_heartbeat"] = current_hour
+        save_state()
+        equity = get_equity(ex, force=True)
+        with state_lock:
+            open_ct = sum(1 for v in state.values() if v.get("position"))
+        log.info(f"[HEARTBEAT] Bot is alive. Open positions: {open_ct}. Equity: {equity}")
+        # إذا أردت رسالة في تيليجرام كل ساعة، أزل علامة المربع من السطر التالي
+        # send(f"⏱️ <b>نبضة حياة:</b> البوت يعمل. صفقات مفتوحة: {open_ct} | رصيد: {equity:.2f} USDT")
 
 # ==========================================
 # الحلقة الرئيسية
@@ -926,7 +946,7 @@ def init_exchange():
     return ex
 
 def trading_loop():
-    log.info("[INIT] Starting V34 Bot (Fixed 50 USDT)...")
+    log.info("[INIT] Starting V35 Bot (Robust Reports)...")
     if not OKX_API_KEY:
         return send("❌ مفاتيح API غير موجودة")
 
@@ -944,7 +964,7 @@ def trading_loop():
 
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
 
-    send(f"🛡️ <b>تم تشغيل البوت (V34 - إصلاح المزامنة)</b>\n"
+    send(f"🛡️ <b>تم تشغيل البوت (V35 - تقارير مضمونة)</b>\n"
          f"━━━━━━━━━━━━━━━\n"
          f"⚙️ <b>الوضع:</b> {mode_str}\n"
          f"🪙 <b>العملات:</b> {len(active_symbols)}\n"
@@ -966,7 +986,10 @@ def trading_loop():
                     cycle_errors += 1
                     log.error(f"[LOOP] {sym}: {e}")
                 time.sleep(0.5)
+            
             maybe_send_daily_report(ex)
+            maybe_send_heartbeat(ex)
+            
         except Exception as e:
             cycle_errors += 1
             log.error(f"[LOOP FATAL] {e}")
