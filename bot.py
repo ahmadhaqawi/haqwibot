@@ -45,7 +45,6 @@ MAX_OPEN_POSITIONS = 5
 REENTRY_COOLDOWN_SEC = 1800
 
 # --- حجم الصفقة ---
-# ✅ تم التعديل هنا: جعل الهامش ثابتاً 50 دولاراً
 USE_RISK_SIZING = False       
 RISK_PCT_PER_TRADE = 1.0      
 POSITION_SIZE_USDT = 50       
@@ -88,7 +87,7 @@ _equity_cache = {"ts": 0, "value": 0.0}
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_v33_fixed50"}, 200
+    return {"status": "ok", "service": "trading_bot_v34_fixed_sync"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -789,7 +788,11 @@ def sync_positions(ex, active_symbols):
                 if not sl_ok:
                     emergency_close(ex, sym, "مركز غير معروف وتعذر حمايته.")
                     continue
+                
+                # ✅ إصلاح خطأ KeyError: التأكد من إنشاء الخانة قبل التحديث
                 with state_lock:
+                    if sym not in state:
+                        state[sym] = new_sym_state()
                     state[sym].update({"position": side, "entry": entry, "sl": sl, "tp": tp,
                                        "contracts": contracts,
                                        "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
@@ -923,7 +926,7 @@ def init_exchange():
     return ex
 
 def trading_loop():
-    log.info("[INIT] Starting V33 Bot (Fixed 50 USDT)...")
+    log.info("[INIT] Starting V34 Bot (Fixed 50 USDT)...")
     if not OKX_API_KEY:
         return send("❌ مفاتيح API غير موجودة")
 
@@ -941,7 +944,7 @@ def trading_loop():
 
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
 
-    send(f"🛡️ <b>تم تشغيل البوت (V33 - هامش ثابت 50$)</b>\n"
+    send(f"🛡️ <b>تم تشغيل البوت (V34 - إصلاح المزامنة)</b>\n"
          f"━━━━━━━━━━━━━━━\n"
          f"⚙️ <b>الوضع:</b> {mode_str}\n"
          f"🪙 <b>العملات:</b> {len(active_symbols)}\n"
