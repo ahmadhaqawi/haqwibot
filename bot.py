@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bot")
 
 # ==========================================
-# الإعدادات - V38
+# الإعدادات - V39
 # ==========================================
 KSA_TZ = timezone(timedelta(hours=3))
 
@@ -88,7 +88,7 @@ _equity_cache = {"ts": 0, "value": 0.0}
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_v38_ultimate"}, 200
+    return {"status": "ok", "service": "trading_bot_v39_floating_pnl"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -868,25 +868,39 @@ def sync_positions(ex, active_symbols):
 def status_text(ex):
     roll_daily()
     equity = get_equity(ex, force=True)
-    lines = [
-        f"📊 <b>حالة البوت V38</b> {'⏸️' if meta.get('paused') else '▶️'}",
-        "━━━━━━━━━━━━━━━",
-        f"💼 الرصيد: {equity:,.2f} USDT",
-        f"📅 اليوم: {daily_pnl['value']:+.2f} USDT | صفقات: {daily_pnl['trades']} | رابحة: {daily_pnl['wins']}",
-        "━━━━━━━━━━━━━━━"
-    ]
+    
+    # حساب إجمالي الربح العائم (لجميع الصفقات المفتوحة)
+    total_floating_pnl = 0.0
     with state_lock:
         opens = {k: dict(v) for k, v in state.items() if v.get("position")}
-    if not opens: lines.append("لا توجد صفقات مفتوحة.")
+    
+    pos_lines = []
     for sym, v in opens.items():
         price = get_current_price(ex, sym) or v["entry"]
         d = 1 if v["position"] == "LONG" else -1
         upnl = (price - v["entry"]) * d * v["contracts"] * contract_size(ex, sym)
+        total_floating_pnl += upnl
+        
         flags = ""
         if v.get("partial_2_taken"): flags += " 💰💰"
         elif v.get("partial_1_taken"): flags += " 💰"
         if v.get("breakeven_hit"): flags += " 🛡️"
-        lines.append(f"• <code>{sym.split(':')[0]}</code> {v['position']} | {fmt(v['entry'])} → {fmt(price)} | {upnl:+.2f}{flags}")
+        pos_lines.append(f"• <code>{sym.split(':')[0]}</code> {v['position']} | {fmt(v['entry'])} → {fmt(price)} | {upnl:+.2f}{flags}")
+
+    lines = [
+        f"📊 <b>حالة البوت V39</b> {'⏸️' if meta.get('paused') else '▶️'}",
+        "━━━━━━━━━━━━━━━",
+        f"💼 الرصيد: {equity:,.2f} USDT",
+        f"📅 المغلق اليوم: {daily_pnl['value']:+.2f} USDT | صفقات: {daily_pnl['trades']} | رابحة: {daily_pnl['wins']}",
+        f"📈 <b>الربح العائم (المفتوح): {total_floating_pnl:+.2f} USDT</b>",
+        "━━━━━━━━━━━━━━━"
+    ]
+    
+    if not opens:
+        lines.append("لا توجد صفقات مفتوحة.")
+    else:
+        lines.extend(pos_lines)
+        
     return "\n".join(lines)
 
 def find_symbol(arg, active_symbols):
@@ -896,46 +910,35 @@ def find_symbol(arg, active_symbols):
     return None
 
 # ==========================================
-# أوامر تيليجرام (شرح كل أمر داخل الكود)
+# أوامر تيليجرام
 # ==========================================
 def handle_command(ex, text, chat_id, active_symbols):
     parts = text.strip().split()
     cmd = parts[0].lower().split("@")[0]
 
-    # 1. أمر /status : لعرض حالة البوت (الرصيد، الأرباح، الصفقات المفتوحة)
     if cmd in ("/status", "/start"):
         send(status_text(ex), chat_id)
-
-    # 2. أمر /pause : لإيقاف فتح صفقات جديدة مؤقتاً (الصفقات المفتوحة تبقى محمية)
     elif cmd == "/pause":
         meta["paused"] = True; save_state()
         send("⏸️ تم إيقاف فتح صفقات جديدة (الصفقات المفتوحة تبقى مُدارة).", chat_id)
-
-    # 3. أمر /resume : لإلغاء الإيقاف المؤقت والعودة للبحث عن صفقات
     elif cmd == "/resume":
         meta["paused"] = False; save_state()
         send("▶️ تم استئناف البحث عن صفقات.", chat_id)
-
-    # 4. أمر /close [اسم العملة] : لإغلاق صفقة معينة (مثال: /close BTC)
     elif cmd == "/close":
         if len(parts) < 2:
             send("استخدم: /close BTC", chat_id); return
         sym = find_symbol(parts[1], active_symbols)
         if not sym:
             send("عملة غير معروفة.", chat_id); return
-        
         with trade_lock:
             with state_lock:
                 pos_data = dict(state.get(sym, {}))
             if not pos_data.get("position"):
                 send("لا توجد صفقة مفتوحة على هذه العملة.", chat_id); return
-            
             if close_position_safe(ex, sym, pos_data):
                 finalize_trade(ex, sym, reason_hint="Manual")
             else:
                 send("❌ فشل الإغلاق، تحقق من المنصة.", chat_id)
-
-    # 5. أمر /closeall : لإغلاق جميع الصفقات المفتوحة دفعة واحدة (زر الطوارئ)
     elif cmd == "/closeall":
         with trade_lock:
             with state_lock:
@@ -947,8 +950,6 @@ def handle_command(ex, text, chat_id, active_symbols):
                     pos_data = dict(state.get(sym, {}))
                 if close_position_safe(ex, sym, pos_data):
                     finalize_trade(ex, sym, reason_hint="Manual")
-
-    # 6. أمر /help : لعرض قائمة الأوامر المتاحة
     elif cmd == "/help":
         send("<b>الأوامر المتاحة:</b>\n"
              "/status - عرض حالة البوت والرصيد\n"
@@ -957,7 +958,6 @@ def handle_command(ex, text, chat_id, active_symbols):
              "/close BTC - إغلاق صفقة عملة محددة\n"
              "/closeall - إغلاق جميع الصفقات", chat_id)
 
-# مستمع أوامر تيليجرام (يقرأ الرسائل ويوجهها للدالة أعلاه)
 def telegram_listener(active_symbols):
     if not TELEGRAM_BOT_TOKEN or not AUTHORIZED_CHATS: return
     try:
@@ -987,7 +987,7 @@ def maybe_send_daily_report(ex):
     if ((now.hour == 23 and now.minute >= 55) or (now.hour == 0 and now.minute < 12)) and meta.get("last_report") != today:
         roll_daily()
         wr = (daily_pnl["wins"] / daily_pnl["trades"] * 100) if daily_pnl["trades"] else 0
-        send(f"📋 <b>التقرير اليومي V38</b> — {today}\n━━━━━━━━━━━━━━━\n"
+        send(f"📋 <b>التقرير اليومي V39</b> — {today}\n━━━━━━━━━━━━━━━\n"
              f"💰 النتيجة: {daily_pnl['value']:+.2f} USDT\n"
              f"🔢 الصفقات: {daily_pnl['trades']} | الرابحة: {daily_pnl['wins']} ({wr:.0f}%)\n"
              f"💼 الرصيد: {get_equity(ex, force=True):,.2f} USDT")
@@ -1009,7 +1009,7 @@ def init_exchange():
     return ex
 
 def trading_loop():
-    log.info("[INIT] Starting V38 Advanced Bot...")
+    log.info("[INIT] Starting V39 Advanced Bot...")
     if not OKX_API_KEY: return send("❌ مفاتيح API غير موجودة")
 
     try:
@@ -1025,7 +1025,7 @@ def trading_loop():
     sync_positions(ex, active_symbols)
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
 
-    send(f"🚀 <b>تم تشغيل البوت V38 (الآمن)</b>\n"
+    send(f"🚀 <b>تم تشغيل البوت V39 (الآمن)</b>\n"
          f"━━━━━━━━━━━━━━━\n"
          f"⚙️ الوضع: {mode_str}\n"
          f"🪙 العملات: {len(active_symbols)}\n"
