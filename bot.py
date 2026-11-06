@@ -110,8 +110,7 @@ def new_sym_state():
 
 def load_state():
     global state, daily_pnl, meta
-    if not os.path.exists(STATE_FILE):
-        return
+    if not os.path.exists(STATE_FILE): return
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -152,8 +151,7 @@ def update_daily_stats(pnl_usdt):
     with state_lock:
         daily_pnl["value"] += pnl_usdt
         daily_pnl["trades"] += 1
-        if pnl_usdt > 0:
-            daily_pnl["wins"] += 1
+        if pnl_usdt > 0: daily_pnl["wins"] += 1
     save_state()
 
 def reset_sym_state(sym, cooldown=True):
@@ -167,8 +165,7 @@ def reset_sym_state(sym, cooldown=True):
 # تيليجرام
 # ==========================================
 def send(msg, chat_id=None):
-    if not TELEGRAM_BOT_TOKEN:
-        return
+    if not TELEGRAM_BOT_TOKEN: return
     targets = [chat_id] if chat_id else list(AUTHORIZED_CHATS)
     for cid in targets:
         try:
@@ -178,8 +175,7 @@ def send(msg, chat_id=None):
             log.warning(f"[TG SEND] {e}")
 
 def fmt(p):
-    if p is None or (isinstance(p, float) and np.isnan(p)):
-        return "0.00"
+    if p is None or (isinstance(p, float) and np.isnan(p)): return "0.00"
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
 
 REASONS = {
@@ -281,8 +277,7 @@ def create_exchange():
         'apiKey': OKX_API_KEY, 'secret': OKX_SECRET, 'password': OKX_PASSPHRASE,
         'enableRateLimit': True, 'options': {'defaultType': 'swap'}, 'timeout': 20000
     })
-    if USE_SANDBOX:
-        ex.set_sandbox_mode(True)
+    if USE_SANDBOX: ex.set_sandbox_mode(True)
     return ex
 
 def get_current_price(ex, sym):
@@ -297,8 +292,7 @@ def get_equity(ex, force=False):
     try:
         bal = ex.fetch_balance().get('USDT', {})
         val = float(bal.get('total') or bal.get('free') or 0)
-        if val > 0:
-            _equity_cache.update({"ts": time.time(), "value": val})
+        if val > 0: _equity_cache.update({"ts": time.time(), "value": val})
         return val or _equity_cache["value"]
     except Exception as e:
         log.warning(f"[EQUITY] {e}")
@@ -320,8 +314,7 @@ def calculate_contracts(ex, sym, margin, price, lev):
         return 0.0
 
 def compute_margin(equity, sl_pct):
-    if not USE_RISK_SIZING or equity <= 0:
-        return float(POSITION_SIZE_USDT)
+    if not USE_RISK_SIZING or equity <= 0: return float(POSITION_SIZE_USDT)
     risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
     margin = risk_usd / (sl_pct * LEVERAGE)
     return max(MIN_MARGIN_USDT, min(MAX_MARGIN_USDT, margin))
@@ -344,8 +337,7 @@ def get_protection(ex, sym):
         for o in (algo.get('data') or []):
             if o.get('slTriggerPx'): has_sl = True
             if o.get('tpTriggerPx'): has_tp = True
-    except Exception:
-        pass
+    except Exception: pass
     return has_sl, has_tp
 
 def cancel_pending(ex, sym):
@@ -399,36 +391,27 @@ def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
     return sl_ok, tp_ok
 
 def close_position_safe(ex, sym, pos_data, amount=None):
-    """إغلاق آمن: يبيع أولاً، ثم يحدث الحماية"""
     try:
         side = pos_data["position"]
         close_side = 'sell' if side == "LONG" else 'buy'
         contracts = pos_data["contracts"]
         close_amt = amount if amount and amount < contracts else contracts
 
-        # 1. تنفيذ أمر البيع (أو الشراء للشورت) أولاً
         ex.create_order(sym, 'market', close_side, close_amt, None,
                         {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
-        time.sleep(0.8)  # انتظار التأكيد
-
-        # 2. إلغاء الحماية القديمة
+        time.sleep(0.8)
         cancel_pending(ex, sym)
 
-        # 3. إذا كان إغلاقاً كاملاً، انتهى الأمر
-        if close_amt >= contracts:
-            return True
+        if close_amt >= contracts: return True
 
-        # 4. إذا كان جزئياً، نضع حماية للكمية المتبقية
         remaining = contracts - close_amt
         be_sl = pos_data["entry"] * (1 + BE_FEE_BUFFER) if side == "LONG" else pos_data["entry"] * (1 - BE_FEE_BUFFER)
-        
         sl_ok, _ = protect_position(ex, sym, close_side, remaining, be_sl, pos_data.get("tp"))
         if not sl_ok:
             log.error(f"[PARTIAL PROTECT FAIL] {sym} — إغلاق طارئ للمتبقي")
             ex.create_order(sym, 'market', close_side, remaining, None,
                             {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
             return False
-        
         return True
     except Exception as e:
         log.error(f"[CLOSE SAFE ERR] {sym}: {e}")
@@ -437,8 +420,7 @@ def close_position_safe(ex, sym, pos_data, amount=None):
 def open_position(ex, sym, side, price, sl, tp, margin):
     try:
         amount = calculate_contracts(ex, sym, margin, price, LEVERAGE)
-        if amount <= 0:
-            return False, "كمية غير صالحة", price, 0.0
+        if amount <= 0: return False, "كمية غير صالحة", price, 0.0
 
         try: ex.set_leverage(LEVERAGE, sym, params={'mgnMode': MARGIN_MODE})
         except Exception as e: log.warning(f"[LEVERAGE] {sym}: {e}")
@@ -490,8 +472,7 @@ def get_exit_price(ex, sym, pos_data):
 
 def detect_reason(pos_data, exit_price):
     side, entry, sl, tp = pos_data["position"], pos_data["entry"], pos_data["sl"], pos_data["tp"]
-    if tp and abs(exit_price - tp) / max(tp, 1e-9) < 0.0035:
-        return "Take Profit"
+    if tp and abs(exit_price - tp) / max(tp, 1e-9) < 0.0035: return "Take Profit"
     if sl and abs(exit_price - sl) / max(sl, 1e-9) < 0.0035:
         if pos_data.get("breakeven_hit"):
             profitable = (sl > entry * 1.0015) if side == "LONG" else (sl < entry * 0.9985)
@@ -502,8 +483,7 @@ def detect_reason(pos_data, exit_price):
 def finalize_trade(ex, sym, reason_hint=None):
     with state_lock:
         pos_data = dict(state.get(sym, {}))
-    if not pos_data.get("position"):
-        return
+    if not pos_data.get("position"): return
     side, entry = pos_data["position"], pos_data["entry"]
     exit_price = get_exit_price(ex, sym, pos_data) or get_current_price(ex, sym) or entry
 
@@ -547,8 +527,7 @@ def detect_regime(df_15m, df_1h, df_4h):
         if up_4h: return "strong_trend_up"
         if down_4h: return "strong_trend_down"
 
-    if adx4 > 20 and (up_4h or down_4h):
-        return "weak_trend"
+    if adx4 > 20 and (up_4h or down_4h): return "weak_trend"
 
     return "range"
 
@@ -835,18 +814,16 @@ def process_symbol(ex, sym):
         log.error(f"[ERROR] {sym}: {e}")
 
 # ==========================================
-# مزامنة + أوامر تيليجرام + الحلقة الرئيسية
+# مزامنة + الحلقة الرئيسية
 # ==========================================
 def sync_positions(ex, active_symbols):
     try:
         exch = {}
         for p in ex.fetch_positions():
             c = abs(float(p.get('contracts') or 0))
-            if c > 0 and p.get('symbol') in active_symbols:
-                exch[p['symbol']] = p
+            if c > 0 and p.get('symbol') in active_symbols: exch[p['symbol']] = p
     except Exception as e:
-        log.error(f"[SYNC] {e}")
-        return
+        log.error(f"[SYNC] {e}"); return
 
     with trade_lock:
         for sym in active_symbols:
@@ -861,7 +838,7 @@ def sync_positions(ex, active_symbols):
                 with state_lock:
                     state[sym]["contracts"] = contracts
                 try:
-                    has_sl, has_tp = get_protection(ex, sym)
+                    has_sl, _ = get_protection(ex, sym)
                     if not has_sl:
                         close_side = 'sell' if st["position"] == "LONG" else 'buy'
                         protect_position(ex, sym, close_side, contracts, st["sl"], st.get("tp"))
@@ -900,8 +877,7 @@ def status_text(ex):
     ]
     with state_lock:
         opens = {k: dict(v) for k, v in state.items() if v.get("position")}
-    if not opens:
-        lines.append("لا توجد صفقات مفتوحة.")
+    if not opens: lines.append("لا توجد صفقات مفتوحة.")
     for sym, v in opens.items():
         price = get_current_price(ex, sym) or v["entry"]
         d = 1 if v["position"] == "LONG" else -1
@@ -919,38 +895,69 @@ def find_symbol(arg, active_symbols):
         if s.startswith(arg + "/"): return s
     return None
 
+# ==========================================
+# أوامر تيليجرام (شرح كل أمر داخل الكود)
+# ==========================================
 def handle_command(ex, text, chat_id, active_symbols):
     parts = text.strip().split()
     cmd = parts[0].lower().split("@")[0]
+
+    # 1. أمر /status : لعرض حالة البوت (الرصيد، الأرباح، الصفقات المفتوحة)
     if cmd in ("/status", "/start"):
         send(status_text(ex), chat_id)
+
+    # 2. أمر /pause : لإيقاف فتح صفقات جديدة مؤقتاً (الصفقات المفتوحة تبقى محمية)
     elif cmd == "/pause":
         meta["paused"] = True; save_state()
-        send("⏸️ تم إيقاف الدخول الجديد", chat_id)
+        send("⏸️ تم إيقاف فتح صفقات جديدة (الصفقات المفتوحة تبقى مُدارة).", chat_id)
+
+    # 3. أمر /resume : لإلغاء الإيقاف المؤقت والعودة للبحث عن صفقات
     elif cmd == "/resume":
         meta["paused"] = False; save_state()
-        send("▶️ تم استئناف البحث", chat_id)
+        send("▶️ تم استئناف البحث عن صفقات.", chat_id)
+
+    # 4. أمر /close [اسم العملة] : لإغلاق صفقة معينة (مثال: /close BTC)
     elif cmd == "/close":
-        if len(parts) < 2: return send("استخدم: /close BTC", chat_id)
+        if len(parts) < 2:
+            send("استخدم: /close BTC", chat_id); return
         sym = find_symbol(parts[1], active_symbols)
-        if not sym: return send("عملة غير معروفة", chat_id)
+        if not sym:
+            send("عملة غير معروفة.", chat_id); return
+        
         with trade_lock:
-            with state_lock: pos_data = dict(state.get(sym, {}))
-            if not pos_data.get("position"): return send("لا توجد صفقة مفتوحة", chat_id)
+            with state_lock:
+                pos_data = dict(state.get(sym, {}))
+            if not pos_data.get("position"):
+                send("لا توجد صفقة مفتوحة على هذه العملة.", chat_id); return
+            
             if close_position_safe(ex, sym, pos_data):
                 finalize_trade(ex, sym, reason_hint="Manual")
-            else: send("فشل الإغلاق", chat_id)
+            else:
+                send("❌ فشل الإغلاق، تحقق من المنصة.", chat_id)
+
+    # 5. أمر /closeall : لإغلاق جميع الصفقات المفتوحة دفعة واحدة (زر الطوارئ)
     elif cmd == "/closeall":
         with trade_lock:
-            syms = [k for k, v in state.items() if v.get("position")]
-            if not syms: return send("لا توجد صفقات", chat_id)
+            with state_lock:
+                syms = [k for k, v in state.items() if v.get("position")]
+            if not syms:
+                send("لا توجد صفقات مفتوحة.", chat_id); return
             for sym in syms:
-                with state_lock: pos_data = dict(state.get(sym, {}))
+                with state_lock:
+                    pos_data = dict(state.get(sym, {}))
                 if close_position_safe(ex, sym, pos_data):
                     finalize_trade(ex, sym, reason_hint="Manual")
-    elif cmd == "/help":
-        send("/status\n/pause\n/resume\n/close BTC\n/closeall", chat_id)
 
+    # 6. أمر /help : لعرض قائمة الأوامر المتاحة
+    elif cmd == "/help":
+        send("<b>الأوامر المتاحة:</b>\n"
+             "/status - عرض حالة البوت والرصيد\n"
+             "/pause - إيقاف الدخول مؤقتاً\n"
+             "/resume - استئناف الدخول\n"
+             "/close BTC - إغلاق صفقة عملة محددة\n"
+             "/closeall - إغلاق جميع الصفقات", chat_id)
+
+# مستمع أوامر تيليجرام (يقرأ الرسائل ويوجهها للدالة أعلاه)
 def telegram_listener(active_symbols):
     if not TELEGRAM_BOT_TOKEN or not AUTHORIZED_CHATS: return
     try:
