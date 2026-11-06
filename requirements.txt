@@ -3,6 +3,5 @@ pandas
 numpy
 requests
 Flask
-matplotlib
 pillow
 websockets
