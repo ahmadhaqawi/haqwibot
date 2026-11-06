@@ -30,12 +30,14 @@ USE_SANDBOX = os.getenv("USE_SANDBOX", "true").lower() in ("true", "1", "yes")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# ✅ قائمة الـ 30 عملة (الأقوى في السيولة والتذبذب)
 FUTURES_SYMBOLS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT",
-    "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
-    "NEAR/USDT:USDT", "APT/USDT:USDT", "SUI/USDT:USDT", "ARB/USDT:USDT",
-    "OP/USDT:USDT", "INJ/USDT:USDT", "ATOM/USDT:USDT", "LTC/USDT:USDT",
-    "BCH/USDT:USDT", "FIL/USDT:USDT", "SEI/USDT:USDT"
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT",
+    "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
+    "NEAR/USDT:USDT", "APT/USDT:USDT", "SUI/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT",
+    "INJ/USDT:USDT", "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT",
+    "SEI/USDT:USDT", "TIA/USDT:USDT", "STX/USDT:USDT", "IMX/USDT:USDT", "RUNE/USDT:USDT",
+    "FET/USDT:USDT", "WLD/USDT:USDT", "PEPE/USDT:USDT", "WIF/USDT:USDT", "ORDI/USDT:USDT"
 ]
 
 TIMEFRAMES = ["15m", "1h", "4h"]
@@ -61,7 +63,7 @@ daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_v28_usd_pnl"}, 200
+    return {"status": "ok", "service": "trading_bot_v30_30coins"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -166,38 +168,66 @@ def generate_chart(symbol, df, timeframe, side, resistance, support, entry, sl, 
         return None
 
 # ==========================================
-# الرسائل (تم إضافة الدولار في الدخول والخروج)
+# الرسائل (تنسيق احترافي)
 # ==========================================
-def msg_entry(sym, side, price, sl, tp, rsi_val, adx_val, real_order):
-    title = f"🟢 <b>شراء (LONG)</b>" if side == "LONG" else f"🔴 <b>بيع (SHORT)</b>"
-    status = "✅ تم فتح الصفقة آلياً" if real_order else "إشارة فقط"
+def msg_entry(sym, side, price, sl, tp, real_order):
+    if side == "LONG":
+        title = "🟢 <b>توصية شراء (LONG)</b>"
+    else:
+        title = "🔴 <b>توصية بيع (SHORT)</b>"
     
-    sl_pct = abs(price - sl) / price
-    tp_pct = abs(tp - price) / price
-    risk_usd = POSITION_SIZE_USDT * sl_pct * LEVERAGE
-    reward_usd = POSITION_SIZE_USDT * tp_pct * LEVERAGE
+    status = "✅ <b>تم فتح الصفقة آلياً</b>" if real_order else "⚠️ <b>إشارة فقط (لم تفتح)</b>"
     
-    return (f"{title} | {status}\n"
-            f"🪙 الزوج: <code>{sym.split(':')[0]}</code>\n"
-            f"💵 الدخول: <code>{fmt(price)}</code>\n"
-            f"🛑 SL: <code>{fmt(sl)}</code> (خسارة: <b>-{risk_usd:.2f} USDT</b>)\n"
-            f"🎯 TP: <code>{fmt(tp)}</code> (ربح: <b>+{reward_usd:.2f} USDT</b>)\n"
-            f"📊 RSI: {rsi_val:.1f} | ADX: {adx_val:.1f}")
+    sl_pct = abs(price - sl) / price * 100
+    tp_pct = abs(tp - price) / price * 100
+    risk_usd = POSITION_SIZE_USDT * (sl_pct / 100) * LEVERAGE
+    reward_usd = POSITION_SIZE_USDT * (tp_pct / 100) * LEVERAGE
+    
+    now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
+    
+    return (f"{title}\n"
+            f"{status}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🪙 <b>الزوج:</b> <code>{sym.split(':')[0]}</code>\n"
+            f"💵 <b>سعر الدخول:</b> <code>{fmt(price)}</code>\n"
+            f"⚙️ <b>الرافعة:</b> {LEVERAGE}x | <b>الهامش:</b> {POSITION_SIZE_USDT} USDT\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🛑 <b>وقف الخسارة (SL):</b> <code>{fmt(sl)}</code>\n"
+            f"📉 <i>الخسارة المتوقعة: {risk_usd:.2f} USDT</i>\n"
+            f"🎯 <b>هدف الربح (TP):</b> <code>{fmt(tp)}</code>\n"
+            f"📈 <i>الربح المتوقع: +{reward_usd:.2f} USDT</i>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"⏰ <b>وقت الدخول:</b> {now_str}")
 
 def msg_exit(sym, side, timeframe, exit_price, entry_price, reason):
     raw = ((exit_price - entry_price) / entry_price * 100) if side == "LONG" else ((entry_price - exit_price) / entry_price * 100)
     lev = raw * LEVERAGE
     pnl_usd = POSITION_SIZE_USDT * (lev / 100.0)
     
-    icon = "🟢" if lev > 0 else "🔴"
-    reasons = {"Take Profit": "تحقق الهدف 🎯", "Stop Loss": "ضرب وقف الخسارة 🛑", "Breakeven Hit": "خروج آمن 🛡️", "Manual/External": "إغلاق مباشر من المنصة ⚡"}
+    if lev > 0:
+        title = "🟢 <b>إغلاق صفقة بربح</b>"
+    elif lev < 0:
+        title = "🔴 <b>إغلاق صفقة بخسارة</b>"
+    else:
+        title = "⚪ <b>إغلاق صفقة (تعادل)</b>"
+        
+    reasons = {
+        "Take Profit": "تحقق الهدف 🎯", 
+        "Stop Loss": "ضرب وقف الخسارة 🛑", 
+        "Breakeven Hit": "خروج آمن (Breakeven) 🛡️", 
+        "Manual/External": "إغلاق من المنصة ⚡"
+    }
     
-    return (f"{icon} <b>إغلاق صفقة ({timeframe})</b>\n"
-            f"🪙 {sym.split(':')[0]} ({side})\n"
-            f"📥 الدخول: <code>{fmt(entry_price)}</code> | 📤 الخروج: <code>{fmt(exit_price)}</code>\n"
-            f"📈 النسبة: <b>{lev:+.2f}%</b>\n"
-            f"💰 <b>الربح/الخسارة: {pnl_usd:+.2f} USDT</b>\n"
-            f"📝 السبب: {reasons.get(reason, reason)}")
+    return (f"{title}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🪙 <b>الزوج:</b> <code>{sym.split(':')[0]}</code> ({side})\n"
+            f"📥 <b>الدخول:</b> <code>{fmt(entry_price)}</code>\n"
+            f"📤 <b>الخروج:</b> <code>{fmt(exit_price)}</code>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📊 <b>النسبة:</b> {lev:+.2f}%\n"
+            f"💰 <b>الربح/الخسارة:</b> {pnl_usd:+.2f} USDT\n"
+            f"📝 <b>السبب:</b> {reasons.get(reason, reason)}\n"
+            f"━━━━━━━━━━━━━━━")
 
 # ==========================================
 # المؤشرات الفنية
@@ -438,7 +468,7 @@ def process_symbol(ex, sym):
             save_state()
 
             chart = generate_chart(sym, df_15m, "15m", signal["side"], signal["resistance"], signal["support"], actual_price, signal["sl"], signal["tp"])
-            caption = msg_entry(sym, signal["side"], actual_price, signal["sl"], signal["tp"], signal["rsi"], signal["adx"], success)
+            caption = msg_entry(sym, signal["side"], actual_price, signal["sl"], signal["tp"], success)
             if chart: send_photo(chart, caption)
             else: send(caption)
 
@@ -453,7 +483,12 @@ def process_symbol(ex, sym):
                     state[state_key]["sl"] = signal["new_sl"]
                     state[state_key]["breakeven_hit"] = True
                 save_state()
-                send(f"🛡️ <b>تفعيل الحجز (Breakeven)</b>\n🪙 الزوج: <code>{sym.split(':')[0]}</code>\nتم نقل الوقف إلى سعر الدخول: <code>{fmt(signal['new_sl'])}</code> لحماية رأس المال.")
+                send(f"🛡️ <b>تأمين الصفقة (Breakeven)</b>\n"
+                     f"━━━━━━━━━━━━━━━\n"
+                     f"🪙 <b>الزوج:</b> <code>{sym.split(':')[0]}</code>\n"
+                     f"🛑 <b>تم نقل وقف الخسارة إلى سعر الدخول:</b> <code>{fmt(signal['new_sl'])}</code>\n"
+                     f"✅ <i>أنت الآن في منطقة آمنة (بدون مخاطرة).</i>\n"
+                     f"━━━━━━━━━━━━━━━")
             except Exception as e:
                 print(f"[BE UPDATE ERR] {e}")
 
@@ -476,7 +511,7 @@ def process_symbol(ex, sym):
 # حلقة التداول الرئيسية
 # ==========================================
 def trading_loop():
-    print("[INIT] Starting V28 Bot (USD PnL)...", flush=True)
+    print("[INIT] Starting V30 Bot (30 Coins)...", flush=True)
     if not OKX_API_KEY: return send("❌ مفاتيح API غير موجودة")
 
     ex = create_exchange()
@@ -489,10 +524,13 @@ def trading_loop():
     except Exception as e:
         return send(f"❌ فشل الاتصال بالمنصة: {e}")
 
-    send(f"🛡️ <b>تم تشغيل البوت V28</b>\n"
-         f"⚙️ الوضع: <b>{mode_str}</b>\n"
-         f"📊 الحد الأقصى للصفقات: {MAX_OPEN_POSITIONS}\n"
-         f"💰 <b>ميزة جديدة:</b> عرض الأرباح والخسائر بالدولار (USDT).")
+    send(f"🛡️ <b>تم تشغيل البوت (V30)</b>\n"
+         f"━━━━━━━━━━━━━━━\n"
+         f"⚙️ <b>الوضع:</b> {mode_str}\n"
+         f"🪙 <b>العملات المراقبة:</b> 30 عملة\n"
+         f"📊 <b>الحد الأقصى للصفقات:</b> {MAX_OPEN_POSITIONS}\n"
+         f"🎨 <b>ميزة جديدة:</b> رسائل منسقة، وإخفاء المؤشرات الفنية.\n"
+         f"━━━━━━━━━━━━━━━")
 
     active_symbols = [s for s in FUTURES_SYMBOLS if s in ex.markets]
 
@@ -500,8 +538,9 @@ def trading_loop():
         start = time.time()
         for sym in active_symbols:
             process_symbol(ex, sym)
-            time.sleep(1)
+            time.sleep(0.5) # ✅ تقليل التأخير إلى نصف ثانية لتسريع الفحص مع زيادة العملات
         elapsed = time.time() - start
+        # إذا استغرق الفحص وقتاً أطول من المطلوب، لا تنتظر
         time.sleep(max(10, SCAN_INTERVAL - elapsed))
 
 if __name__ == "__main__":
