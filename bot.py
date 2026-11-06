@@ -44,28 +44,28 @@ MARGIN_MODE = "isolated"
 MAX_OPEN_POSITIONS = 5
 REENTRY_COOLDOWN_SEC = 1800
 
-# --- حجم الصفقة ---
-USE_RISK_SIZING = False       
-RISK_PCT_PER_TRADE = 1.0      
-POSITION_SIZE_USDT = 50       
-MIN_MARGIN_USDT = 10
-MAX_MARGIN_USDT = 100
+# --- حجم الصفقة (Risk Sizing) ---
+USE_RISK_SIZING = True          
+RISK_PCT_PER_TRADE = 0.8        
+POSITION_SIZE_USDT = 50         
+MIN_MARGIN_USDT = 12
+MAX_MARGIN_USDT = 120
 
 # --- SL/TP حسب ATR ---
-ATR_SL_MULT = 1.5
-RR_RATIO = 2.0                
-MIN_SL_PCT = 0.008            
-MAX_SL_PCT = 0.04             
-TRAIL_ATR_MULT = 1.0          
-BE_FEE_BUFFER = 0.0007        
+ATR_SL_MULT = 1.6
+RR_RATIO = 2.2                  
+MIN_SL_PCT = 0.007
+MAX_SL_PCT = 0.035
+TRAIL_ATR_MULT = 1.1
+BE_FEE_BUFFER = 0.0008
 
 # --- حماية المحفظة ---
-DAILY_LOSS_LIMIT_PCT = 5.0    
-MAX_SAME_DIRECTION = 3        
+DAILY_LOSS_LIMIT_PCT = 4.5
+MAX_SAME_DIRECTION = 3
 
 # --- فلاتر السوق ---
-MAX_SPREAD_PCT = 0.001        
-MAX_FUNDING_RATE = 0.0005     
+MAX_SPREAD_PCT = 0.0012
+MAX_FUNDING_RATE = 0.0005
 
 CACHE_TTL = {"15m": 0, "1h": 300, "4h": 900}
 
@@ -73,7 +73,7 @@ DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) els
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
 
 state_lock = threading.Lock()
-trade_lock = threading.RLock()   
+trade_lock = threading.RLock()
 state = {}
 meta = {"paused": False, "last_report": "", "loss_alert": "", "last_heartbeat": ""}
 daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
@@ -87,7 +87,7 @@ _equity_cache = {"ts": 0, "value": 0.0}
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_v35_robust"}, 200
+    return {"status": "ok", "service": "trading_bot_v37_ultimate"}, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -97,8 +97,12 @@ def run_flask():
 # إدارة الحالة
 # ==========================================
 def new_sym_state():
-    return {"position": None, "entry": None, "sl": None, "tp": None, "contracts": 0.0,
-            "margin": 0.0, "opened_ts": 0, "last_exit_ts": 0, "breakeven_hit": False}
+    return {
+        "position": None, "entry": None, "sl": None, "tp": None,
+        "contracts": 0.0, "margin": 0.0, "opened_ts": 0,
+        "last_exit_ts": 0, "breakeven_hit": False,
+        "partial_taken": False
+    }
 
 def load_state():
     global state, daily_pnl, meta
@@ -109,7 +113,7 @@ def load_state():
             data = json.load(f)
         loaded = {}
         for k, v in data.get("state", {}).items():
-            sym = k.split("|")[0] 
+            sym = k.split("|")[0]
             base = new_sym_state()
             base.update(v)
             loaded[sym] = base
@@ -182,6 +186,7 @@ REASONS = {
     "Stop Loss": "ضرب وقف الخسارة 🛑",
     "Breakeven Hit": "خروج آمن (Breakeven) 🛡️",
     "Trailing Stop": "خروج بوقف متحرك (ربح مؤمَّن) 📈",
+    "Partial TP": "إغلاق جزئي + تأمين الباقي 💰",
     "Manual": "إغلاق يدوي من تيليجرام 🖐️",
     "Emergency": "إغلاق طارئ (فشل حماية الصفقة) 🚨",
     "Manual/External": "إغلاق من المنصة ⚡",
@@ -254,10 +259,11 @@ def adx(high, low, close, p=14):
     return (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9) * 100).ewm(alpha=1/p, adjust=False).mean()
 
 def add_indicators(df):
-    if len(df) < 30: return df
+    if len(df) < 50: return df
     df = df.copy()
     df["ema9"] = ema(df["close"], 9)
     df["ema21"] = ema(df["close"], 21)
+    df["ema50"] = ema(df["close"], 50)
     df["rsi"] = rsi(df["close"])
     df["adx"] = adx(df["high"], df["low"], df["close"])
     df["atr"] = atr(df["high"], df["low"], df["close"])
@@ -392,17 +398,19 @@ def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
                 time.sleep(1)
     return sl_ok, tp_ok
 
-def close_position(ex, sym):
+def close_position(ex, sym, amount=None):
     try:
-        cancel_pending(ex, sym)
         for p in ex.fetch_positions([sym]):
             contracts = abs(float(p.get('contracts') or 0))
             if contracts > 0:
+                close_amt = amount if amount and amount < contracts else contracts
                 side = 'sell' if p['side'] == 'long' else 'buy'
-                ex.create_order(sym, 'market', side, contracts, None,
+                ex.create_order(sym, 'market', side, close_amt, None,
                                 {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
-        time.sleep(0.5)
-        return get_open_position(ex, sym) is None
+        time.sleep(0.6)
+        if amount is None:
+            return get_open_position(ex, sym) is None
+        return True
     except Exception as e:
         log.error(f"[CLOSE ERR] {sym}: {e}")
         return False
@@ -415,6 +423,7 @@ def open_position(ex, sym, side, price, sl, tp, margin):
 
         try: ex.set_leverage(LEVERAGE, sym, params={'mgnMode': MARGIN_MODE})
         except Exception as e: log.warning(f"[LEVERAGE] {sym}: {e}")
+        
         cancel_pending(ex, sym)
 
         order_side = 'buy' if side == "LONG" else 'sell'
@@ -448,7 +457,7 @@ def open_position(ex, sym, side, price, sl, tp, margin):
         return False, str(e), price, 0.0
 
 # ==========================================
-# إنهاء الصفقة (حساب الربح الفعلي)
+# إنهاء الصفقة
 # ==========================================
 def get_exit_price(ex, sym, pos_data):
     try:
@@ -501,39 +510,64 @@ def emergency_close(ex, sym, why):
         send(f"🆘 <b>فشل الإغلاق الطارئ</b> لـ <code>{sym.split(':')[0]}</code> — تدخل يدوي مطلوب!")
 
 # ==========================================
-# الاستراتيجية
+# الاستراتيجية المحسّنة
 # ==========================================
 def check_entry_signal(df_15m, df_1h, df_4h):
-    if len(df_15m) < 50 or len(df_1h) < 50 or len(df_4h) < 50: return None
-    last_15m, last_1h, last_4h = df_15m.iloc[-2], df_1h.iloc[-2], df_4h.iloc[-2]
+    if len(df_15m) < 60 or len(df_1h) < 60 or len(df_4h) < 60:
+        return None
 
-    needed = [last_15m.get(k) for k in ("ema9", "ema21", "rsi", "adx", "atr", "vol_ma")]
-    if any(v is None or pd.isna(v) for v in needed): return None
+    last_15m = df_15m.iloc[-2]
+    last_1h = df_1h.iloc[-2]
+    last_4h = df_4h.iloc[-2]
+    prev_15m = df_15m.iloc[-3]
+
+    needed = [last_15m.get(k) for k in ("ema9", "ema21", "ema50", "rsi", "adx", "atr", "vol_ma")]
+    if any(v is None or pd.isna(v) for v in needed):
+        return None
 
     price = float(last_15m["close"])
-    trend_up = (last_15m["ema9"] > last_15m["ema21"]
-                and last_1h["close"] > last_1h["ema21"] and last_1h["ema9"] > last_1h["ema21"]
-                and last_4h["close"] > last_4h["ema21"])
-    trend_down = (last_15m["ema9"] < last_15m["ema21"]
-                  and last_1h["close"] < last_1h["ema21"] and last_1h["ema9"] < last_1h["ema21"]
-                  and last_4h["close"] < last_4h["ema21"])
+    atr_val = float(last_15m["atr"])
+    ema21 = float(last_15m["ema21"])
 
-    adx_strong = last_15m["adx"] > 30
-    vol_ok = last_15m["volume"] > 1.3 * last_15m["vol_ma"]
-    if not (adx_strong and vol_ok): return None
+    # فلتر الاتجاه القوي
+    trend_up = (
+        last_15m["ema9"] > last_15m["ema21"] > last_15m["ema50"] and
+        last_1h["close"] > last_1h["ema21"] and last_1h["ema9"] > last_1h["ema21"] and
+        last_4h["close"] > last_4h["ema21"] and last_4h["ema9"] > last_4h["ema50"]
+    )
+    trend_down = (
+        last_15m["ema9"] < last_15m["ema21"] < last_15m["ema50"] and
+        last_1h["close"] < last_1h["ema21"] and last_1h["ema9"] < last_1h["ema21"] and
+        last_4h["close"] < last_4h["ema21"] and last_4h["ema9"] < last_4h["ema50"]
+    )
 
-    sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * float(last_15m["atr"]) / price))
+    adx_strong = last_15m["adx"] > 26
+    vol_ok = last_15m["volume"] > 1.25 * last_15m["vol_ma"]
+
+    if not (adx_strong and vol_ok):
+        return None
+
+    # شرط الـ Pullback (قريب من EMA21)
+    dist_to_ema21 = abs(price - ema21) / price
+    is_near_ema = dist_to_ema21 < 0.012
+
+    sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * atr_val / price))
     tp_pct = sl_pct * RR_RATIO
-    support, resistance = last_15m["low20"], last_15m["high20"]
 
-    if trend_up and 45 < last_15m["rsi"] < 65:
-        return {"side": "LONG", "price": price, "sl_pct": sl_pct,
-                "sl": price * (1 - sl_pct), "tp": price * (1 + tp_pct),
-                "support": support, "resistance": resistance}
-    if trend_down and 35 < last_15m["rsi"] < 55:
-        return {"side": "SHORT", "price": price, "sl_pct": sl_pct,
-                "sl": price * (1 + sl_pct), "tp": price * (1 - tp_pct),
-                "support": support, "resistance": resistance}
+    if trend_up and 42 < last_15m["rsi"] < 62 and is_near_ema:
+        return {
+            "side": "LONG", "price": price, "sl_pct": sl_pct,
+            "sl": price * (1 - sl_pct), "tp": price * (1 + tp_pct),
+            "support": last_15m["low20"], "resistance": last_15m["high20"]
+        }
+
+    if trend_down and 38 < last_15m["rsi"] < 58 and is_near_ema:
+        return {
+            "side": "SHORT", "price": price, "sl_pct": sl_pct,
+            "sl": price * (1 + sl_pct), "tp": price * (1 - tp_pct),
+            "support": last_15m["low20"], "resistance": last_15m["high20"]
+        }
+
     return None
 
 def market_filters_ok(ex, sym, side):
@@ -553,7 +587,7 @@ def market_filters_ok(ex, sym, side):
         log.warning(f"[FUNDING] {sym}: {e}")
     return True, ""
 
-def fetch_data(ex, sym, tf, limit=100):
+def fetch_data(ex, sym, tf, limit=120):
     key = (sym, tf)
     ttl = CACHE_TTL.get(tf, 0)
     cached = _data_cache.get(key)
@@ -573,7 +607,7 @@ def to_df(raw):
     return add_indicators(pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"]))
 
 # ==========================================
-# إدارة الصفقة المفتوحة
+# إدارة الصفقة المفتوحة (مع Partial TP)
 # ==========================================
 def move_sl(ex, sym, pos_data, new_sl, title):
     side = pos_data["position"]
@@ -600,11 +634,58 @@ def move_sl(ex, sym, pos_data, new_sl, title):
          f"🪙 <b>الزوج:</b> <code>{sym.split(':')[0]}</code>\n"
          f"🛑 <b>وقف الخسارة الجديد:</b> <code>{fmt(new_sl)}</code>\n━━━━━━━━━━━━━━━")
 
+def take_partial_profit(ex, sym, pos_data, current_price):
+    side = pos_data["position"]
+    entry = pos_data["entry"]
+    contracts = pos_data["contracts"]
+    partial_amt = contracts * 0.5
+
+    if partial_amt <= 0: return False
+
+    risk = abs(entry - pos_data["sl"])
+    target_1_5r = entry + (1.5 * risk) if side == "LONG" else entry - (1.5 * risk)
+
+    reached = (current_price >= target_1_5r) if side == "LONG" else (current_price <= target_1_5r)
+    if not reached: return False
+
+    # ✅ إصلاح هام: إغلاق 50% كأمر سوق أولاً دون إلغاء الحماية الحالية
+    try:
+        close_side = 'sell' if side == "LONG" else 'buy'
+        ex.create_order(sym, 'market', close_side, partial_amt, None,
+                        {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
+        time.sleep(0.8) # انتظار تأكيد التنفيذ
+    except Exception as e:
+        log.error(f"[PARTIAL CLOSE ERR] {sym}: {e}")
+        return False
+
+    # بعد التأكد من إغلاق النصف، الآن نحدث الحالة والوقف
+    new_contracts = contracts - partial_amt
+    be_sl = entry * (1 + BE_FEE_BUFFER) if side == "LONG" else entry * (1 - BE_FEE_BUFFER)
+
+    with state_lock:
+        state[sym]["contracts"] = new_contracts
+        state[sym]["partial_taken"] = True
+        state[sym]["sl"] = be_sl
+        state[sym]["breakeven_hit"] = True
+
+    # الآن نلغي الحماية القديمة ونضع حماية جديدة للكمية المتبقية
+    cancel_pending(ex, sym)
+    protect_position(ex, sym, close_side, new_contracts, be_sl, pos_data["tp"])
+
+    save_state()
+    send(f"💰 <b>إغلاق جزئي (50%)</b>\n"
+         f"━━━━━━━━━━━━━━━\n"
+         f"🪙 <b>الزوج:</b> <code>{sym.split(':')[0]}</code>\n"
+         f"✅ تم تأمين جزء من الأرباح\n"
+         f"🛡️ تم نقل الوقف إلى التعادل على الباقي\n━━━━━━━━━━━━━━━")
+    return True
+
 def manage_position(ex, sym, pos_data):
     side, entry, sl, tp = pos_data["position"], pos_data["entry"], pos_data["sl"], pos_data["tp"]
     price = get_current_price(ex, sym)
     if not price: return
 
+    # التحقق من الحماية
     try:
         has_sl, has_tp = get_protection(ex, sym)
         if not has_sl:
@@ -618,27 +699,37 @@ def manage_position(ex, sym, pos_data):
     except Exception as e:
         log.warning(f"[PROTECTION CHECK] {sym}: {e}")
 
+    # 1. محاولة الإغلاق الجزئي
+    if not pos_data.get("partial_taken"):
+        if take_partial_profit(ex, sym, pos_data, price):
+            return
+
+    # 2. نقل إلى Breakeven لو لم يتم بعد
     if not pos_data.get("breakeven_hit"):
-        trigger = entry + (tp - entry) * 0.5
+        risk = abs(entry - sl)
+        trigger = entry + risk if side == "LONG" else entry - risk
         reached = price >= trigger if side == "LONG" else price <= trigger
         if reached:
             be_sl = entry * (1 + BE_FEE_BUFFER) if side == "LONG" else entry * (1 - BE_FEE_BUFFER)
             move_sl(ex, sym, pos_data, be_sl, "🛡️ <b>تأمين الصفقة (Breakeven)</b>")
         return
 
+    # 3. Trailing Stop
     raw = fetch_data(ex, sym, "15m")
     if len(raw) < 50: return
     df = to_df(raw)
     atr_val = df.iloc[-2].get("atr")
     if atr_val is None or pd.isna(atr_val): return
 
+    trail_mult = TRAIL_ATR_MULT * (0.9 if pos_data.get("partial_taken") else 1.0)
+
     if side == "LONG":
-        new_sl = price - TRAIL_ATR_MULT * float(atr_val)
-        if new_sl > sl * 1.002 and new_sl < price:
+        new_sl = price - trail_mult * float(atr_val)
+        if new_sl > sl * 1.0015 and new_sl < price:
             move_sl(ex, sym, pos_data, new_sl, "📈 <b>تحريك الوقف المتحرك (Trailing)</b>")
     else:
-        new_sl = price + TRAIL_ATR_MULT * float(atr_val)
-        if new_sl < sl * 0.998 and new_sl > price:
+        new_sl = price + trail_mult * float(atr_val)
+        if new_sl < sl * 0.9985 and new_sl > price:
             move_sl(ex, sym, pos_data, new_sl, "📈 <b>تحريك الوقف المتحرك (Trailing)</b>")
 
 # ==========================================
@@ -668,11 +759,13 @@ def process_symbol(ex, sym):
                 pos_data = dict(state[sym])
 
             if pos_data.get("position") is not None:
-                exch_pos = get_open_position(ex, sym)  
+                exch_pos = get_open_position(ex, sym)
                 if exch_pos is None:
                     finalize_trade(ex, sym)
                     return
-                manage_position(ex, sym, pos_data)
+                with state_lock:
+                    state[sym]["contracts"] = exch_pos["contracts"]
+                manage_position(ex, sym, dict(state[sym]))
                 return
 
             if time.time() - pos_data.get("last_exit_ts", 0) < REENTRY_COOLDOWN_SEC:
@@ -688,7 +781,7 @@ def process_symbol(ex, sym):
             raw_15m = fetch_data(ex, sym, "15m")
             raw_1h = fetch_data(ex, sym, "1h")
             raw_4h = fetch_data(ex, sym, "4h")
-            if len(raw_15m) < 50 or len(raw_1h) < 50 or len(raw_4h) < 50:
+            if len(raw_15m) < 60 or len(raw_1h) < 60 or len(raw_4h) < 60:
                 return
             df_15m, df_1h, df_4h = to_df(raw_15m), to_df(raw_1h), to_df(raw_4h)
 
@@ -708,18 +801,22 @@ def process_symbol(ex, sym):
 
             actual_price = get_current_price(ex, sym) or signal["price"]
             if signal["side"] == "LONG":
-                sl = actual_price * (1 - signal["sl_pct"]); tp = actual_price * (1 + signal["sl_pct"] * RR_RATIO)
+                sl = actual_price * (1 - signal["sl_pct"])
+                tp = actual_price * (1 + signal["sl_pct"] * RR_RATIO)
             else:
-                sl = actual_price * (1 + signal["sl_pct"]); tp = actual_price * (1 - signal["sl_pct"] * RR_RATIO)
+                sl = actual_price * (1 + signal["sl_pct"])
+                tp = actual_price * (1 - signal["sl_pct"] * RR_RATIO)
 
             margin = compute_margin(get_equity(ex), signal["sl_pct"])
             success, info, entry, contracts = open_position(ex, sym, signal["side"], actual_price, sl, tp, margin)
 
             if success:
                 with state_lock:
-                    state[sym].update({"position": signal["side"], "entry": entry, "sl": sl, "tp": tp,
-                                       "contracts": contracts, "margin": margin,
-                                       "opened_ts": time.time(), "breakeven_hit": False})
+                    state[sym].update({
+                        "position": signal["side"], "entry": entry, "sl": sl, "tp": tp,
+                        "contracts": contracts, "margin": margin,
+                        "opened_ts": time.time(), "breakeven_hit": False, "partial_taken": False
+                    })
             else:
                 with state_lock:
                     state[sym]["last_exit_ts"] = time.time()
@@ -779,7 +876,7 @@ def sync_positions(ex, active_symbols):
                 side = "LONG" if p.get('side') == 'long' else "SHORT"
                 entry = float(p.get('entryPrice') or 0)
                 contracts = abs(float(p.get('contracts')))
-                sl_pct = 0.02
+                sl_pct = 0.018
                 sl = entry * (1 - sl_pct) if side == "LONG" else entry * (1 + sl_pct)
                 tp = entry * (1 + sl_pct * RR_RATIO) if side == "LONG" else entry * (1 - sl_pct * RR_RATIO)
                 close_side = 'sell' if side == "LONG" else 'buy'
@@ -788,14 +885,16 @@ def sync_positions(ex, active_symbols):
                 if not sl_ok:
                     emergency_close(ex, sym, "مركز غير معروف وتعذر حمايته.")
                     continue
-                
+
                 with state_lock:
                     if sym not in state:
                         state[sym] = new_sym_state()
-                    state[sym].update({"position": side, "entry": entry, "sl": sl, "tp": tp,
-                                       "contracts": contracts,
-                                       "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
-                                       "opened_ts": time.time(), "breakeven_hit": False})
+                    state[sym].update({
+                        "position": side, "entry": entry, "sl": sl, "tp": tp,
+                        "contracts": contracts,
+                        "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
+                        "opened_ts": time.time(), "breakeven_hit": False, "partial_taken": False
+                    })
                 send(f"♻️ تم تبني مركز موجود <code>{sym.split(':')[0]}</code> ({side}) مع SL/TP افتراضية.")
         save_state()
 
@@ -818,8 +917,10 @@ def status_text(ex):
         price = get_current_price(ex, sym) or v["entry"]
         d = 1 if v["position"] == "LONG" else -1
         upnl = (price - v["entry"]) * d * v["contracts"] * contract_size(ex, sym)
+        partial_flag = " 💰" if v.get("partial_taken") else ""
+        be_flag = " 🛡️" if v.get("breakeven_hit") else ""
         lines.append(f"• <code>{sym.split(':')[0]}</code> {v['position']} | دخول {fmt(v['entry'])} | "
-                     f"الآن {fmt(price)} | {upnl:+.2f} USDT{' 🛡️' if v.get('breakeven_hit') else ''}")
+                     f"الآن {fmt(price)} | {upnl:+.2f} USDT{partial_flag}{be_flag}")
     return "\n".join(lines)
 
 def find_symbol(arg, active_symbols):
@@ -871,8 +972,7 @@ def handle_command(ex, text, chat_id, active_symbols):
              "/close BTC — إغلاق عملة\n/closeall — إغلاق الكل", chat_id)
 
 def telegram_listener(active_symbols):
-    if not TELEGRAM_BOT_TOKEN or not AUTHORIZED_CHATS:
-        return
+    if not TELEGRAM_BOT_TOKEN or not AUTHORIZED_CHATS: return
     try:
         ex2 = create_exchange()
         ex2.load_markets()
@@ -900,15 +1000,13 @@ def telegram_listener(active_symbols):
             time.sleep(5)
 
 # ==========================================
-# التقرير اليومي (تم تحسينه ليعمل في أي وقت بعد 11:55)
+# التقرير اليومي + Heartbeat
 # ==========================================
 def maybe_send_daily_report(ex):
     now = datetime.now(KSA_TZ)
     today = str(now.date())
-    
-    # التحقق: هل نحن في وقت التقرير (من 11:55 مساءً حتى 12:15 صباحاً كهامش أمان)؟
     is_report_time = (now.hour == 23 and now.minute >= 55) or (now.hour == 0 and now.minute < 15)
-    
+
     if is_report_time and meta.get("last_report") != today:
         roll_daily()
         wr = (daily_pnl["wins"] / daily_pnl["trades"] * 100) if daily_pnl["trades"] else 0
@@ -921,9 +1019,6 @@ def maybe_send_daily_report(ex):
         save_state()
         log.info("[DAILY REPORT] Sent successfully.")
 
-# ==========================================
-# نبضة الحياة (Heartbeat) لطمأنتك
-# ==========================================
 def maybe_send_heartbeat(ex):
     now = datetime.now(KSA_TZ)
     current_hour = now.strftime("%Y-%m-%d %H")
@@ -934,8 +1029,6 @@ def maybe_send_heartbeat(ex):
         with state_lock:
             open_ct = sum(1 for v in state.values() if v.get("position"))
         log.info(f"[HEARTBEAT] Bot is alive. Open positions: {open_ct}. Equity: {equity}")
-        # إذا أردت رسالة في تيليجرام كل ساعة، أزل علامة المربع من السطر التالي
-        # send(f"⏱️ <b>نبضة حياة:</b> البوت يعمل. صفقات مفتوحة: {open_ct} | رصيد: {equity:.2f} USDT")
 
 # ==========================================
 # الحلقة الرئيسية
@@ -946,7 +1039,7 @@ def init_exchange():
     return ex
 
 def trading_loop():
-    log.info("[INIT] Starting V35 Bot (Robust Reports)...")
+    log.info("[INIT] Starting V37 Bot (Ultimate)...")
     if not OKX_API_KEY:
         return send("❌ مفاتيح API غير موجودة")
 
@@ -964,13 +1057,13 @@ def trading_loop():
 
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
 
-    send(f"🛡️ <b>تم تشغيل البوت (V35 - تقارير مضمونة)</b>\n"
+    send(f"🛡️ <b>تم تشغيل البوت (V37 - النسخة النهائية)</b>\n"
          f"━━━━━━━━━━━━━━━\n"
          f"⚙️ <b>الوضع:</b> {mode_str}\n"
          f"🪙 <b>العملات:</b> {len(active_symbols)}\n"
-         f"📊 <b>الحد الأقصى للصفقات:</b> {MAX_OPEN_POSITIONS} (حد {MAX_SAME_DIRECTION} بنفس الاتجاه)\n"
-         f"💰 <b>حجم الصفقة:</b> {POSITION_SIZE_USDT} USDT (ثابت)\n"
-         f"🎯 <b>SL/TP:</b> ATR (نسبة 1:{RR_RATIO:g}) + Trailing\n"
+         f"📊 <b>الحد الأقصى للصفقات:</b> {MAX_OPEN_POSITIONS}\n"
+         f"💰 <b>حجم الصفقة:</b> Risk 0.8% من الرصيد\n"
+         f"🎯 <b>SL/TP:</b> ATR + Partial TP + Trailing\n"
          f"⛔ <b>حد الخسارة اليومي:</b> {DAILY_LOSS_LIMIT_PCT}%\n"
          f"━━━━━━━━━━━━━━━")
 
@@ -985,11 +1078,11 @@ def trading_loop():
                 except Exception as e:
                     cycle_errors += 1
                     log.error(f"[LOOP] {sym}: {e}")
-                time.sleep(0.5)
-            
+                time.sleep(0.45)
+
             maybe_send_daily_report(ex)
             maybe_send_heartbeat(ex)
-            
+
         except Exception as e:
             cycle_errors += 1
             log.error(f"[LOOP FATAL] {e}")
