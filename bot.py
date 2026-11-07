@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V41.3 (BTC Focus + No Cooldown + Open Profits)
+OKX Futures Trading Bot - V41.4 (Flexible Strategy + Bug Fixes)
 """
 import os
 import sys
@@ -22,9 +22,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bot")
 
 # ==========================================
-# الإعدادات - V41.3
+# الإعدادات - V41.4
 # ==========================================
-VERSION = "V41.3"
+VERSION = "V41.4"
 KSA_TZ = timezone(timedelta(hours=3))
 
 def env_float(name, default):
@@ -63,7 +63,7 @@ SCAN_INTERVAL = 30
 LEVERAGE = int(env_float("LEVERAGE", 7))
 MARGIN_MODE = "isolated"
 MAX_OPEN_POSITIONS = 6
-REENTRY_COOLDOWN_SEC = 0  # <--- تم إلغاء الانتظار للعملات العادية
+REENTRY_COOLDOWN_SEC = 0
 
 USE_RISK_SIZING = True
 RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 1.0)
@@ -86,19 +86,31 @@ PARTIAL2_R, PARTIAL2_PCT = 2.1, 0.50
 
 FEE_RATE = 0.0005
 DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 5.0)
-DAILY_PROFIT_TARGET_PCT = 0.0 # تم إلغاء حد الربح اليومي
+DAILY_PROFIT_TARGET_PCT = 0.0 
 MAX_SAME_DIRECTION = 4
 MAX_SPREAD_PCT = 0.0011
 MAX_FUNDING_RATE = 0.00045
 MAX_ENTRY_SLIPPAGE_PCT = 0.004
 USE_BTC_FILTER = True
 
-# ==== إعدادات BTC (التركيز) ====
+# ==== إعدادات BTC ====
 BTC_LEVERAGE = int(env_float("BTC_LEVERAGE", 10))
 BTC_MAX_TRADES_PER_DAY = int(env_float("BTC_MAX_TRADES_PER_DAY", 6))
 BTC_MAX_CONSECUTIVE_LOSSES = int(env_float("BTC_MAX_CONSECUTIVE_LOSSES", 3))
-BTC_COOLDOWN_MINUTES = int(env_float("BTC_COOLDOWN_MINUTES", 0)) # <--- تم إلغاء الانتظار لـ BTC
+BTC_COOLDOWN_MINUTES = int(env_float("BTC_COOLDOWN_MINUTES", 0))
 BTC_ADX_MIN = float(env_float("BTC_ADX_MIN", 24))
+
+# ==== إعدادات الاستراتيجية المرنة (جديد) ====
+STRAT_ADX_MIN = float(env_float("STRAT_ADX_MIN", 20))
+STRAT_VOL_MULT = float(env_float("STRAT_VOL_MULT", 1.2))
+STRAT_RSI_LONG_MIN = float(env_float("STRAT_RSI_LONG_MIN", 40))
+STRAT_RSI_LONG_MAX = float(env_float("STRAT_RSI_LONG_MAX", 61))
+STRAT_RSI_SHORT_MIN = float(env_float("STRAT_RSI_SHORT_MIN", 39))
+STRAT_RSI_SHORT_MAX = float(env_float("STRAT_RSI_SHORT_MAX", 60))
+STRAT_NEAR_EMA21_PCT = float(env_float("STRAT_NEAR_EMA21_PCT", 0.011))
+STRAT_NEAR_EMA50_PCT = float(env_float("STRAT_NEAR_EMA50_PCT", 0.016))
+STRAT_REGIME_ADX_STRONG = float(env_float("STRAT_REGIME_ADX_STRONG", 28))
+STRAT_REGIME_ADX_WEAK = float(env_float("STRAT_REGIME_ADX_WEAK", 20))
 
 TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 
@@ -179,13 +191,14 @@ def load_state():
         log.error(f"[STATE LOAD ERROR] {e}")
 
 def save_state():
+    # تم إصلاح الثغرة: القفل يغطي عملية الكتابة الفعلية لمنع تعارض الملفات
     try:
         with state_lock:
             txt = json.dumps({"state": state, "daily_pnl": daily_pnl, "meta": meta, "btc_tracker": btc_tracker}, ensure_ascii=False, indent=2)
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(txt)
-        os.replace(tmp, STATE_FILE)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(txt)
+            os.replace(tmp, STATE_FILE)
     except Exception as e:
         log.error(f"[STATE SAVE ERROR] {e}")
 
@@ -223,7 +236,6 @@ def daily_snapshot():
     roll_daily()
     with state_lock: return dict(daily_pnl)
 
-# ==== BTC Tracker Functions ====
 def btc_roll_daily():
     global btc_tracker
     today = str(datetime.now(KSA_TZ).date())
@@ -313,6 +325,7 @@ def send(msg, chat_id=None):
         try:
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                           json={"chat_id": cid, "text": msg, "parse_mode": "HTML"}, timeout=10)
+            if len(targets) > 1: time.sleep(0.5) # حماية من الحظر
         except Exception as e: log.warning(f"[TG SEND] {e}")
 
 def fmt(p):
@@ -688,10 +701,11 @@ def detect_regime(df_15m, df_1h, df_4h):
     ema50_4 = last_4h.get("ema50", last_4h["close"])
     up_4h = last_4h["close"] > ema50_4 and last_4h["ema9"] > last_4h["ema21"]
     down_4h = last_4h["close"] < ema50_4 and last_4h["ema9"] < last_4h["ema21"]
-    if adx4 > 28 and adx1 > 24:
+    # استخدام المتغيرات المرنة
+    if adx4 > STRAT_REGIME_ADX_STRONG and adx1 > (STRAT_REGIME_ADX_STRONG - 4):
         if up_4h: return "strong_trend_up"
         if down_4h: return "strong_trend_down"
-    if adx4 > 20 and (up_4h or down_4h): return "weak_trend"
+    if adx4 > STRAT_REGIME_ADX_WEAK and (up_4h or down_4h): return "weak_trend"
     return "range"
 
 def check_entry_signal(df_15m, df_1h, df_4h, sym=""):
@@ -705,22 +719,28 @@ def check_entry_signal(df_15m, df_1h, df_4h, sym=""):
     rsi_val = float(last["rsi"]); adx_val = float(last["adx"])
     regime = detect_regime(df_15m, df_1h, df_4h)
     if regime in ("range", "unknown"): return None
+    
     atr_pct = atr_val / price
     if atr_pct < 0.004 or atr_pct > 0.045: return None
     
-    adx_min = BTC_ADX_MIN if sym.startswith("BTC/") else 20
-    if not (last["volume"] > 1.2 * last["vol_ma"]) or adx_val < adx_min: return None
+    # استخدام المتغيرات المرنة للفلترة
+    adx_min = BTC_ADX_MIN if sym.startswith("BTC/") else STRAT_ADX_MIN
+    if not (last["volume"] > STRAT_VOL_MULT * last["vol_ma"]) or adx_val < adx_min: return None
     
-    near_ema = abs(price - ema21) / price < 0.011 or abs(price - ema50) / price < 0.016
+    near_ema = abs(price - ema21) / price < STRAT_NEAR_EMA21_PCT or abs(price - ema50) / price < STRAT_NEAR_EMA50_PCT
     bullish_reject = last["close"] > last["open"] and (last["low"] < ema21 or prev["low"] < ema21)
     bearish_reject = last["close"] < last["open"] and (last["high"] > ema21 or prev["high"] > ema21)
+    
     sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * atr_val / price))
     tp_pct = sl_pct * RR_RATIO
+    
     if regime in ("strong_trend_up", "weak_trend") and last_4h["close"] > last_4h["ema50"]:
-        if (last["ema9"] > last["ema21"] and last_1h["ema9"] > last_1h["ema21"] and near_ema and 40 < rsi_val < 61 and bullish_reject):
+        # استخدام المتغيرات المرنة للـ RSI
+        if (last["ema9"] > last["ema21"] and last_1h["ema9"] > last_1h["ema21"] and near_ema and STRAT_RSI_LONG_MIN < rsi_val < STRAT_RSI_LONG_MAX and bullish_reject):
             return {"side": "LONG", "price": price, "sl_pct": sl_pct, "sl": price * (1 - sl_pct), "tp": price * (1 + tp_pct), "regime": regime}
+            
     if regime in ("strong_trend_down", "weak_trend") and last_4h["close"] < last_4h["ema50"]:
-        if (last["ema9"] < last["ema21"] and last_1h["ema9"] < last_1h["ema21"] and near_ema and 39 < rsi_val < 60 and bearish_reject):
+        if (last["ema9"] < last["ema21"] and last_1h["ema9"] < last_1h["ema21"] and near_ema and STRAT_RSI_SHORT_MIN < rsi_val < STRAT_RSI_SHORT_MAX and bearish_reject):
             return {"side": "SHORT", "price": price, "sl_pct": sl_pct, "sl": price * (1 + sl_pct), "tp": price * (1 - tp_pct), "regime": regime}
     return None
 
@@ -848,57 +868,63 @@ def entries_allowed(ex):
 
 def process_symbol(ex, sym):
     try:
+        # 1. فحص سريع بدون قفل (لتجنب تجميد البوت)
+        with state_lock: st = state.setdefault(sym, new_sym_state()); pos_data = dict(st)
+
+        if pos_data.get("position") is not None:
+            exch_pos = get_open_position(ex, sym)
+            if exch_pos is None: 
+                with trade_lock: finalize_trade(ex, sym)
+                return
+            with state_lock: state[sym]["contracts"] = exch_pos["contracts"]; cur = dict(state[sym])
+            manage_position(ex, sym, cur); return
+
+        cooldown = BTC_COOLDOWN_MINUTES * 60 if sym.startswith("BTC/") else REENTRY_COOLDOWN_SEC
+        if time.time() - pos_data.get("last_exit_ts", 0) < cooldown: return
+        if not entries_allowed(ex): return
+        
+        with state_lock: open_count = sum(1 for v in state.values() if v.get("position"))
+        if open_count >= MAX_OPEN_POSITIONS: return
+
+        raw_15m = fetch_data(ex, sym, "15m")
+        if len(raw_15m) < 70: return
+        closed_ts = raw_15m[-2][0]
+        if _last_eval.get(sym) == closed_ts: return
+        raw_1h = fetch_data(ex, sym, "1h"); raw_4h = fetch_data(ex, sym, "4h")
+        if len(raw_1h) < 60 or len(raw_4h) < 60: return
+        _last_eval[sym] = closed_ts
+
+        signal = check_entry_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h), sym)
+        if not signal: return
+        side = signal["side"]
+
+        if sym.startswith("BTC/"):
+            btc_ok, why = btc_can_trade()
+            if not btc_ok:
+                log.info(f"[BTC SKIP] {why}")
+                return
+
+        with state_lock: same_dir = sum(1 for v in state.values() if v.get("position") == side)
+        if same_dir >= MAX_SAME_DIRECTION: return
+        if sector_limit_reached(sym, side): return
+        if USE_BTC_FILTER and not sym.startswith("BTC/"):
+            bias = btc_bias(ex)
+            if (side == "LONG" and bias == "down") or (side == "SHORT" and bias == "up"): return
+        ok, why = market_filters_ok(ex, sym, side)
+        if not ok: return
+
+        actual_price = get_current_price(ex, sym, 0) or signal["price"]
+        if abs(actual_price - signal["price"]) / signal["price"] > MAX_ENTRY_SLIPPAGE_PCT: return
+        
+        sl_pct = signal["sl_pct"]
+        if side == "LONG": sl = actual_price * (1 - sl_pct); tp = actual_price * (1 + sl_pct * RR_RATIO)
+        else: sl = actual_price * (1 + sl_pct); tp = actual_price * (1 - sl_pct * RR_RATIO)
+        
+        lev = BTC_LEVERAGE if sym.startswith("BTC/") else LEVERAGE
+        margin = compute_margin(get_equity(ex), sl_pct, lev)
+
+        # 2. قفل التنفيذ فقط (لحظة فتح الصفقة وتحديث الحالة)
         with trade_lock:
-            with state_lock: st = state.setdefault(sym, new_sym_state()); pos_data = dict(st)
-
-            if pos_data.get("position") is not None:
-                exch_pos = get_open_position(ex, sym)
-                if exch_pos is None: finalize_trade(ex, sym); return
-                with state_lock: state[sym]["contracts"] = exch_pos["contracts"]; cur = dict(state[sym])
-                manage_position(ex, sym, cur); return
-
-            cooldown = BTC_COOLDOWN_MINUTES * 60 if sym.startswith("BTC/") else REENTRY_COOLDOWN_SEC
-            if time.time() - pos_data.get("last_exit_ts", 0) < cooldown: return
-            if not entries_allowed(ex): return
-            with state_lock: open_count = sum(1 for v in state.values() if v.get("position"))
-            if open_count >= MAX_OPEN_POSITIONS: return
-
-            raw_15m = fetch_data(ex, sym, "15m")
-            if len(raw_15m) < 70: return
-            closed_ts = raw_15m[-2][0]
-            if _last_eval.get(sym) == closed_ts: return
-            raw_1h = fetch_data(ex, sym, "1h"); raw_4h = fetch_data(ex, sym, "4h")
-            if len(raw_1h) < 60 or len(raw_4h) < 60: return
-            _last_eval[sym] = closed_ts
-
-            signal = check_entry_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h), sym)
-            if not signal: return
-            side = signal["side"]
-
-            if sym.startswith("BTC/"):
-                btc_ok, why = btc_can_trade()
-                if not btc_ok:
-                    log.info(f"[BTC SKIP] {why}")
-                    return
-
-            with state_lock: same_dir = sum(1 for v in state.values() if v.get("position") == side)
-            if same_dir >= MAX_SAME_DIRECTION: return
-            if sector_limit_reached(sym, side): return
-            if USE_BTC_FILTER and not sym.startswith("BTC/"):
-                bias = btc_bias(ex)
-                if (side == "LONG" and bias == "down") or (side == "SHORT" and bias == "up"): return
-            ok, why = market_filters_ok(ex, sym, side)
-            if not ok: return
-
-            actual_price = get_current_price(ex, sym, 0) or signal["price"]
-            if abs(actual_price - signal["price"]) / signal["price"] > MAX_ENTRY_SLIPPAGE_PCT: return
-            sl_pct = signal["sl_pct"]
-            if side == "LONG": sl = actual_price * (1 - sl_pct); tp = actual_price * (1 + sl_pct * RR_RATIO)
-            else: sl = actual_price * (1 + sl_pct); tp = actual_price * (1 - sl_pct * RR_RATIO)
-            
-            lev = BTC_LEVERAGE if sym.startswith("BTC/") else LEVERAGE
-            margin = compute_margin(get_equity(ex), sl_pct, lev)
-
             success, info, entry, contracts = open_position(ex, sym, side, actual_price, sl, tp, margin)
             now = time.time()
             if success:
@@ -906,8 +932,17 @@ def process_symbol(ex, sym):
                     state[sym].update({"position": side, "entry": entry, "sl": sl, "tp": tp, "initial_sl": sl, "initial_risk": abs(entry - sl), "contracts": contracts, "initial_contracts": contracts, "margin": margin, "opened_ts": now, "leg_ts": now, "realized_pnl": 0.0, "last_notified_sl": None, "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False, "regime": signal.get("regime", "")})
                 if sym.startswith("BTC/"): btc_register_entry()
             else:
+                # إصلاح ثغرة المركز المعلق: التحقق مما إذا كانت الصفقة فُتحت على المنصة رغم الخطأ
+                actual_pos = get_open_position(ex, sym)
+                if actual_pos:
+                    send(f"🚨 <b>مركز معلق!</b> فشل الإعداد لـ <code>{short(sym)}</code> لكن الصفقة مفتوحة. جاري الإغلاق الطارئ...")
+                    if close_full(ex, sym):
+                        send(f"✅ تم إغلاق المركز المعلق بنجاح.")
+                    else:
+                        send(f"🆘 <b>فشل الإغلاق الطارئ!</b> يرجى التدخل يدوياً لـ <code>{short(sym)}</code>.")
                 with state_lock: state[sym]["last_exit_ts"] = now
             save_state()
+            
             caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""), lev)
             if not success: caption += f"\n❌ {info}"
             send(caption)
@@ -1120,7 +1155,7 @@ def trading_loop():
     active_symbols = [s for s in FUTURES_SYMBOLS if s in ex.markets]
     sync_positions(ex, active_symbols)
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
-    send(f"🚀 <b>تم تشغيل البوت {VERSION} (بدون كولداون + أرباح مفتوحة)</b>\n━━━━━━━━━━━━━━━\n⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة عامة: {LEVERAGE}x\n🎯 رافعة BTC: {BTC_LEVERAGE}x | حد صفقات BTC: {BTC_MAX_TRADES_PER_DAY}/يوم\n⏱️ كولداون: <b>ملغي (0 دقيقة)</b>\n🎯 حد الربح اليومي: مفتوح (لا يتوقف)\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
+    send(f"🚀 <b>تم تشغيل البوت {VERSION} (استراتيجية مرنة + إصلاحات)</b>\n━━━━━━━━━━━━━━━\n⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة عامة: {LEVERAGE}x\n🎯 رافعة BTC: {BTC_LEVERAGE}x | حد صفقات BTC: {BTC_MAX_TRADES_PER_DAY}/يوم\n⏱️ كولداون: <b>ملغي (0 دقيقة)</b>\n🎯 حد الربح اليومي: مفتوح (لا يتوقف)\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
 
     fail_streak = 0
     while True:
