@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V41 (BTC Focus + Higher Risk)
+OKX Futures Trading Bot - V41.3 (BTC Focus + No Cooldown + Open Profits)
 """
 import os
 import sys
@@ -22,9 +22,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bot")
 
 # ==========================================
-# الإعدادات - V41
+# الإعدادات - V41.3
 # ==========================================
-VERSION = "V41"
+VERSION = "V41.3"
 KSA_TZ = timezone(timedelta(hours=3))
 
 def env_float(name, default):
@@ -57,20 +57,20 @@ SECTORS = {
     "ai": {"FET", "WLD"},
     "legacy": {"XRP", "LTC", "BCH", "FIL", "LINK", "RUNE", "ORDI"},
 }
-MAX_PER_SECTOR_SAME_DIR = 3  # رفع من 2
+MAX_PER_SECTOR_SAME_DIR = 3
 
 SCAN_INTERVAL = 30
-LEVERAGE = int(env_float("LEVERAGE", 7))  # رفع من 5
+LEVERAGE = int(env_float("LEVERAGE", 7))
 MARGIN_MODE = "isolated"
-MAX_OPEN_POSITIONS = 6  # رفع من 5
-REENTRY_COOLDOWN_SEC = 1500
+MAX_OPEN_POSITIONS = 6
+REENTRY_COOLDOWN_SEC = 0  # <--- تم إلغاء الانتظار للعملات العادية
 
 USE_RISK_SIZING = True
-RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 1.0)  # رفع من 0.75
+RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 1.0)
 POSITION_SIZE_USDT = 50
 MIN_MARGIN_USDT = 12
-MAX_MARGIN_USDT = 200  # رفع من 130
-MAX_MARGIN_PCT_EQUITY = 0.40  # رفع من 0.30
+MAX_MARGIN_USDT = 200
+MAX_MARGIN_PCT_EQUITY = 0.40
 
 ATR_SL_MULT = 1.55
 RR_RATIO = 2.3
@@ -85,9 +85,9 @@ PARTIAL1_R, PARTIAL1_PCT = 1.3, 0.40
 PARTIAL2_R, PARTIAL2_PCT = 2.1, 0.50
 
 FEE_RATE = 0.0005
-DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 5.0)  # رفع من 4
-DAILY_PROFIT_TARGET_PCT = env_float("DAILY_PROFIT_TARGET_PCT", 8.0)  # رفع من 6
-MAX_SAME_DIRECTION = 4  # رفع من 3
+DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 5.0)
+DAILY_PROFIT_TARGET_PCT = 0.0 # تم إلغاء حد الربح اليومي
+MAX_SAME_DIRECTION = 4
 MAX_SPREAD_PCT = 0.0011
 MAX_FUNDING_RATE = 0.00045
 MAX_ENTRY_SLIPPAGE_PCT = 0.004
@@ -97,7 +97,7 @@ USE_BTC_FILTER = True
 BTC_LEVERAGE = int(env_float("BTC_LEVERAGE", 10))
 BTC_MAX_TRADES_PER_DAY = int(env_float("BTC_MAX_TRADES_PER_DAY", 6))
 BTC_MAX_CONSECUTIVE_LOSSES = int(env_float("BTC_MAX_CONSECUTIVE_LOSSES", 3))
-BTC_COOLDOWN_MINUTES = int(env_float("BTC_COOLDOWN_MINUTES", 30))
+BTC_COOLDOWN_MINUTES = int(env_float("BTC_COOLDOWN_MINUTES", 0)) # <--- تم إلغاء الانتظار لـ BTC
 BTC_ADX_MIN = float(env_float("BTC_ADX_MIN", 24))
 
 TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
@@ -258,7 +258,7 @@ def btc_register_result(pnl_usdt):
     save_state()
 
 # ==========================================
-# Journal
+# Journal & Stats
 # ==========================================
 JOURNAL_FIELDS = ["close_time", "symbol", "side", "entry", "exit", "initial_contracts", "pnl", "r_multiple", "reason", "regime", "duration_min"]
 
@@ -708,7 +708,7 @@ def check_entry_signal(df_15m, df_1h, df_4h, sym=""):
     atr_pct = atr_val / price
     if atr_pct < 0.004 or atr_pct > 0.045: return None
     
-    adx_min = BTC_ADX_MIN if sym.startswith("BTC/") else 20  # رفع الحساسية للجميع
+    adx_min = BTC_ADX_MIN if sym.startswith("BTC/") else 20
     if not (last["volume"] > 1.2 * last["vol_ma"]) or adx_val < adx_min: return None
     
     near_ema = abs(price - ema21) / price < 0.011 or abs(price - ema50) / price < 0.016
@@ -841,7 +841,7 @@ def entries_allowed(ex):
     if snap["value"] <= -equity * DAILY_LOSS_LIMIT_PCT / 100.0:
         if meta.get("loss_alert") != snap["date"]: set_meta("loss_alert", snap["date"]); send("⛔ <b>وصلنا حد الخسارة اليومي</b>\nتم إيقاف الصفقات الجديدة")
         return False
-    if snap["value"] >= equity * DAILY_PROFIT_TARGET_PCT / 100.0:
+    if DAILY_PROFIT_TARGET_PCT > 0 and snap["value"] >= equity * DAILY_PROFIT_TARGET_PCT / 100.0:
         if meta.get("profit_alert") != snap["date"]: set_meta("profit_alert", snap["date"]); send("✅ <b>تحقق الهدف اليومي للربح</b>\nتم إيقاف الدخول لحماية الأرباح")
         return False
     return True
@@ -1018,13 +1018,13 @@ def positions_text(ex):
 def risk_text(ex):
     snap = daily_snapshot(); equity = get_equity(ex, force=True); opens = open_positions_snapshot()
     longs = sum(1 for v in opens.values() if v["position"] == "LONG"); shorts = sum(1 for v in opens.values() if v["position"] == "SHORT")
-    loss_limit = equity * DAILY_LOSS_LIMIT_PCT / 100.0; profit_target = equity * DAILY_PROFIT_TARGET_PCT / 100.0
+    loss_limit = equity * DAILY_LOSS_LIMIT_PCT / 100.0
     status = "⏸️ متوقف" if meta.get("paused") else "▶️ يعمل"
     btc_ok, btc_why = btc_can_trade()
     return "\n".join(["🛡️ <b>ملخص إدارة المخاطر</b>", "━━━━━━━━━━━━━━━", f"💼 الرصيد: <b>{equity:,.2f} USDT</b>", f"📊 الحالة: {status} | BTC: {_btc_bias_cache['value']}", "",
-                      f"🎯 المخاطرة لكل صفقة: <b>{RISK_PCT_PER_TRADE}%</b>", f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT)", f"📈 هدف الربح اليومي: {DAILY_PROFIT_TARGET_PCT}% ({profit_target:.1f} USDT)", "",
+                      f"🎯 المخاطرة لكل صفقة: <b>{RISK_PCT_PER_TRADE}%</b>", f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT)", f"📈 هدف الربح اليومي: مفتوح (غير محدد)", "",
                       f"🔢 المفتوحة: {len(opens)} / {MAX_OPEN_POSITIONS}", f"🟢 LONG: {longs} | 🔴 SHORT: {shorts} (الحد {MAX_SAME_DIRECTION})", "",
-                      f"📅 نتيجة اليوم: <b>{snap['value']:+.2f} USDT</b>", f"🔻 المتبقي للخسارة: {loss_limit + snap['value']:+.2f} USDT", f"🔺 المتبقي للهدف: {profit_target - snap['value']:+.2f} USDT", "", f"🎯 BTC: {btc_ok} ({btc_why})", "━━━━━━━━━━━━━━━"])
+                      f"📅 نتيجة اليوم: <b>{snap['value']:+.2f} USDT</b>", f"🔻 المتبقي للخسارة: {loss_limit + snap['value']:+.2f} USDT", "", f"🎯 BTC: {btc_ok} ({btc_why})", "━━━━━━━━━━━━━━━"])
 
 def daily_text(ex):
     snap = daily_snapshot(); equity = get_equity(ex, force=True)
@@ -1120,7 +1120,7 @@ def trading_loop():
     active_symbols = [s for s in FUTURES_SYMBOLS if s in ex.markets]
     sync_positions(ex, active_symbols)
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
-    send(f"🚀 <b>تم تشغيل البوت {VERSION} (تركيز BTC + مخاطرة أعلى)</b>\n━━━━━━━━━━━━━━━\n⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة عامة: {LEVERAGE}x\n🎯 رافعة BTC: {BTC_LEVERAGE}x | حد صفقات BTC: {BTC_MAX_TRADES_PER_DAY}/يوم\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
+    send(f"🚀 <b>تم تشغيل البوت {VERSION} (بدون كولداون + أرباح مفتوحة)</b>\n━━━━━━━━━━━━━━━\n⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة عامة: {LEVERAGE}x\n🎯 رافعة BTC: {BTC_LEVERAGE}x | حد صفقات BTC: {BTC_MAX_TRADES_PER_DAY}/يوم\n⏱️ كولداون: <b>ملغي (0 دقيقة)</b>\n🎯 حد الربح اليومي: مفتوح (لا يتوقف)\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
 
     fail_streak = 0
     while True:
