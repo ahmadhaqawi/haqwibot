@@ -1,24 +1,52 @@
+# -*- coding: utf-8 -*-
+"""
+OKX Futures Trading Bot - V40 (Professional)
+
+التحسينات الرئيسية عن V39:
+- إصلاح هدف الإغلاق الجزئي الثاني (كان يعتمد على مخاطرة تتقلص بعد نقل الوقف).
+- استبدال الحماية بدون أي فجوة (وضع الوقف الجديد أولاً ثم إلغاء القديم).
+- تتبع PnL التراكمي للصفقة (الجزئيات + النهائي + الرسوم) وإدخاله في الإحصائيات اليومية.
+- سجل صفقات دائم (CSV) + أمر /stats (Win rate, Profit factor, avg R, Max DD).
+- جلب شموع ذكي (لا يعيد الجلب إلا عند إغلاق شمعة جديدة) + جلب الأسعار دفعة واحدة.
+- تقييم الإشارة مرة واحدة لكل شمعة مغلقة.
+- فلتر اتجاه BTC + حد للصفقات لكل قطاع (ارتباط العملات).
+- فلتر انزلاق السعر قبل الدخول، وسقف للهامش كنسبة من الرصيد.
+- قفل نسخة واحدة (Single instance) + أقفال أدق للخيوط.
+- تبنّي المراكز الخارجية بوقف مبني على ATR.
+- أمر /closeall يحتاج تأكيد.
+"""
 import os
-import threading
-import time
+import sys
+import csv
 import json
+import time
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
+
 import numpy as np
-import ccxt
 import pandas as pd
+import ccxt
 import requests
 from flask import Flask
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
 
 # ==========================================
-# الإعدادات - V39
+# الإعدادات
 # ==========================================
+VERSION = "V40"
 KSA_TZ = timezone(timedelta(hours=3))
+
+
+def env_float(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except ValueError:
+        return float(default)
+
 
 OKX_API_KEY = os.getenv("OKX_API_KEY", "")
 OKX_SECRET = os.getenv("OKX_SECRET", "")
@@ -35,52 +63,88 @@ FUTURES_SYMBOLS = [
     "NEAR/USDT:USDT", "APT/USDT:USDT", "SUI/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT",
     "INJ/USDT:USDT", "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT",
     "SEI/USDT:USDT", "TIA/USDT:USDT", "STX/USDT:USDT", "IMX/USDT:USDT", "RUNE/USDT:USDT",
-    "FET/USDT:USDT", "WLD/USDT:USDT", "PEPE/USDT:USDT", "WIF/USDT:USDT", "ORDI/USDT:USDT"
+    "FET/USDT:USDT", "WLD/USDT:USDT", "PEPE/USDT:USDT", "WIF/USDT:USDT", "ORDI/USDT:USDT",
 ]
 
-SCAN_INTERVAL = 55
-LEVERAGE = 5
+# قطاعات العملات (للحد من الارتباط)
+SECTORS = {
+    "major": {"BTC", "ETH", "BNB"},
+    "l1": {"SOL", "AVAX", "NEAR", "APT", "SUI", "ADA", "DOT", "ATOM", "SEI", "TIA", "INJ"},
+    "l2": {"ARB", "OP", "STX", "IMX"},
+    "meme": {"DOGE", "PEPE", "WIF"},
+    "ai": {"FET", "WLD"},
+    "legacy": {"XRP", "LTC", "BCH", "FIL", "LINK", "RUNE", "ORDI"},
+}
+MAX_PER_SECTOR_SAME_DIR = 2
+
+SCAN_INTERVAL = 30
+LEVERAGE = int(env_float("LEVERAGE", 5))
 MARGIN_MODE = "isolated"
 MAX_OPEN_POSITIONS = 5
 REENTRY_COOLDOWN_SEC = 1500
 
 # --- حجم الصفقة ---
 USE_RISK_SIZING = True
-RISK_PCT_PER_TRADE = 0.75
+RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 0.75)
 POSITION_SIZE_USDT = 50
 MIN_MARGIN_USDT = 12
 MAX_MARGIN_USDT = 130
+MAX_MARGIN_PCT_EQUITY = 0.30      # سقف الهامش لكل صفقة كنسبة من الرصيد
 
-# --- SL/TP ---
+# --- SL / TP ---
 ATR_SL_MULT = 1.55
 RR_RATIO = 2.3
 MIN_SL_PCT = 0.0065
 MAX_SL_PCT = 0.032
 TRAIL_ATR_MULT = 1.05
 BE_FEE_BUFFER = 0.0008
+BE_TRIGGER_R = 0.9
+FALLBACK_SL_PCT = 0.017           # لتبني المراكز عند فشل حساب ATR
+
+# --- الإغلاق الجزئي (بوحدات R من المخاطرة الأصلية) ---
+PARTIAL1_R, PARTIAL1_PCT = 1.3, 0.40   # 40% من الكمية الأصلية
+PARTIAL2_R, PARTIAL2_PCT = 2.1, 0.50   # 50% من المتبقي
+
+# --- الرسوم (تقديرية لكل جانب - Taker) ---
+FEE_RATE = 0.0005
 
 # --- حماية المحفظة ---
-DAILY_LOSS_LIMIT_PCT = 4.0
-DAILY_PROFIT_TARGET_PCT = 6.0
+DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 4.0)
+DAILY_PROFIT_TARGET_PCT = env_float("DAILY_PROFIT_TARGET_PCT", 6.0)
 MAX_SAME_DIRECTION = 3
 
 # --- فلاتر السوق ---
 MAX_SPREAD_PCT = 0.0011
 MAX_FUNDING_RATE = 0.00045
+MAX_ENTRY_SLIPPAGE_PCT = 0.004
+USE_BTC_FILTER = True
 
-CACHE_TTL = {"15m": 0, "1h": 280, "4h": 850}
+TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
+CACHE_TTL_FALLBACK = {"15m": 20, "1h": 280, "4h": 850}
 
 DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
+JOURNAL_FILE = os.path.join(DATA_DIR, "trades_journal.csv")
+LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
 
-state_lock = threading.Lock()
+# ==========================================
+# الحالة العامة
+# ==========================================
+state_lock = threading.RLock()
 trade_lock = threading.RLock()
+journal_lock = threading.Lock()
+
 state = {}
-meta = {"paused": False, "last_report": "", "loss_alert": "", "last_heartbeat": "", "profit_alert": ""}
+meta = {"paused": False, "last_report": "", "loss_alert": "", "profit_alert": "", "last_heartbeat": ""}
 daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
 
 _data_cache = {}
+_price_cache = {}
 _equity_cache = {"ts": 0, "value": 0.0}
+_btc_bias_cache = {"ts": 0, "value": "neutral"}
+_last_eval = {}          # sym -> timestamp آخر شمعة مغلقة تم تقييمها
+_lock_fh = None
+
 
 # ==========================================
 # Flask
@@ -88,11 +152,29 @@ _equity_cache = {"ts": 0, "value": 0.0}
 @app.route("/")
 @app.route("/healthz")
 def health_check():
-    return {"status": "ok", "service": "trading_bot_v39_commands"}, 200
+    return {"status": "ok", "service": f"trading_bot_{VERSION.lower()}"}, 200
+
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+# ==========================================
+# قفل النسخة الواحدة
+# ==========================================
+def acquire_single_instance():
+    global _lock_fh
+    try:
+        import fcntl
+        _lock_fh = open(LOCK_FILE, "w")
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except ImportError:
+        return True
+    except OSError:
+        return False
+
 
 # ==========================================
 # إدارة الحالة
@@ -100,16 +182,19 @@ def run_flask():
 def new_sym_state():
     return {
         "position": None, "entry": None, "sl": None, "tp": None,
+        "initial_sl": None, "initial_risk": 0.0,
         "contracts": 0.0, "initial_contracts": 0.0, "margin": 0.0,
-        "opened_ts": 0, "last_exit_ts": 0,
+        "opened_ts": 0, "leg_ts": 0, "last_exit_ts": 0,
+        "realized_pnl": 0.0,
         "breakeven_hit": False,
-        "partial_1_taken": False,
-        "partial_2_taken": False,
-        "regime": "unknown"
+        "partial_1_taken": False, "partial_2_taken": False,
+        "last_notified_sl": None,
+        "regime": "unknown",
     }
 
+
 def load_state():
-    global state, daily_pnl, meta
+    global state, daily_pnl
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -117,10 +202,9 @@ def load_state():
             data = json.load(f)
         loaded = {}
         for k, v in data.get("state", {}).items():
-            sym = k.split("|")[0]
             base = new_sym_state()
             base.update(v)
-            loaded[sym] = base
+            loaded[k.split("|")[0]] = base
         with state_lock:
             state = loaded
             daily_pnl = data.get("daily_pnl", daily_pnl)
@@ -128,17 +212,25 @@ def load_state():
     except Exception as e:
         log.error(f"[STATE LOAD ERROR] {e}")
 
+
 def save_state():
     try:
         with state_lock:
-            data = {"state": dict(state), "daily_pnl": daily_pnl, "meta": meta}
-            txt = json.dumps(data, ensure_ascii=False, indent=2)
+            txt = json.dumps({"state": state, "daily_pnl": daily_pnl, "meta": meta},
+                             ensure_ascii=False, indent=2)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(txt)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         log.error(f"[STATE SAVE ERROR] {e}")
+
+
+def set_meta(key, value):
+    with state_lock:
+        meta[key] = value
+    save_state()
+
 
 def roll_daily():
     global daily_pnl
@@ -147,14 +239,24 @@ def roll_daily():
         if daily_pnl.get("date") != today:
             daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": today}
 
-def update_daily_stats(pnl_usdt):
+
+def add_daily_pnl(pnl_usdt):
+    """يضيف الربح/الخسارة المحققة (جزئية أو نهائية) لإجمالي اليوم."""
     roll_daily()
     with state_lock:
         daily_pnl["value"] += pnl_usdt
+    save_state()
+
+
+def register_trade_result(total_pnl):
+    """يسجل صفقة مكتملة (للعدّاد ونسبة الربح)."""
+    roll_daily()
+    with state_lock:
         daily_pnl["trades"] += 1
-        if pnl_usdt > 0:
+        if total_pnl > 0:
             daily_pnl["wins"] += 1
     save_state()
+
 
 def reset_sym_state(sym, cooldown=True):
     with state_lock:
@@ -162,6 +264,67 @@ def reset_sym_state(sym, cooldown=True):
         s["last_exit_ts"] = time.time() if cooldown else 0
         state[sym] = s
     save_state()
+
+
+def daily_snapshot():
+    roll_daily()
+    with state_lock:
+        return dict(daily_pnl)
+
+
+# ==========================================
+# سجل الصفقات
+# ==========================================
+JOURNAL_FIELDS = ["close_time", "symbol", "side", "entry", "exit", "initial_contracts",
+                  "pnl", "r_multiple", "reason", "regime", "duration_min"]
+
+
+def journal_append(row):
+    try:
+        with journal_lock:
+            new = not os.path.exists(JOURNAL_FILE)
+            with open(JOURNAL_FILE, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS)
+                if new:
+                    w.writeheader()
+                w.writerow(row)
+    except Exception as e:
+        log.error(f"[JOURNAL] {e}")
+
+
+def stats_text():
+    try:
+        with journal_lock:
+            if not os.path.exists(JOURNAL_FILE):
+                return "📭 لا يوجد سجل صفقات بعد."
+            df = pd.read_csv(JOURNAL_FILE)
+    except Exception as e:
+        return f"خطأ في قراءة السجل: {e}"
+    if df.empty:
+        return "📭 لا يوجد سجل صفقات بعد."
+    n = len(df)
+    wins = df[df["pnl"] > 0]
+    losses = df[df["pnl"] <= 0]
+    gross_win = wins["pnl"].sum()
+    gross_loss = abs(losses["pnl"].sum())
+    pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
+    curve = df["pnl"].cumsum()
+    max_dd = (curve.cummax() - curve).max()
+    avg_r = df["r_multiple"].mean() if "r_multiple" in df else 0.0
+    wr = len(wins) / n * 100
+    avg_win = wins["pnl"].mean() if len(wins) else 0.0
+    avg_loss = losses["pnl"].mean() if len(losses) else 0.0
+    pf_txt = "∞" if pf == float("inf") else f"{pf:.2f}"
+    return (f"📈 <b>إحصائيات الأداء الكلية</b>\n━━━━━━━━━━━━━━━\n"
+            f"🔢 عدد الصفقات: {n}\n"
+            f"✅ نسبة الربح: {wr:.1f}%\n"
+            f"💰 الصافي: <b>{df['pnl'].sum():+.2f} USDT</b>\n"
+            f"⚖️ Profit Factor: {pf_txt}\n"
+            f"📐 متوسط R: {avg_r:+.2f}\n"
+            f"🟢 متوسط الربح: {avg_win:+.2f} | 🔴 متوسط الخسارة: {avg_loss:+.2f}\n"
+            f"📉 أقصى تراجع: {max_dd:.2f} USDT\n"
+            f"━━━━━━━━━━━━━━━")
+
 
 # ==========================================
 # تيليجرام
@@ -177,21 +340,27 @@ def send(msg, chat_id=None):
         except Exception as e:
             log.warning(f"[TG SEND] {e}")
 
+
 def fmt(p):
     if p is None or (isinstance(p, float) and np.isnan(p)):
         return "0.00"
     return f"{p:,.4f}" if p >= 1 else f"{p:.6f}"
+
+
+def short(sym):
+    return sym.split(":")[0]
+
 
 REASONS = {
     "Take Profit": "تحقق الهدف 🎯",
     "Stop Loss": "ضرب وقف الخسارة 🛑",
     "Breakeven Hit": "خروج آمن (Breakeven) 🛡️",
     "Trailing Stop": "خروج بوقف متحرك 📈",
-    "Partial TP": "إغلاق جزئي 💰",
     "Manual": "إغلاق يدوي 🖐️",
     "Emergency": "إغلاق طارئ 🚨",
     "Manual/External": "إغلاق من المنصة ⚡",
 }
+
 
 def msg_entry(sym, side, price, sl, tp, margin, real_order, regime=""):
     title = "🟢 <b>توصية شراء (LONG)</b>" if side == "LONG" else "🔴 <b>توصية بيع (SHORT)</b>"
@@ -204,7 +373,7 @@ def msg_entry(sym, side, price, sl, tp, margin, real_order, regime=""):
     regime_txt = f"\n📡 <b>نظام السوق:</b> {regime}" if regime else ""
     return (f"{title}\n{status}{regime_txt}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"🪙 <b>الزوج:</b> <code>{sym.split(':')[0]}</code>\n"
+            f"🪙 <b>الزوج:</b> <code>{short(sym)}</code>\n"
             f"💵 <b>سعر الدخول:</b> <code>{fmt(price)}</code>\n"
             f"⚙️ <b>الرافعة:</b> {LEVERAGE}x | <b>الهامش:</b> {margin:.2f} USDT\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -215,23 +384,26 @@ def msg_entry(sym, side, price, sl, tp, margin, real_order, regime=""):
             f"━━━━━━━━━━━━━━━\n"
             f"⏰ {now_str}")
 
-def msg_exit(sym, side, exit_price, entry_price, pnl_usd, margin, reason):
-    pct = (pnl_usd / margin * 100) if margin else 0.0
-    if pnl_usd > 0:
+
+def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margin, r_mult, reason):
+    pct = (total_pnl / margin * 100) if margin else 0.0
+    if total_pnl > 0:
         title = "🟢 <b>إغلاق بربح</b>"
-    elif pnl_usd < 0:
+    elif total_pnl < 0:
         title = "🔴 <b>إغلاق بخسارة</b>"
     else:
         title = "⚪ <b>إغلاق متعادل</b>"
     return (f"{title}\n━━━━━━━━━━━━━━━\n"
-            f"🪙 <code>{sym.split(':')[0]}</code> ({side})\n"
+            f"🪙 <code>{short(sym)}</code> ({side})\n"
             f"📥 الدخول: <code>{fmt(entry_price)}</code>\n"
             f"📤 الخروج: <code>{fmt(exit_price)}</code>\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📊 على الهامش: {pct:+.2f}%\n"
-            f"💰 النتيجة: {pnl_usd:+.2f} USDT\n"
+            f"📊 على الهامش: {pct:+.2f}% | R: {r_mult:+.2f}\n"
+            f"💰 الصافي الكلي: <b>{total_pnl:+.2f} USDT</b>\n"
+            f"🧩 الجزء الأخير: {final_leg_pnl:+.2f} USDT\n"
             f"📝 السبب: {REASONS.get(reason, reason)}\n"
             f"━━━━━━━━━━━━━━━")
+
 
 # ==========================================
 # المؤشرات
@@ -239,26 +411,33 @@ def msg_exit(sym, side, exit_price, entry_price, pnl_usd, margin, reason):
 def ema(s, p):
     return s.ewm(span=p, adjust=False).mean()
 
+
 def rsi(s, p=14):
     d = s.diff()
-    g = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
-    l = -d.clip(upper=0).ewm(alpha=1/p, adjust=False).mean()
+    g = d.clip(lower=0).ewm(alpha=1 / p, adjust=False).mean()
+    l = -d.clip(upper=0).ewm(alpha=1 / p, adjust=False).mean()
     return 100 - (100 / (1 + g / (l + 1e-9)))
 
+
 def true_range(high, low, close):
-    return pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
+                     axis=1).max(axis=1)
+
 
 def atr(high, low, close, p=14):
-    return true_range(high, low, close).ewm(alpha=1/p, adjust=False).mean()
+    return true_range(high, low, close).ewm(alpha=1 / p, adjust=False).mean()
+
 
 def adx(high, low, close, p=14):
     up, down = high.diff(), -low.diff()
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
     atr_val = atr(high, low, close, p)
-    plus_di = 100 * (plus_dm.ewm(alpha=1/p, adjust=False).mean() / (atr_val + 1e-9))
-    minus_di = 100 * (minus_dm.ewm(alpha=1/p, adjust=False).mean() / (atr_val + 1e-9))
-    return (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9) * 100).ewm(alpha=1/p, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / p, adjust=False).mean() / (atr_val + 1e-9))
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / p, adjust=False).mean() / (atr_val + 1e-9))
+    dx = abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9) * 100
+    return dx.ewm(alpha=1 / p, adjust=False).mean()
+
 
 def add_indicators(df):
     if len(df) < 60:
@@ -267,14 +446,12 @@ def add_indicators(df):
     df["ema9"] = ema(df["close"], 9)
     df["ema21"] = ema(df["close"], 21)
     df["ema50"] = ema(df["close"], 50)
-    df["ema200"] = ema(df["close"], 200) if len(df) >= 200 else ema(df["close"], 50)
     df["rsi"] = rsi(df["close"])
     df["adx"] = adx(df["high"], df["low"], df["close"])
     df["atr"] = atr(df["high"], df["low"], df["close"])
     df["vol_ma"] = df["volume"].rolling(20).mean()
-    df["high20"] = df["high"].rolling(20).max().shift(1)
-    df["low20"] = df["low"].rolling(20).min().shift(1)
     return df
+
 
 # ==========================================
 # المنصة (OKX)
@@ -286,18 +463,43 @@ def create_exchange():
         'password': OKX_PASSPHRASE,
         'enableRateLimit': True,
         'options': {'defaultType': 'swap'},
-        'timeout': 20000
+        'timeout': 20000,
     })
     if USE_SANDBOX:
         ex.set_sandbox_mode(True)
     return ex
 
-def get_current_price(ex, sym):
+
+def init_exchange():
+    ex = create_exchange()
+    ex.load_markets()
+    return ex
+
+
+def refresh_prices(ex, symbols):
+    """جلب أسعار كل الرموز بطلب واحد."""
     try:
-        return float(ex.fetch_ticker(sym)['last'])
+        tickers = ex.fetch_tickers(symbols)
+        now = time.time()
+        for s, t in tickers.items():
+            if t.get('last'):
+                _price_cache[s] = (now, float(t['last']))
+    except Exception as e:
+        log.warning(f"[PRICES] {e}")
+
+
+def get_current_price(ex, sym, max_age=20):
+    c = _price_cache.get(sym)
+    if c and time.time() - c[0] <= max_age:
+        return c[1]
+    try:
+        p = float(ex.fetch_ticker(sym)['last'])
+        _price_cache[sym] = (time.time(), p)
+        return p
     except Exception as e:
         log.warning(f"[PRICE] {sym}: {e}")
-        return None
+        return c[1] if c else None
+
 
 def get_equity(ex, force=False):
     if not force and time.time() - _equity_cache["ts"] < 60 and _equity_cache["value"] > 0:
@@ -312,31 +514,43 @@ def get_equity(ex, force=False):
         log.warning(f"[EQUITY] {e}")
         return _equity_cache["value"]
 
+
 def contract_size(ex, sym):
     try:
         return float(ex.market(sym).get('contractSize') or 1)
     except Exception:
         return 1.0
 
+
+def min_amount(ex, sym):
+    try:
+        return float(ex.market(sym).get('limits', {}).get('amount', {}).get('min') or 1.0)
+    except Exception:
+        return 1.0
+
+
 def calculate_contracts(ex, sym, margin, price, lev):
     try:
         market = ex.market(sym)
         raw = (margin * lev) / (price * float(market.get('contractSize') or 1))
         amt = float(ex.amount_to_precision(sym, raw))
-        min_amount = float(market.get('limits', {}).get('amount', {}).get('min') or 1.0)
-        return amt if amt >= min_amount else 0.0
+        return amt if amt >= min_amount(ex, sym) else 0.0
     except Exception as e:
         log.warning(f"[AMOUNT] {sym}: {e}")
         return 0.0
+
 
 def compute_margin(equity, sl_pct):
     if not USE_RISK_SIZING or equity <= 0:
         return float(POSITION_SIZE_USDT)
     risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
     margin = risk_usd / (sl_pct * LEVERAGE)
-    return max(MIN_MARGIN_USDT, min(MAX_MARGIN_USDT, margin))
+    cap = min(MAX_MARGIN_USDT, equity * MAX_MARGIN_PCT_EQUITY)
+    return max(min(MIN_MARGIN_USDT, cap), min(cap, margin))
+
 
 def get_open_position(ex, sym):
+    """يرجع None فقط إذا لا يوجد مركز. أي خطأ API يرفع Exception (لا نفترض الإغلاق)."""
     for p in ex.fetch_positions([sym]):
         contracts = abs(float(p.get('contracts') or 0))
         if contracts > 0:
@@ -344,33 +558,44 @@ def get_open_position(ex, sym):
                 "side": "LONG" if p.get('side') == 'long' else "SHORT",
                 "contracts": contracts,
                 "entry": float(p.get('entryPrice') or 0),
-                "margin": float(p.get('initialMargin') or 0)
+                "margin": float(p.get('initialMargin') or 0),
             }
     return None
 
-def get_protection(ex, sym):
-    has_sl = has_tp = False
+
+# ---------- أوامر الحماية (Algo) ----------
+def get_algos(ex, sym):
+    """قائمة أوامر الحماية المعلقة: [{'id','is_sl','is_tp'}]"""
+    out = []
+    market = ex.market(sym)
+    algo = ex.privateGetTradeOrdersAlgoPending({'instId': market['id'], 'ordType': 'conditional'})
+    for o in (algo.get('data') or []):
+        out.append({"id": o.get('algoId'),
+                    "is_sl": bool(o.get('slTriggerPx')),
+                    "is_tp": bool(o.get('tpTriggerPx'))})
+    return out
+
+
+def has_protection(ex, sym):
     try:
-        market = ex.market(sym)
-        algo = ex.privateGetTradeOrdersAlgoPending({'instId': market['id'], 'ordType': 'conditional'})
-        for o in (algo.get('data') or []):
-            if o.get('slTriggerPx'):
-                has_sl = True
-            if o.get('tpTriggerPx'):
-                has_tp = True
+        algos = get_algos(ex, sym)
+        return any(a["is_sl"] for a in algos), any(a["is_tp"] for a in algos)
     except Exception:
-        pass
-    return has_sl, has_tp
+        return True, True   # عند فشل الاستعلام لا نتخذ إجراء مبنياً على افتراض خاطئ
+
+
+def cancel_algo_ids(ex, sym, ids):
+    market = ex.market(sym)
+    for aid in ids:
+        try:
+            ex.privatePostTradeCancelAlgos([{'instId': market['id'], 'algoId': aid}])
+        except Exception as e:
+            log.warning(f"[CANCEL ALGO] {sym} {aid}: {e}")
+
 
 def cancel_pending(ex, sym):
     try:
-        market = ex.market(sym)
-        algo = ex.privateGetTradeOrdersAlgoPending({'instId': market['id'], 'ordType': 'conditional'})
-        for o in (algo.get('data') or []):
-            try:
-                ex.privatePostTradeCancelAlgos([{'instId': market['id'], 'algoId': o['algoId']}])
-            except Exception:
-                pass
+        cancel_algo_ids(ex, sym, [a["id"] for a in get_algos(ex, sym)])
         for o in ex.fetch_open_orders(sym):
             try:
                 ex.cancel_order(o['id'], sym)
@@ -379,13 +604,14 @@ def cancel_pending(ex, sym):
     except Exception as e:
         log.warning(f"[CANCEL PENDING] {sym}: {e}")
 
+
 def place_sl_tp(ex, sym, side, contracts, trigger, is_sl):
     trig_str = str(ex.price_to_precision(sym, trigger))
     amt_str = str(ex.amount_to_precision(sym, contracts))
     market = ex.market(sym)
     req = {
         'instId': market['id'], 'tdMode': MARGIN_MODE, 'side': side,
-        'posSide': 'net', 'ordType': 'conditional', 'sz': amt_str, 'reduceOnly': 'true'
+        'posSide': 'net', 'ordType': 'conditional', 'sz': amt_str, 'reduceOnly': 'true',
     }
     if is_sl:
         req.update({'slTriggerPx': trig_str, 'slOrdPx': '-1'})
@@ -397,16 +623,18 @@ def place_sl_tp(ex, sym, side, contracts, trigger, is_sl):
         raise Exception(f"algo rejected: {data.get('sMsg')}")
     return res
 
+
 def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
     sl_ok = tp_ok = False
-    for i in range(retries):
-        try:
-            place_sl_tp(ex, sym, close_side, contracts, sl, True)
-            sl_ok = True
-            break
-        except Exception as e:
-            log.error(f"[SL ERR] {sym} try {i+1}: {e}")
-            time.sleep(0.8)
+    if sl is not None:
+        for i in range(retries):
+            try:
+                place_sl_tp(ex, sym, close_side, contracts, sl, True)
+                sl_ok = True
+                break
+            except Exception as e:
+                log.error(f"[SL ERR] {sym} try {i + 1}: {e}")
+                time.sleep(0.8)
     if tp is not None and contracts > 0:
         for i in range(retries):
             try:
@@ -414,34 +642,48 @@ def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
                 tp_ok = True
                 break
             except Exception as e:
-                log.error(f"[TP ERR] {sym} try {i+1}: {e}")
+                log.error(f"[TP ERR] {sym} try {i + 1}: {e}")
                 time.sleep(0.8)
     return sl_ok, tp_ok
 
-def close_position_safe(ex, sym, pos_data, amount=None):
+
+def replace_protection(ex, sym, close_side, contracts, sl, tp=None):
+    """
+    استبدال الحماية بدون أي فجوة: نضع الأوامر الجديدة أولاً،
+    وبعد نجاحها فقط نلغي القديمة. إذا فشل الوقف الجديد تبقى القديمة كما هي.
+    """
     try:
-        side = pos_data["position"]
-        close_side = 'sell' if side == "LONG" else 'buy'
-        contracts = pos_data["contracts"]
-        close_amt = amount if amount and amount < contracts else contracts
-        ex.create_order(sym, 'market', close_side, close_amt, None,
-                        {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
-        time.sleep(0.8)
-        cancel_pending(ex, sym)
-        if close_amt >= contracts:
+        old = get_algos(ex, sym)
+    except Exception as e:
+        log.warning(f"[REPLACE] list failed {sym}: {e}")
+        old = []
+    sl_ok, tp_ok = protect_position(ex, sym, close_side, contracts, sl, tp)
+    if not sl_ok:
+        return False
+    ids = [a["id"] for a in old if a["is_sl"] or (tp is not None and tp_ok and a["is_tp"])]
+    cancel_algo_ids(ex, sym, ids)
+    return True
+
+
+def close_full(ex, sym):
+    """إغلاق كامل للمركز مع التحقق الفعلي من الإغلاق."""
+    try:
+        pos = get_open_position(ex, sym)
+        if pos is None:
+            cancel_pending(ex, sym)
             return True
-        remaining = contracts - close_amt
-        be_sl = pos_data["entry"] * (1 + BE_FEE_BUFFER) if side == "LONG" else pos_data["entry"] * (1 - BE_FEE_BUFFER)
-        sl_ok, _ = protect_position(ex, sym, close_side, remaining, be_sl, pos_data.get("tp"))
-        if not sl_ok:
-            log.error(f"[PARTIAL PROTECT FAIL] {sym} — إغلاق طارئ للمتبقي")
-            ex.create_order(sym, 'market', close_side, remaining, None,
-                            {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
+        close_side = 'sell' if pos["side"] == "LONG" else 'buy'
+        ex.create_order(sym, 'market', close_side, pos["contracts"], None,
+                        {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
+        time.sleep(1.0)
+        if get_open_position(ex, sym) is not None:
             return False
+        cancel_pending(ex, sym)
         return True
     except Exception as e:
-        log.error(f"[CLOSE SAFE ERR] {sym}: {e}")
+        log.error(f"[CLOSE FULL ERR] {sym}: {e}")
         return False
+
 
 def open_position(ex, sym, side, price, sl, tp, margin):
     try:
@@ -455,7 +697,8 @@ def open_position(ex, sym, side, price, sl, tp, margin):
         cancel_pending(ex, sym)
         order_side = 'buy' if side == "LONG" else 'sell'
         close_side = 'sell' if side == "LONG" else 'buy'
-        order = ex.create_order(sym, 'market', order_side, amount, None, {'tdMode': MARGIN_MODE, 'posSide': 'net'})
+        order = ex.create_order(sym, 'market', order_side, amount, None,
+                                {'tdMode': MARGIN_MODE, 'posSide': 'net'})
         time.sleep(1.1)
         entry, contracts = price, amount
         try:
@@ -467,24 +710,33 @@ def open_position(ex, sym, side, price, sl, tp, margin):
             log.warning(f"[POS FETCH] {sym}: {e}")
         sl_ok, tp_ok = protect_position(ex, sym, close_side, contracts, sl, tp)
         if not sl_ok:
-            send(f"🚨 فشل وضع وقف الخسارة لـ <code>{sym.split(':')[0]}</code> — جاري الإغلاق.")
-            ex.create_order(sym, 'market', close_side, contracts, None,
-                            {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
+            send(f"🚨 فشل وضع وقف الخسارة لـ <code>{short(sym)}</code> — جاري الإغلاق.")
+            if not close_full(ex, sym):
+                send(f"🆘 فشل إغلاق <code>{short(sym)}</code> بعد فشل الوقف! تدخل يدوي فوراً.")
             return False, "فشل وضع SL", entry, 0.0
         if not tp_ok:
-            send(f"⚠️ تم وضع SL لكن فشل TP لـ <code>{sym.split(':')[0]}</code>")
+            send(f"⚠️ تم وضع SL لكن فشل TP لـ <code>{short(sym)}</code>")
         return True, order.get('id'), entry, contracts
     except Exception as e:
         log.error(f"[OPEN ERR] {sym}: {e}")
         return False, str(e), price, 0.0
 
+
 # ==========================================
-# إنهاء الصفقة
+# حساب الربح وإنهاء الصفقة
 # ==========================================
+def leg_pnl(side, entry, exit_price, contracts, cs):
+    """ربح جزء من الصفقة بعد خصم الرسوم التقديرية."""
+    d = 1 if side == "LONG" else -1
+    gross = (exit_price - entry) * d * contracts * cs
+    fees = (entry + exit_price) * contracts * cs * FEE_RATE
+    return gross - fees
+
+
 def get_exit_price(ex, sym, pos_data):
     try:
         close_side = 'sell' if pos_data["position"] == "LONG" else 'buy'
-        since = int(pos_data.get("opened_ts", 0) * 1000) - 8000
+        since = int(max(pos_data.get("leg_ts") or 0, pos_data.get("opened_ts") or 0) * 1000) - 8000
         trades = ex.fetch_my_trades(sym, since=since, limit=80)
         fills = [t for t in trades if t.get('side') == close_side and t.get('price') and t.get('amount')]
         total = sum(float(t['amount']) for t in fills)
@@ -493,6 +745,7 @@ def get_exit_price(ex, sym, pos_data):
     except Exception as e:
         log.warning(f"[EXIT PRICE] {sym}: {e}")
     return None
+
 
 def detect_reason(pos_data, exit_price):
     side, entry, sl, tp = pos_data["position"], pos_data["entry"], pos_data["sl"], pos_data["tp"]
@@ -505,35 +758,96 @@ def detect_reason(pos_data, exit_price):
         return "Stop Loss"
     return "Manual/External"
 
+
 def finalize_trade(ex, sym, reason_hint=None):
     with state_lock:
         pos_data = dict(state.get(sym, {}))
     if not pos_data.get("position"):
         return
     side, entry = pos_data["position"], pos_data["entry"]
-    exit_price = get_exit_price(ex, sym, pos_data) or get_current_price(ex, sym) or entry
+    exit_price = get_exit_price(ex, sym, pos_data) or get_current_price(ex, sym, 0) or entry
     cs = contract_size(ex, sym)
-    direction = 1 if side == "LONG" else -1
-    pnl = (exit_price - entry) * direction * pos_data.get("contracts", 0.0) * cs
+    final_leg = leg_pnl(side, entry, exit_price, pos_data.get("contracts", 0.0), cs)
+    total = pos_data.get("realized_pnl", 0.0) + final_leg
     margin = pos_data.get("margin") or POSITION_SIZE_USDT
     reason = reason_hint or detect_reason(pos_data, exit_price)
-    update_daily_stats(pnl)
+
+    risk_usd = pos_data.get("initial_risk", 0.0) * pos_data.get("initial_contracts", 0.0) * cs
+    r_mult = (total / risk_usd) if risk_usd > 0 else 0.0
+    duration = int((time.time() - (pos_data.get("opened_ts") or time.time())) / 60)
+
+    add_daily_pnl(final_leg)            # الجزئيات أُضيفت سابقاً
+    register_trade_result(total)
+    journal_append({
+        "close_time": datetime.now(KSA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": short(sym), "side": side, "entry": entry, "exit": exit_price,
+        "initial_contracts": pos_data.get("initial_contracts", 0.0),
+        "pnl": round(total, 4), "r_multiple": round(r_mult, 3),
+        "reason": reason, "regime": pos_data.get("regime", ""), "duration_min": duration,
+    })
     reset_sym_state(sym, cooldown=True)
     cancel_pending(ex, sym)
-    send(msg_exit(sym, side, exit_price, entry, pnl, margin, reason))
+    send(msg_exit(sym, side, exit_price, entry, total, final_leg, margin, r_mult, reason))
+
 
 def emergency_close(ex, sym, why):
-    send(f"🚨 <b>إغلاق طارئ</b> <code>{sym.split(':')[0]}</code>\n{why}")
-    with state_lock:
-        pos_data = dict(state.get(sym, {}))
-    if pos_data.get("position"):
-        if close_position_safe(ex, sym, pos_data):
-            finalize_trade(ex, sym, reason_hint="Emergency")
-        else:
-            send(f"🆘 فشل الإغلاق الطارئ لـ <code>{sym.split(':')[0]}</code>")
+    send(f"🚨 <b>إغلاق طارئ</b> <code>{short(sym)}</code>\n{why}")
+    if close_full(ex, sym):
+        finalize_trade(ex, sym, reason_hint="Emergency")
+    else:
+        send(f"🆘 فشل الإغلاق الطارئ لـ <code>{short(sym)}</code>")
+
 
 # ==========================================
-# كشف نظام السوق + الاستراتيجية
+# البيانات
+# ==========================================
+def fetch_data(ex, sym, tf, limit=130):
+    """
+    الكاش ذكي: يُعاد الجلب فقط بعد إغلاق الشمعة الحالية (آخر شمعة في البيانات هي الشمعة الجارية).
+    """
+    key = (sym, tf)
+    cached = _data_cache.get(key)
+    now_ms = time.time() * 1000
+    if cached and cached[1]:
+        last_ts = cached[1][-1][0]
+        if now_ms < last_ts + TF_MS.get(tf, 60_000) + 1500:
+            return cached[1]
+    for _ in range(3):
+        try:
+            data = ex.fetch_ohlcv(sym, tf, limit=limit)
+            _data_cache[key] = (time.time(), data)
+            return data
+        except Exception as e:
+            log.warning(f"[OHLCV] {sym} {tf}: {e}")
+            time.sleep(1.3)
+    return cached[1] if cached else []
+
+
+def to_df(raw):
+    return add_indicators(pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"]))
+
+
+def btc_bias(ex):
+    """اتجاه BTC على فريم الساعة: up / down / neutral."""
+    if time.time() - _btc_bias_cache["ts"] < 120:
+        return _btc_bias_cache["value"]
+    val = "neutral"
+    try:
+        raw = fetch_data(ex, "BTC/USDT:USDT", "1h")
+        if len(raw) >= 60:
+            r = to_df(raw).iloc[-2]
+            if r["close"] > r["ema50"] and r["ema21"] > r["ema50"] and r["ema9"] > r["ema21"]:
+                val = "up"
+            elif r["close"] < r["ema50"] and r["ema21"] < r["ema50"] and r["ema9"] < r["ema21"]:
+                val = "down"
+    except Exception as e:
+        log.warning(f"[BTC BIAS] {e}")
+    _btc_bias_cache.update({"ts": time.time(), "value": val})
+    return val
+
+
+# ==========================================
+# نظام السوق + الاستراتيجية
 # ==========================================
 def detect_regime(df_15m, df_1h, df_4h):
     if len(df_4h) < 50 or len(df_1h) < 50:
@@ -554,6 +868,7 @@ def detect_regime(df_15m, df_1h, df_4h):
         return "weak_trend"
     return "range"
 
+
 def check_entry_signal(df_15m, df_1h, df_4h):
     if len(df_15m) < 70 or len(df_1h) < 60 or len(df_4h) < 60:
         return None
@@ -571,34 +886,30 @@ def check_entry_signal(df_15m, df_1h, df_4h):
     rsi_val = float(last["rsi"])
     adx_val = float(last["adx"])
     regime = detect_regime(df_15m, df_1h, df_4h)
-    if regime == "range":
+    if regime in ("range", "unknown"):
         return None
     atr_pct = atr_val / price
     if atr_pct < 0.004 or atr_pct > 0.045:
         return None
-    vol_ok = last["volume"] > 1.2 * last["vol_ma"]
-    if not vol_ok or adx_val < 23:
+    if not (last["volume"] > 1.2 * last["vol_ma"]) or adx_val < 23:
         return None
-    dist_ema21 = abs(price - ema21) / price
-    dist_ema50 = abs(price - ema50) / price
-    near_ema = dist_ema21 < 0.011 or dist_ema50 < 0.016
+    near_ema = abs(price - ema21) / price < 0.011 or abs(price - ema50) / price < 0.016
     bullish_reject = last["close"] > last["open"] and (last["low"] < ema21 or prev["low"] < ema21)
     bearish_reject = last["close"] < last["open"] and (last["high"] > ema21 or prev["high"] > ema21)
     sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * atr_val / price))
     tp_pct = sl_pct * RR_RATIO
     if regime in ("strong_trend_up", "weak_trend") and last_4h["close"] > last_4h["ema50"]:
-        if (last["ema9"] > last["ema21"] and last_1h["ema9"] > last_1h["ema21"]) and near_ema and 40 < rsi_val < 61 and bullish_reject:
-            return {
-                "side": "LONG", "price": price, "sl_pct": sl_pct,
-                "sl": price * (1 - sl_pct), "tp": price * (1 + tp_pct), "regime": regime
-            }
+        if (last["ema9"] > last["ema21"] and last_1h["ema9"] > last_1h["ema21"]
+                and near_ema and 40 < rsi_val < 61 and bullish_reject):
+            return {"side": "LONG", "price": price, "sl_pct": sl_pct,
+                    "sl": price * (1 - sl_pct), "tp": price * (1 + tp_pct), "regime": regime}
     if regime in ("strong_trend_down", "weak_trend") and last_4h["close"] < last_4h["ema50"]:
-        if (last["ema9"] < last["ema21"] and last_1h["ema9"] < last_1h["ema21"]) and near_ema and 39 < rsi_val < 60 and bearish_reject:
-            return {
-                "side": "SHORT", "price": price, "sl_pct": sl_pct,
-                "sl": price * (1 + sl_pct), "tp": price * (1 - tp_pct), "regime": regime
-            }
+        if (last["ema9"] < last["ema21"] and last_1h["ema9"] < last_1h["ema21"]
+                and near_ema and 39 < rsi_val < 60 and bearish_reject):
+            return {"side": "SHORT", "price": price, "sl_pct": sl_pct,
+                    "sl": price * (1 + sl_pct), "tp": price * (1 - tp_pct), "regime": regime}
     return None
+
 
 def market_filters_ok(ex, sym, side):
     try:
@@ -619,162 +930,196 @@ def market_filters_ok(ex, sym, side):
         pass
     return True, ""
 
-def fetch_data(ex, sym, tf, limit=130):
-    key = (sym, tf)
-    ttl = CACHE_TTL.get(tf, 0)
-    cached = _data_cache.get(key)
-    if cached and ttl and time.time() - cached[0] < ttl:
-        return cached[1]
-    for _ in range(3):
-        try:
-            data = ex.fetch_ohlcv(sym, tf, limit=limit)
-            _data_cache[key] = (time.time(), data)
-            return data
-        except Exception as e:
-            log.warning(f"[OHLCV] {sym} {tf}: {e}")
-            time.sleep(1.3)
-    return []
 
-def to_df(raw):
-    return add_indicators(pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"]))
+def sector_of(sym):
+    base = sym.split("/")[0]
+    for name, members in SECTORS.items():
+        if base in members:
+            return name
+    return "other"
+
+
+def sector_limit_reached(sym, side):
+    sec = sector_of(sym)
+    with state_lock:
+        n = sum(1 for s, v in state.items()
+                if v.get("position") == side and sector_of(s) == sec)
+    return n >= MAX_PER_SECTOR_SAME_DIR
+
 
 # ==========================================
 # إدارة الصفقة المتقدمة
 # ==========================================
-def move_sl(ex, sym, pos_data, new_sl, title):
-    side = pos_data["position"]
+def breakeven_price(side, entry):
+    return entry * (1 + BE_FEE_BUFFER) if side == "LONG" else entry * (1 - BE_FEE_BUFFER)
+
+
+def move_sl(ex, sym, st, new_sl, title, notify=True):
+    side = st["position"]
     close_side = 'sell' if side == "LONG" else 'buy'
-    contracts = pos_data["contracts"]
-    cancel_pending(ex, sym)
-    sl_ok, tp_ok = protect_position(ex, sym, close_side, contracts, new_sl, pos_data.get("tp"))
-    if not sl_ok:
-        protect_position(ex, sym, close_side, contracts, pos_data["sl"], None)
+    if not replace_protection(ex, sym, close_side, st["contracts"], new_sl, None):
         return False
     with state_lock:
         state[sym]["sl"] = new_sl
         state[sym]["breakeven_hit"] = True
+        prev_notified = state[sym].get("last_notified_sl")
+        risk = state[sym].get("initial_risk") or 0
+        big_move = (prev_notified is None or risk <= 0 or abs(new_sl - prev_notified) >= 0.3 * risk)
+        if notify and big_move:
+            state[sym]["last_notified_sl"] = new_sl
     save_state()
-    send(f"{title}\n━━━━━━━━━━━━━━━\n🪙 <code>{sym.split(':')[0]}</code>\n🛑 الوقف الجديد: <code>{fmt(new_sl)}</code>")
+    if notify and big_move:
+        send(f"{title}\n━━━━━━━━━━━━━━━\n🪙 <code>{short(sym)}</code>\n🛑 الوقف الجديد: <code>{fmt(new_sl)}</code>")
     return True
 
-def manage_partials(ex, sym, pos_data, price):
-    side = pos_data["position"]
-    entry = pos_data["entry"]
-    risk = abs(entry - pos_data["sl"])
-    if risk <= 0:
-        return False
-    contracts = pos_data["contracts"]
-    if not pos_data.get("partial_1_taken"):
-        target1 = entry + 1.3 * risk if side == "LONG" else entry - 1.3 * risk
-        reached = price >= target1 if side == "LONG" else price <= target1
-        if reached and contracts > 0:
-            close_amt = contracts * 0.40
-            if close_position_safe(ex, sym, pos_data, amount=close_amt):
-                new_contracts = contracts - close_amt
-                be_sl = entry * (1 + BE_FEE_BUFFER) if side == "LONG" else entry * (1 - BE_FEE_BUFFER)
-                with state_lock:
-                    state[sym]["contracts"] = new_contracts
-                    state[sym]["partial_1_taken"] = True
-                    state[sym]["sl"] = be_sl
-                    state[sym]["breakeven_hit"] = True
-                save_state()
-                send(f"💰 <b>إغلاق جزئي أول (40%)</b> — <code>{sym.split(':')[0]}</code>\nتم تأمين الأرباح + نقل الوقف للتعادل")
-                return True
-    if pos_data.get("partial_1_taken") and not pos_data.get("partial_2_taken"):
-        target2 = entry + 2.1 * risk if side == "LONG" else entry - 2.1 * risk
-        reached = price >= target2 if side == "LONG" else price <= target2
-        if reached and contracts > 0:
-            close_amt = contracts * 0.50
-            if close_position_safe(ex, sym, pos_data, amount=close_amt):
-                new_contracts = contracts - close_amt
-                with state_lock:
-                    state[sym]["contracts"] = new_contracts
-                    state[sym]["partial_2_taken"] = True
-                save_state()
-                send(f"💰 <b>إغلاق جزئي ثاني</b> — <code>{sym.split(':')[0]}</code>\nتم قفل المزيد من الأرباح")
-                return True
-    return False
 
-def manage_position(ex, sym, pos_data):
-    side = pos_data["position"]
-    entry = pos_data["entry"]
-    sl = pos_data["sl"]
+def do_partial(ex, sym, st, which):
+    """إغلاق جزئي: أمر سوق reduce-only ثم استبدال الحماية بالكمية المتبقية بدون فجوة."""
+    side = st["position"]
+    entry = st["entry"]
+    close_side = 'sell' if side == "LONG" else 'buy'
+    contracts = st["contracts"]
+    if which == 1:
+        raw_amt = st["initial_contracts"] * PARTIAL1_PCT
+    else:
+        raw_amt = contracts * PARTIAL2_PCT
+    amt = float(ex.amount_to_precision(sym, raw_amt))
+    mn = min_amount(ex, sym)
+    remaining = contracts - amt
+    if amt < mn or remaining < mn:
+        # كمية صغيرة جداً للتجزئة: نعتبر المرحلة منفذة ونكمل
+        with state_lock:
+            state[sym][f"partial_{which}_taken"] = True
+        save_state()
+        return False
+    try:
+        ex.create_order(sym, 'market', close_side, amt, None,
+                        {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
+    except Exception as e:
+        log.error(f"[PARTIAL ORDER] {sym}: {e}")
+        return False
+    time.sleep(0.8)
+    exit_price = get_current_price(ex, sym, 0) or entry
+    pnl = leg_pnl(side, entry, exit_price, amt, contract_size(ex, sym))
+
+    new_sl = breakeven_price(side, entry) if which == 1 else st["sl"]
+    # الحماية الجديدة بالكمية المتبقية (SL + TP) ثم إلغاء القديمة
+    protected = replace_protection(ex, sym, close_side, remaining, new_sl, st.get("tp"))
+
+    with state_lock:
+        s = state[sym]
+        s["contracts"] = remaining
+        s[f"partial_{which}_taken"] = True
+        s["realized_pnl"] = s.get("realized_pnl", 0.0) + pnl
+        s["leg_ts"] = time.time()
+        if which == 1 and protected:
+            s["sl"] = new_sl
+            s["breakeven_hit"] = True
+    add_daily_pnl(pnl)
+    save_state()
+    pct_txt = f"{int(PARTIAL1_PCT * 100)}% من الكمية" if which == 1 else f"{int(PARTIAL2_PCT * 100)}% من المتبقي"
+    extra = "نقل الوقف للتعادل" if (which == 1 and protected) else "قفل أرباح إضافية"
+    warn = "" if protected else "\n⚠️ تعذر تحديث الحماية — سيُعاد المحاولة تلقائياً."
+    send(f"💰 <b>إغلاق جزئي {which} ({pct_txt})</b> — <code>{short(sym)}</code>\n"
+         f"ربح الجزء: {pnl:+.2f} USDT | {extra}{warn}")
+    return True
+
+
+def manage_position(ex, sym, st):
+    side = st["position"]
+    entry = st["entry"]
+    d = 1 if side == "LONG" else -1
     price = get_current_price(ex, sym)
     if not price:
         return
-    try:
-        has_sl, _ = get_protection(ex, sym)
-        if not has_sl:
-            close_side = 'sell' if side == "LONG" else 'buy'
-            sl_ok, _ = protect_position(ex, sym, close_side, pos_data["contracts"], sl, pos_data.get("tp"))
-            if not sl_ok:
-                emergency_close(ex, sym, "الصفقة بدون وقف خسارة")
-                return
-    except Exception:
-        pass
-    if manage_partials(ex, sym, pos_data, price):
+    close_side = 'sell' if side == "LONG" else 'buy'
+
+    # 1) التأكد من وجود وقف خسارة
+    has_sl, _ = has_protection(ex, sym)
+    if not has_sl:
+        ok = replace_protection(ex, sym, close_side, st["contracts"], st["sl"], st.get("tp"))
+        if not ok:
+            emergency_close(ex, sym, "الصفقة بدون وقف خسارة")
+            return
+
+    # 2) المخاطرة الأصلية ثابتة (لا تتأثر بنقل الوقف)
+    risk = st.get("initial_risk") or abs(entry - (st.get("initial_sl") or st["sl"]))
+    if risk <= 0:
         return
-    if not pos_data.get("breakeven_hit"):
-        risk = abs(entry - sl)
-        trigger = entry + risk * 0.9 if side == "LONG" else entry - risk * 0.9
-        if (price >= trigger if side == "LONG" else price <= trigger):
-            be_sl = entry * (1 + BE_FEE_BUFFER) if side == "LONG" else entry * (1 - BE_FEE_BUFFER)
-            move_sl(ex, sym, pos_data, be_sl, "🛡️ تأمين الصفقة (Breakeven)")
+    r_now = (price - entry) * d / risk
+
+    # 3) الإغلاقات الجزئية
+    if not st.get("partial_1_taken") and r_now >= PARTIAL1_R:
+        if do_partial(ex, sym, st, 1):
+            return
+    elif st.get("partial_1_taken") and not st.get("partial_2_taken") and r_now >= PARTIAL2_R:
+        if do_partial(ex, sym, st, 2):
+            return
+
+    # 4) Breakeven
+    if not st.get("breakeven_hit"):
+        if r_now >= BE_TRIGGER_R:
+            move_sl(ex, sym, st, breakeven_price(side, entry), "🛡️ تأمين الصفقة (Breakeven)")
         return
+
+    # 5) Trailing
     raw = fetch_data(ex, sym, "15m")
     if len(raw) < 50:
         return
-    df = to_df(raw)
-    atr_val = df.iloc[-2].get("atr")
+    atr_val = to_df(raw).iloc[-2].get("atr")
     if atr_val is None or pd.isna(atr_val):
         return
     mult = TRAIL_ATR_MULT
-    if pos_data.get("partial_2_taken"):
+    if st.get("partial_2_taken"):
         mult *= 0.82
-    elif pos_data.get("partial_1_taken"):
+    elif st.get("partial_1_taken"):
         mult *= 0.90
+    be = breakeven_price(side, entry)
+    sl = st["sl"]
     if side == "LONG":
-        new_sl = price - mult * float(atr_val)
+        new_sl = max(price - mult * float(atr_val), be)
         if new_sl > sl * 1.001 and new_sl < price:
-            move_sl(ex, sym, pos_data, new_sl, "📈 تحريك الوقف المتحرك")
+            move_sl(ex, sym, st, new_sl, "📈 تحريك الوقف المتحرك")
     else:
-        new_sl = price + mult * float(atr_val)
+        new_sl = min(price + mult * float(atr_val), be)
         if new_sl < sl * 0.999 and new_sl > price:
-            move_sl(ex, sym, pos_data, new_sl, "📈 تحريك الوقف المتحرك")
+            move_sl(ex, sym, st, new_sl, "📈 تحريك الوقف المتحرك")
+
 
 # ==========================================
-# معالجة الرموز
+# السماح بالدخول
 # ==========================================
 def entries_allowed(ex):
     if meta.get("paused"):
         return False
-    roll_daily()
+    snap = daily_snapshot()
     equity = get_equity(ex)
     if equity <= 0:
         return True
-    if daily_pnl["value"] <= -equity * DAILY_LOSS_LIMIT_PCT / 100.0:
-        today = daily_pnl["date"]
-        if meta.get("loss_alert") != today:
-            meta["loss_alert"] = today
-            save_state()
-            send(f"⛔ <b>وصلنا حد الخسارة اليومي</b>\nتم إيقاف الصفقات الجديدة")
+    if snap["value"] <= -equity * DAILY_LOSS_LIMIT_PCT / 100.0:
+        if meta.get("loss_alert") != snap["date"]:
+            set_meta("loss_alert", snap["date"])
+            send("⛔ <b>وصلنا حد الخسارة اليومي</b>\nتم إيقاف الصفقات الجديدة")
         return False
-    if daily_pnl["value"] >= equity * DAILY_PROFIT_TARGET_PCT / 100.0:
-        today = daily_pnl["date"]
-        if meta.get("profit_alert") != today:
-            meta["profit_alert"] = today
-            save_state()
-            send(f"✅ <b>تحقق الهدف اليومي للربح</b>\nتم إيقاف الدخول لحماية الأرباح")
+    if snap["value"] >= equity * DAILY_PROFIT_TARGET_PCT / 100.0:
+        if meta.get("profit_alert") != snap["date"]:
+            set_meta("profit_alert", snap["date"])
+            send("✅ <b>تحقق الهدف اليومي للربح</b>\nتم إيقاف الدخول لحماية الأرباح")
         return False
     return True
 
+
+# ==========================================
+# معالجة الرموز
+# ==========================================
 def process_symbol(ex, sym):
     try:
         with trade_lock:
             with state_lock:
-                if sym not in state:
-                    state[sym] = new_sym_state()
-                pos_data = dict(state[sym])
+                st = state.setdefault(sym, new_sym_state())
+                pos_data = dict(st)
+
+            # --- إدارة مركز قائم ---
             if pos_data.get("position") is not None:
                 exch_pos = get_open_position(ex, sym)
                 if exch_pos is None:
@@ -782,8 +1127,11 @@ def process_symbol(ex, sym):
                     return
                 with state_lock:
                     state[sym]["contracts"] = exch_pos["contracts"]
-                manage_position(ex, sym, dict(state[sym]))
+                    cur = dict(state[sym])
+                manage_position(ex, sym, cur)
                 return
+
+            # --- بحث عن دخول ---
             if time.time() - pos_data.get("last_exit_ts", 0) < REENTRY_COOLDOWN_SEC:
                 return
             if not entries_allowed(ex):
@@ -792,50 +1140,91 @@ def process_symbol(ex, sym):
                 open_count = sum(1 for v in state.values() if v.get("position"))
             if open_count >= MAX_OPEN_POSITIONS:
                 return
+
             raw_15m = fetch_data(ex, sym, "15m")
+            if len(raw_15m) < 70:
+                return
+            closed_ts = raw_15m[-2][0]
+            if _last_eval.get(sym) == closed_ts:
+                return          # هذه الشمعة قُيّمت مسبقاً
             raw_1h = fetch_data(ex, sym, "1h")
             raw_4h = fetch_data(ex, sym, "4h")
-            if len(raw_15m) < 70 or len(raw_1h) < 60 or len(raw_4h) < 60:
+            if len(raw_1h) < 60 or len(raw_4h) < 60:
                 return
-            df_15m, df_1h, df_4h = to_df(raw_15m), to_df(raw_1h), to_df(raw_4h)
-            signal = check_entry_signal(df_15m, df_1h, df_4h)
+            _last_eval[sym] = closed_ts
+
+            signal = check_entry_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
             if not signal:
                 return
-            same_dir = sum(1 for v in state.values() if v.get("position") == signal["side"])
+            side = signal["side"]
+
+            with state_lock:
+                same_dir = sum(1 for v in state.values() if v.get("position") == side)
             if same_dir >= MAX_SAME_DIRECTION:
                 return
-            ok, why = market_filters_ok(ex, sym, signal["side"])
+            if sector_limit_reached(sym, side):
+                return
+            if USE_BTC_FILTER and not sym.startswith("BTC/"):
+                bias = btc_bias(ex)
+                if (side == "LONG" and bias == "down") or (side == "SHORT" and bias == "up"):
+                    return
+            ok, why = market_filters_ok(ex, sym, side)
             if not ok:
                 return
-            actual_price = get_current_price(ex, sym) or signal["price"]
+
+            actual_price = get_current_price(ex, sym, 0) or signal["price"]
+            if abs(actual_price - signal["price"]) / signal["price"] > MAX_ENTRY_SLIPPAGE_PCT:
+                return          # السعر ابتعد كثيراً عن الإشارة
             sl_pct = signal["sl_pct"]
-            sl = actual_price * (1 - sl_pct) if signal["side"] == "LONG" else actual_price * (1 + sl_pct)
-            tp = actual_price * (1 + sl_pct * RR_RATIO) if signal["side"] == "LONG" else actual_price * (1 - sl_pct * RR_RATIO)
+            if side == "LONG":
+                sl = actual_price * (1 - sl_pct)
+                tp = actual_price * (1 + sl_pct * RR_RATIO)
+            else:
+                sl = actual_price * (1 + sl_pct)
+                tp = actual_price * (1 - sl_pct * RR_RATIO)
             margin = compute_margin(get_equity(ex), sl_pct)
-            success, info, entry, contracts = open_position(ex, sym, signal["side"], actual_price, sl, tp, margin)
+
+            success, info, entry, contracts = open_position(ex, sym, side, actual_price, sl, tp, margin)
+            now = time.time()
             if success:
                 with state_lock:
                     state[sym].update({
-                        "position": signal["side"], "entry": entry, "sl": sl, "tp": tp,
+                        "position": side, "entry": entry, "sl": sl, "tp": tp,
+                        "initial_sl": sl, "initial_risk": abs(entry - sl),
                         "contracts": contracts, "initial_contracts": contracts,
-                        "margin": margin, "opened_ts": time.time(),
+                        "margin": margin, "opened_ts": now, "leg_ts": now,
+                        "realized_pnl": 0.0, "last_notified_sl": None,
                         "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False,
-                        "regime": signal.get("regime", "")
+                        "regime": signal.get("regime", ""),
                     })
             else:
                 with state_lock:
-                    state[sym]["last_exit_ts"] = time.time()
+                    state[sym]["last_exit_ts"] = now
             save_state()
-            caption = msg_entry(sym, signal["side"], entry, sl, tp, margin, success, signal.get("regime", ""))
+            caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""))
             if not success:
                 caption += f"\n❌ {info}"
             send(caption)
     except Exception as e:
         log.error(f"[ERROR] {sym}: {e}")
 
+
 # ==========================================
-# مزامنة
+# مزامنة المراكز
 # ==========================================
+def adopt_sl_pct(ex, sym):
+    try:
+        raw = fetch_data(ex, sym, "15m")
+        if len(raw) >= 60:
+            df = to_df(raw)
+            a, c = float(df.iloc[-2]["atr"]), float(df.iloc[-2]["close"])
+            if c > 0 and not np.isnan(a):
+                return max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * a / c))
+    except Exception:
+        pass
+    return FALLBACK_SL_PCT
+
+
 def sync_positions(ex, active_symbols):
     try:
         exch = {}
@@ -853,177 +1242,154 @@ def sync_positions(ex, active_symbols):
             if st.get("position") and sym not in exch:
                 finalize_trade(ex, sym)
             elif st.get("position") and sym in exch:
-                p = exch[sym]
-                contracts = abs(float(p.get('contracts')))
+                contracts = abs(float(exch[sym].get('contracts')))
                 with state_lock:
                     state[sym]["contracts"] = contracts
-                try:
-                    has_sl, _ = get_protection(ex, sym)
-                    if not has_sl:
-                        close_side = 'sell' if st["position"] == "LONG" else 'buy'
-                        protect_position(ex, sym, close_side, contracts, st["sl"], st.get("tp"))
-                except Exception:
-                    pass
+                has_sl, _ = has_protection(ex, sym)
+                if not has_sl:
+                    close_side = 'sell' if st["position"] == "LONG" else 'buy'
+                    replace_protection(ex, sym, close_side, contracts, st["sl"], st.get("tp"))
             elif not st.get("position") and sym in exch:
                 p = exch[sym]
                 side = "LONG" if p.get('side') == 'long' else "SHORT"
                 entry = float(p.get('entryPrice') or 0)
                 contracts = abs(float(p.get('contracts')))
-                sl_pct = 0.017
-                sl = entry * (1 - sl_pct) if side == "LONG" else entry * (1 + sl_pct)
-                tp = entry * (1 + sl_pct * RR_RATIO) if side == "LONG" else entry * (1 - sl_pct * RR_RATIO)
+                sl_pct = adopt_sl_pct(ex, sym)
+                if side == "LONG":
+                    sl, tp = entry * (1 - sl_pct), entry * (1 + sl_pct * RR_RATIO)
+                else:
+                    sl, tp = entry * (1 + sl_pct), entry * (1 - sl_pct * RR_RATIO)
                 close_side = 'sell' if side == "LONG" else 'buy'
                 cancel_pending(ex, sym)
                 if protect_position(ex, sym, close_side, contracts, sl, tp)[0]:
+                    now = time.time()
                     with state_lock:
                         state[sym] = new_sym_state()
                         state[sym].update({
                             "position": side, "entry": entry, "sl": sl, "tp": tp,
+                            "initial_sl": sl, "initial_risk": abs(entry - sl),
                             "contracts": contracts, "initial_contracts": contracts,
                             "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
-                            "opened_ts": time.time()
+                            "opened_ts": now, "leg_ts": now, "regime": "adopted",
                         })
-                    send(f"♻️ تم تبني مركز <code>{sym.split(':')[0]}</code> ({side})")
+                    send(f"♻️ تم تبني مركز <code>{short(sym)}</code> ({side}) — SL {sl_pct * 100:.2f}% (ATR)")
         save_state()
 
+
 # ==========================================
-# أوامر تيليجرام المحسّنة
+# أوامر تيليجرام
 # ==========================================
-def status_text(ex):
-    roll_daily()
-    equity = get_equity(ex, force=True)
-    total_floating_pnl = 0.0
+def open_positions_snapshot():
     with state_lock:
-        opens = {k: dict(v) for k, v in state.items() if v.get("position")}
-    pos_lines = []
+        return {k: dict(v) for k, v in state.items() if v.get("position")}
+
+
+def unrealized(ex, sym, v):
+    price = get_current_price(ex, sym) or v["entry"]
+    d = 1 if v["position"] == "LONG" else -1
+    upnl = (price - v["entry"]) * d * v["contracts"] * contract_size(ex, sym)
+    return price, upnl
+
+
+def flags_text(v):
+    f = ""
+    if v.get("partial_2_taken"):
+        f += " 💰💰"
+    elif v.get("partial_1_taken"):
+        f += " 💰"
+    if v.get("breakeven_hit"):
+        f += " 🛡️"
+    return f
+
+
+def status_text(ex):
+    snap = daily_snapshot()
+    equity = get_equity(ex, force=True)
+    opens = open_positions_snapshot()
+    total_float = 0.0
+    lines_pos = []
     for sym, v in opens.items():
-        price = get_current_price(ex, sym) or v["entry"]
-        d = 1 if v["position"] == "LONG" else -1
-        upnl = (price - v["entry"]) * d * v["contracts"] * contract_size(ex, sym)
-        total_floating_pnl += upnl
-        flags = ""
-        if v.get("partial_2_taken"):
-            flags += " 💰💰"
-        elif v.get("partial_1_taken"):
-            flags += " 💰"
-        if v.get("breakeven_hit"):
-            flags += " 🛡️"
-        pos_lines.append(f"• <code>{sym.split(':')[0]}</code> {v['position']} | {fmt(v['entry'])} → {fmt(price)} | {upnl:+.2f}{flags}")
+        price, upnl = unrealized(ex, sym, v)
+        total_float += upnl
+        lines_pos.append(f"• <code>{short(sym)}</code> {v['position']} | {fmt(v['entry'])} → {fmt(price)} | {upnl:+.2f}{flags_text(v)}")
     lines = [
-        f"📊 <b>حالة البوت V39</b> {'⏸️' if meta.get('paused') else '▶️'}",
+        f"📊 <b>حالة البوت {VERSION}</b> {'⏸️' if meta.get('paused') else '▶️'}",
         "━━━━━━━━━━━━━━━",
         f"💼 الرصيد: {equity:,.2f} USDT",
-        f"📅 المغلق اليوم: {daily_pnl['value']:+.2f} USDT | صفقات: {daily_pnl['trades']} | رابحة: {daily_pnl['wins']}",
-        f"📈 <b>الربح العائم: {total_floating_pnl:+.2f} USDT</b>",
-        "━━━━━━━━━━━━━━━"
+        f"📅 المحقق اليوم: {snap['value']:+.2f} USDT | صفقات: {snap['trades']} | رابحة: {snap['wins']}",
+        f"📈 <b>الربح العائم: {total_float:+.2f} USDT</b>",
+        "━━━━━━━━━━━━━━━",
     ]
-    if not opens:
-        lines.append("لا توجد صفقات مفتوحة.")
-    else:
-        lines.extend(pos_lines)
+    lines.extend(lines_pos if lines_pos else ["لا توجد صفقات مفتوحة."])
     return "\n".join(lines)
 
+
 def positions_text(ex):
-    with state_lock:
-        opens = {k: dict(v) for k, v in state.items() if v.get("position")}
+    opens = open_positions_snapshot()
     if not opens:
         return "📭 لا توجد صفقات مفتوحة حالياً."
     lines = ["📊 <b>تفاصيل الصفقات المفتوحة</b>", "━━━━━━━━━━━━━━━"]
-    total_upnl = 0.0
+    total = 0.0
     for sym, v in opens.items():
-        price = get_current_price(ex, sym) or v["entry"]
+        price, upnl = unrealized(ex, sym, v)
+        total += upnl
+        pct = (upnl / v["margin"] * 100) if v.get("margin") else 0.0
+        mins = int((time.time() - v["opened_ts"]) / 60) if v.get("opened_ts") else 0
+        duration = f"{mins // 60}س {mins % 60}د" if mins >= 60 else f"{mins}د"
+        risk = v.get("initial_risk") or 0
         d = 1 if v["position"] == "LONG" else -1
-        upnl = (price - v["entry"]) * d * v["contracts"] * contract_size(ex, sym)
-        total_upnl += upnl
-        sl = v.get("sl")
-        sl_txt = fmt(sl) if sl else "—"
-        pct = 0.0
-        if v.get("margin") and v["margin"] > 0:
-            pct = (upnl / v["margin"]) * 100
-        flags = []
-        if v.get("partial_2_taken"):
-            flags.append("💰💰 Partial 2")
-        elif v.get("partial_1_taken"):
-            flags.append("💰 Partial 1")
-        if v.get("breakeven_hit"):
-            flags.append("🛡️ BE")
-        flags_txt = " | ".join(flags) if flags else "—"
-        duration = ""
-        if v.get("opened_ts"):
-            mins = int((time.time() - v["opened_ts"]) / 60)
-            duration = f"{mins // 60}س {mins % 60}د" if mins >= 60 else f"{mins}د"
+        r_now = ((price - v["entry"]) * d / risk) if risk else 0.0
         lines.append(
-            f"🪙 <b>{sym.split(':')[0]}</b> ({v['position']})\n"
+            f"🪙 <b>{short(sym)}</b> ({v['position']})\n"
             f"📥 الدخول: <code>{fmt(v['entry'])}</code>\n"
             f"📤 الحالي: <code>{fmt(price)}</code>\n"
-            f"💰 العائم: <b>{upnl:+.2f} USDT</b> ({pct:+.1f}%)\n"
-            f"🛑 الوقف: <code>{sl_txt}</code>\n"
-            f"⏱ المدة: {duration} | {flags_txt}\n"
-            f"────────────────"
-        )
-    lines.append(f"\n📈 <b>إجمالي العائم: {total_upnl:+.2f} USDT</b>")
+            f"💰 العائم: <b>{upnl:+.2f} USDT</b> ({pct:+.1f}%) | {r_now:+.2f}R\n"
+            f"🧾 المحقق من الجزئيات: {v.get('realized_pnl', 0.0):+.2f}\n"
+            f"🛑 الوقف: <code>{fmt(v['sl']) if v.get('sl') else '—'}</code> | 🎯 <code>{fmt(v['tp']) if v.get('tp') else '—'}</code>\n"
+            f"⏱ المدة: {duration}{flags_text(v)}\n"
+            f"────────────────")
+    lines.append(f"\n📈 <b>إجمالي العائم: {total:+.2f} USDT</b>")
     return "\n".join(lines)
+
 
 def risk_text(ex):
-    roll_daily()
+    snap = daily_snapshot()
     equity = get_equity(ex, force=True)
-    with state_lock:
-        open_count = sum(1 for v in state.values() if v.get("position"))
-        same_long = sum(1 for v in state.values() if v.get("position") == "LONG")
-        same_short = sum(1 for v in state.values() if v.get("position") == "SHORT")
+    opens = open_positions_snapshot()
+    longs = sum(1 for v in opens.values() if v["position"] == "LONG")
+    shorts = sum(1 for v in opens.values() if v["position"] == "SHORT")
     loss_limit = equity * DAILY_LOSS_LIMIT_PCT / 100.0
-    remaining_loss = loss_limit + daily_pnl["value"]
     profit_target = equity * DAILY_PROFIT_TARGET_PCT / 100.0
-    remaining_profit = profit_target - daily_pnl["value"]
     status = "⏸️ متوقف" if meta.get("paused") else "▶️ يعمل"
-    lines = [
-        "🛡️ <b>ملخص إدارة المخاطر</b>",
-        "━━━━━━━━━━━━━━━",
+    return "\n".join([
+        "🛡️ <b>ملخص إدارة المخاطر</b>", "━━━━━━━━━━━━━━━",
         f"💼 الرصيد: <b>{equity:,.2f} USDT</b>",
-        f"📊 حالة البوت: {status}",
-        "",
+        f"📊 الحالة: {status} | BTC: {_btc_bias_cache['value']}", "",
         f"🎯 المخاطرة لكل صفقة: <b>{RISK_PCT_PER_TRADE}%</b>",
         f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT)",
-        f"📈 هدف الربح اليومي: {DAILY_PROFIT_TARGET_PCT}% ({profit_target:.1f} USDT)",
-        "",
-        f"🔢 الصفقات المفتوحة: {open_count} / {MAX_OPEN_POSITIONS}",
-        f"🟢 LONG: {same_long} | 🔴 SHORT: {same_short}",
-        f"📌 حد نفس الاتجاه: {MAX_SAME_DIRECTION}",
-        "",
-        f"📅 نتيجة اليوم: <b>{daily_pnl['value']:+.2f} USDT</b>",
-        f"🔻 المتبقي للخسارة: {remaining_loss:+.2f} USDT",
-        f"🔺 المتبقي للهدف: {remaining_profit:+.2f} USDT",
-        "━━━━━━━━━━━━━━━"
-    ]
-    return "\n".join(lines)
+        f"📈 هدف الربح اليومي: {DAILY_PROFIT_TARGET_PCT}% ({profit_target:.1f} USDT)", "",
+        f"🔢 المفتوحة: {len(opens)} / {MAX_OPEN_POSITIONS}",
+        f"🟢 LONG: {longs} | 🔴 SHORT: {shorts} (الحد {MAX_SAME_DIRECTION})", "",
+        f"📅 نتيجة اليوم: <b>{snap['value']:+.2f} USDT</b>",
+        f"🔻 المتبقي للخسارة: {loss_limit + snap['value']:+.2f} USDT",
+        f"🔺 المتبقي للهدف: {profit_target - snap['value']:+.2f} USDT",
+        "━━━━━━━━━━━━━━━"])
+
 
 def daily_text(ex):
-    roll_daily()
+    snap = daily_snapshot()
     equity = get_equity(ex, force=True)
-    total_upnl = 0.0
-    with state_lock:
-        opens = {k: dict(v) for k, v in state.items() if v.get("position")}
-    for sym, v in opens.items():
-        price = get_current_price(ex, sym) or v["entry"]
-        d = 1 if v["position"] == "LONG" else -1
-        upnl = (price - v["entry"]) * d * v["contracts"] * contract_size(ex, sym)
-        total_upnl += upnl
-    wr = (daily_pnl["wins"] / daily_pnl["trades"] * 100) if daily_pnl["trades"] else 0
-    closed = daily_pnl["value"]
-    total_today = closed + total_upnl
-    lines = [
-        f"📅 <b>ملخص اليوم</b> — {daily_pnl['date']}",
-        "━━━━━━━━━━━━━━━",
-        f"💰 المغلق اليوم: <b>{closed:+.2f} USDT</b>",
+    total_upnl = sum(unrealized(ex, s, v)[1] for s, v in open_positions_snapshot().items())
+    wr = (snap["wins"] / snap["trades"] * 100) if snap["trades"] else 0
+    return "\n".join([
+        f"📅 <b>ملخص اليوم</b> — {snap['date']}", "━━━━━━━━━━━━━━━",
+        f"💰 المحقق اليوم: <b>{snap['value']:+.2f} USDT</b>",
         f"📈 العائم حالياً: <b>{total_upnl:+.2f} USDT</b>",
-        f"📊 الإجمالي التقديري: <b>{total_today:+.2f} USDT</b>",
-        "",
-        f"🔢 عدد الصفقات: {daily_pnl['trades']}",
-        f"✅ الرابحة: {daily_pnl['wins']} ({wr:.0f}%)",
-        f"💼 الرصيد: {equity:,.2f} USDT",
-        "━━━━━━━━━━━━━━━"
-    ]
-    return "\n".join(lines)
+        f"📊 الإجمالي التقديري: <b>{snap['value'] + total_upnl:+.2f} USDT</b>", "",
+        f"🔢 الصفقات المكتملة: {snap['trades']}",
+        f"✅ الرابحة: {snap['wins']} ({wr:.0f}%)",
+        f"💼 الرصيد: {equity:,.2f} USDT", "━━━━━━━━━━━━━━━"])
+
 
 def find_symbol(arg, active_symbols):
     arg = arg.upper().replace("/USDT", "").replace("USDT", "")
@@ -1031,6 +1397,7 @@ def find_symbol(arg, active_symbols):
         if s.startswith(arg + "/"):
             return s
     return None
+
 
 def handle_command(ex, text, chat_id, active_symbols):
     parts = text.strip().split()
@@ -1044,13 +1411,13 @@ def handle_command(ex, text, chat_id, active_symbols):
         send(risk_text(ex), chat_id)
     elif cmd == "/daily":
         send(daily_text(ex), chat_id)
+    elif cmd == "/stats":
+        send(stats_text(), chat_id)
     elif cmd == "/pause":
-        meta["paused"] = True
-        save_state()
+        set_meta("paused", True)
         send("⏸️ تم إيقاف فتح صفقات جديدة (الصفقات المفتوحة تبقى مُدارة).", chat_id)
     elif cmd == "/resume":
-        meta["paused"] = False
-        save_state()
+        set_meta("paused", False)
         send("▶️ تم استئناف البحث عن صفقات.", chat_id)
     elif cmd == "/close":
         if len(parts) < 2:
@@ -1066,11 +1433,14 @@ def handle_command(ex, text, chat_id, active_symbols):
             if not pos_data.get("position"):
                 send("لا توجد صفقة مفتوحة على هذه العملة.", chat_id)
                 return
-            if close_position_safe(ex, sym, pos_data):
+            if close_full(ex, sym):
                 finalize_trade(ex, sym, reason_hint="Manual")
             else:
                 send("❌ فشل الإغلاق، تحقق من المنصة.", chat_id)
     elif cmd == "/closeall":
+        if len(parts) < 2 or parts[1].lower() != "confirm":
+            send("⚠️ لتأكيد إغلاق كل الصفقات أرسل:\n/closeall confirm", chat_id)
+            return
         with trade_lock:
             with state_lock:
                 syms = [k for k, v in state.items() if v.get("position")]
@@ -1078,10 +1448,10 @@ def handle_command(ex, text, chat_id, active_symbols):
                 send("لا توجد صفقات مفتوحة.", chat_id)
                 return
             for sym in syms:
-                with state_lock:
-                    pos_data = dict(state.get(sym, {}))
-                if close_position_safe(ex, sym, pos_data):
+                if close_full(ex, sym):
                     finalize_trade(ex, sym, reason_hint="Manual")
+                else:
+                    send(f"❌ فشل إغلاق <code>{short(sym)}</code>", chat_id)
     elif cmd == "/help":
         send(
             "<b>📋 الأوامر المتاحة:</b>\n\n"
@@ -1089,20 +1459,19 @@ def handle_command(ex, text, chat_id, active_symbols):
             "/pos - تفاصيل كل صفقة مفتوحة\n"
             "/risk - ملخص إدارة المخاطر\n"
             "/daily - ملخص أداء اليوم\n"
+            "/stats - إحصائيات الأداء الكلية\n"
             "/pause - إيقاف الدخول مؤقتاً\n"
             "/resume - استئناف الدخول\n"
             "/close BTC - إغلاق عملة محددة\n"
-            "/closeall - إغلاق جميع الصفقات\n"
-            "/help - عرض هذه القائمة",
-            chat_id
-        )
+            "/closeall confirm - إغلاق جميع الصفقات\n"
+            "/help - عرض هذه القائمة", chat_id)
+
 
 def telegram_listener(active_symbols):
     if not TELEGRAM_BOT_TOKEN or not AUTHORIZED_CHATS:
         return
     try:
-        ex2 = create_exchange()
-        ex2.load_markets()
+        ex2 = init_exchange()
     except Exception as e:
         log.error(f"[TG INIT] {e}")
         return
@@ -1125,38 +1494,40 @@ def telegram_listener(active_symbols):
             log.warning(f"[TG POLL] {e}")
             time.sleep(5)
 
+
+# ==========================================
+# التقارير الدورية
+# ==========================================
 def maybe_send_daily_report(ex):
     now = datetime.now(KSA_TZ)
     today = str(now.date())
-    if ((now.hour == 23 and now.minute >= 55) or (now.hour == 0 and now.minute < 12)) and meta.get("last_report") != today:
-        roll_daily()
-        wr = (daily_pnl["wins"] / daily_pnl["trades"] * 100) if daily_pnl["trades"] else 0
-        send(f"📋 <b>التقرير اليومي V39</b> — {today}\n━━━━━━━━━━━━━━━\n"
-             f"💰 النتيجة: {daily_pnl['value']:+.2f} USDT\n"
-             f"🔢 الصفقات: {daily_pnl['trades']} | الرابحة: {daily_pnl['wins']} ({wr:.0f}%)\n"
+    if now.hour == 23 and now.minute >= 55 and meta.get("last_report") != today:
+        snap = daily_snapshot()
+        wr = (snap["wins"] / snap["trades"] * 100) if snap["trades"] else 0
+        send(f"📋 <b>التقرير اليومي {VERSION}</b> — {today}\n━━━━━━━━━━━━━━━\n"
+             f"💰 النتيجة: {snap['value']:+.2f} USDT\n"
+             f"🔢 الصفقات: {snap['trades']} | الرابحة: {snap['wins']} ({wr:.0f}%)\n"
              f"💼 الرصيد: {get_equity(ex, force=True):,.2f} USDT")
-        meta["last_report"] = today
-        save_state()
+        set_meta("last_report", today)
+
 
 def maybe_send_heartbeat(ex):
     now = datetime.now(KSA_TZ)
     current_hour = now.strftime("%Y-%m-%d %H")
     if meta.get("last_heartbeat") != current_hour and now.minute < 4:
-        meta["last_heartbeat"] = current_hour
-        save_state()
-        with state_lock:
-            open_ct = sum(1 for v in state.values() if v.get("position"))
+        set_meta("last_heartbeat", current_hour)
+        open_ct = len(open_positions_snapshot())
         log.info(f"[HEARTBEAT] Open: {open_ct} | Equity: {get_equity(ex)}")
 
-def init_exchange():
-    ex = create_exchange()
-    ex.load_markets()
-    return ex
 
+# ==========================================
+# الحلقة الرئيسية
+# ==========================================
 def trading_loop():
-    log.info("[INIT] Starting V39 Advanced Bot with strong commands...")
+    log.info(f"[INIT] Starting {VERSION} ...")
     if not OKX_API_KEY:
-        return send("❌ مفاتيح API غير موجودة")
+        send("❌ مفاتيح API غير موجودة")
+        return
     try:
         ex = init_exchange()
         load_state()
@@ -1164,31 +1535,34 @@ def trading_loop():
         mode_str = "تجريبي (Sandbox)" if USE_SANDBOX else "حقيقي"
         log.info(f"[OKX] Connected ({mode_str}). Equity: {balance}")
     except Exception as e:
-        return send(f"❌ فشل الاتصال: {e}")
+        send(f"❌ فشل الاتصال: {e}")
+        return
+
     active_symbols = [s for s in FUTURES_SYMBOLS if s in ex.markets]
     sync_positions(ex, active_symbols)
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
-    send(f"🚀 <b>تم تشغيل البوت V39 (أوامر محسّنة)</b>\n"
-         f"━━━━━━━━━━━━━━━\n"
+    send(f"🚀 <b>تم تشغيل البوت {VERSION}</b>\n━━━━━━━━━━━━━━━\n"
          f"⚙️ الوضع: {mode_str}\n"
          f"🪙 العملات: {len(active_symbols)}\n"
          f"📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n"
          f"💰 المخاطرة: {RISK_PCT_PER_TRADE}% من الرصيد\n"
-         f"🎯 Partial: 40% @ 1.3R → 30% @ 2.1R + Trailing\n"
-         f"📱 الأوامر: /status /pos /risk /daily\n"
-         f"━━━━━━━━━━━━━━━")
+         f"🎯 Partial: {int(PARTIAL1_PCT * 100)}% @ {PARTIAL1_R}R → "
+         f"{int(PARTIAL2_PCT * 100)}% من المتبقي @ {PARTIAL2_R}R + Trailing\n"
+         f"📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
+
     fail_streak = 0
     while True:
         start = time.time()
         cycle_errors = 0
         try:
+            refresh_prices(ex, active_symbols)
             for sym in active_symbols:
                 try:
                     process_symbol(ex, sym)
                 except Exception as e:
                     cycle_errors += 1
                     log.error(f"[LOOP] {sym}: {e}")
-                time.sleep(0.4)
+                time.sleep(0.25)
             maybe_send_daily_report(ex)
             maybe_send_heartbeat(ex)
         except Exception as e:
@@ -1202,9 +1576,12 @@ def trading_loop():
                 log.warning("[RECONNECT] تم إعادة الاتصال")
             except Exception as e:
                 log.error(f"[RECONNECT FAIL] {e}")
-        elapsed = time.time() - start
-        time.sleep(max(8, SCAN_INTERVAL - elapsed))
+        time.sleep(max(8, SCAN_INTERVAL - (time.time() - start)))
+
 
 if __name__ == "__main__":
+    if not acquire_single_instance():
+        log.error("نسخة أخرى من البوت تعمل بالفعل — إيقاف.")
+        sys.exit(1)
     threading.Thread(target=run_flask, daemon=True).start()
     trading_loop()
