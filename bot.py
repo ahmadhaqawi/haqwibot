@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V40.1 (Professional + Bugfix)
+OKX Futures Trading Bot - V40.1 (Professional + Bugfix + Formatted Help)
 """
 import os
 import sys
@@ -469,7 +469,6 @@ def place_sl_tp(ex, sym, side, contracts, trigger, is_sl):
     if str(data.get('sCode', '0')) != '0': raise Exception(f"algo rejected: {data.get('sMsg')}")
     return res
 
-# ==== التعديل هنا: معالجة خطأ 51277 ====
 def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
     sl_ok = tp_ok = False
     if sl is not None:
@@ -848,7 +847,6 @@ def adopt_sl_pct(ex, sym):
     except Exception: pass
     return FALLBACK_SL_PCT
 
-# ==== التعديل هنا: منع الخطأ عند تبني صفقة تحقق هدفها مسبقاً ====
 def sync_positions(ex, active_symbols):
     try:
         exch = {}
@@ -876,7 +874,6 @@ def sync_positions(ex, active_symbols):
                 if side == "LONG": sl, tp = entry * (1 - sl_pct), entry * (1 + sl_pct * RR_RATIO)
                 else: sl, tp = entry * (1 + sl_pct), entry * (1 - sl_pct * RR_RATIO)
                 
-                # منع محاولة وضع هدف سعره أعلى من السعر الحالي
                 current_price = get_current_price(ex, sym)
                 if current_price:
                     if (side == "LONG" and current_price >= tp) or (side == "SHORT" and current_price <= tp):
@@ -967,27 +964,37 @@ def handle_command(ex, text, chat_id, active_symbols):
     elif cmd == "/risk": send(risk_text(ex), chat_id)
     elif cmd == "/daily": send(daily_text(ex), chat_id)
     elif cmd == "/stats": send(stats_text(), chat_id)
-    elif cmd == "/pause": set_meta("paused", True); send("⏸️ تم إيقاف فتح صفقات جديدة.", chat_id)
-    elif cmd == "/resume": set_meta("paused", False); send("▶️ تم استئناف البحث.", chat_id)
+    elif cmd == "/pause": set_meta("paused", True); send("⏸️ تم إيقاف فتح صفقات جديدة (الصفقات المفتوحة تبقى مُدارة).", chat_id)
+    elif cmd == "/resume": set_meta("paused", False); send("▶️ تم استئناف البحث عن صفقات.", chat_id)
     elif cmd == "/close":
         if len(parts) < 2: send("استخدم: /close BTC", chat_id); return
         sym = find_symbol(parts[1], active_symbols)
         if not sym: send("عملة غير معروفة.", chat_id); return
         with trade_lock:
             with state_lock: pos_data = dict(state.get(sym, {}))
-            if not pos_data.get("position"): send("لا توجد صفقة مفتوحة.", chat_id); return
+            if not pos_data.get("position"): send("لا توجد صفقة مفتوحة على هذه العملة.", chat_id); return
             if close_full(ex, sym): finalize_trade(ex, sym, reason_hint="Manual")
-            else: send("❌ فشل الإغلاق.", chat_id)
+            else: send("❌ فشل الإغلاق، تحقق من المنصة.", chat_id)
     elif cmd == "/closeall":
-        if len(parts) < 2 or parts[1].lower() != "confirm": send("⚠️ للتأكيد: /closeall confirm", chat_id); return
+        if len(parts) < 2 or parts[1].lower() != "confirm": send("⚠️ لتأكيد إغلاق كل الصفقات أرسل:\n/closeall confirm", chat_id); return
         with trade_lock:
             with state_lock: syms = [k for k, v in state.items() if v.get("position")]
-            if not syms: send("لا توجد صفقات.", chat_id); return
+            if not syms: send("لا توجد صفقات مفتوحة.", chat_id); return
             for sym in syms:
                 if close_full(ex, sym): finalize_trade(ex, sym, reason_hint="Manual")
                 else: send(f"❌ فشل إغلاق <code>{short(sym)}</code>", chat_id)
     elif cmd == "/help":
-        send("<b>📋 الأوامر:</b>\n/status /pos /risk /daily /stats /pause /resume /close BTC /closeall confirm /help", chat_id)
+        send("<b>📋 الأوامر المتاحة:</b>\n\n"
+             "/status - نظرة عامة + الربح العائم\n"
+             "/pos - تفاصيل كل صفقة مفتوحة\n"
+             "/risk - ملخص إدارة المخاطر\n"
+             "/daily - ملخص أداء اليوم\n"
+             "/stats - إحصائيات الأداء الكلية\n"
+             "/pause - إيقاف الدخول مؤقتاً\n"
+             "/resume - استئناف الدخول\n"
+             "/close BTC - إغلاق عملة محددة\n"
+             "/closeall confirm - إغلاق جميع الصفقات\n"
+             "/help - عرض هذه القائمة", chat_id)
 
 def telegram_listener(active_symbols):
     if not TELEGRAM_BOT_TOKEN or not AUTHORIZED_CHATS: return
