@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V40.1 (Professional + Bugfix + Formatted Help)
+OKX Futures Trading Bot - V41 (BTC Focus + Higher Risk)
 """
 import os
 import sys
@@ -22,9 +22,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bot")
 
 # ==========================================
-# الإعدادات
+# الإعدادات - V41
 # ==========================================
-VERSION = "V40.1"
+VERSION = "V41"
 KSA_TZ = timezone(timedelta(hours=3))
 
 def env_float(name, default):
@@ -57,20 +57,20 @@ SECTORS = {
     "ai": {"FET", "WLD"},
     "legacy": {"XRP", "LTC", "BCH", "FIL", "LINK", "RUNE", "ORDI"},
 }
-MAX_PER_SECTOR_SAME_DIR = 2
+MAX_PER_SECTOR_SAME_DIR = 3  # رفع من 2
 
 SCAN_INTERVAL = 30
-LEVERAGE = int(env_float("LEVERAGE", 5))
+LEVERAGE = int(env_float("LEVERAGE", 7))  # رفع من 5
 MARGIN_MODE = "isolated"
-MAX_OPEN_POSITIONS = 5
+MAX_OPEN_POSITIONS = 6  # رفع من 5
 REENTRY_COOLDOWN_SEC = 1500
 
 USE_RISK_SIZING = True
-RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 0.75)
+RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 1.0)  # رفع من 0.75
 POSITION_SIZE_USDT = 50
 MIN_MARGIN_USDT = 12
-MAX_MARGIN_USDT = 130
-MAX_MARGIN_PCT_EQUITY = 0.30
+MAX_MARGIN_USDT = 200  # رفع من 130
+MAX_MARGIN_PCT_EQUITY = 0.40  # رفع من 0.30
 
 ATR_SL_MULT = 1.55
 RR_RATIO = 2.3
@@ -85,13 +85,20 @@ PARTIAL1_R, PARTIAL1_PCT = 1.3, 0.40
 PARTIAL2_R, PARTIAL2_PCT = 2.1, 0.50
 
 FEE_RATE = 0.0005
-DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 4.0)
-DAILY_PROFIT_TARGET_PCT = env_float("DAILY_PROFIT_TARGET_PCT", 6.0)
-MAX_SAME_DIRECTION = 3
+DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 5.0)  # رفع من 4
+DAILY_PROFIT_TARGET_PCT = env_float("DAILY_PROFIT_TARGET_PCT", 8.0)  # رفع من 6
+MAX_SAME_DIRECTION = 4  # رفع من 3
 MAX_SPREAD_PCT = 0.0011
 MAX_FUNDING_RATE = 0.00045
 MAX_ENTRY_SLIPPAGE_PCT = 0.004
 USE_BTC_FILTER = True
+
+# ==== إعدادات BTC (التركيز) ====
+BTC_LEVERAGE = int(env_float("BTC_LEVERAGE", 10))
+BTC_MAX_TRADES_PER_DAY = int(env_float("BTC_MAX_TRADES_PER_DAY", 6))
+BTC_MAX_CONSECUTIVE_LOSSES = int(env_float("BTC_MAX_CONSECUTIVE_LOSSES", 3))
+BTC_COOLDOWN_MINUTES = int(env_float("BTC_COOLDOWN_MINUTES", 30))
+BTC_ADX_MIN = float(env_float("BTC_ADX_MIN", 24))
 
 TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 
@@ -107,6 +114,13 @@ journal_lock = threading.Lock()
 state = {}
 meta = {"paused": False, "last_report": "", "loss_alert": "", "profit_alert": "", "last_heartbeat": ""}
 daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
+
+btc_tracker = {
+    "date": str(datetime.now(KSA_TZ).date()),
+    "count": 0,
+    "consecutive_losses": 0,
+    "blocked_until": 0,
+}
 
 _data_cache = {}
 _price_cache = {}
@@ -146,7 +160,7 @@ def new_sym_state():
     }
 
 def load_state():
-    global state, daily_pnl
+    global state, daily_pnl, btc_tracker
     if not os.path.exists(STATE_FILE): return
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -160,13 +174,14 @@ def load_state():
             state = loaded
             daily_pnl = data.get("daily_pnl", daily_pnl)
             meta.update(data.get("meta", {}))
+            if "btc_tracker" in data: btc_tracker.update(data["btc_tracker"])
     except Exception as e:
         log.error(f"[STATE LOAD ERROR] {e}")
 
 def save_state():
     try:
         with state_lock:
-            txt = json.dumps({"state": state, "daily_pnl": daily_pnl, "meta": meta}, ensure_ascii=False, indent=2)
+            txt = json.dumps({"state": state, "daily_pnl": daily_pnl, "meta": meta, "btc_tracker": btc_tracker}, ensure_ascii=False, indent=2)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(txt)
@@ -208,6 +223,43 @@ def daily_snapshot():
     roll_daily()
     with state_lock: return dict(daily_pnl)
 
+# ==== BTC Tracker Functions ====
+def btc_roll_daily():
+    global btc_tracker
+    today = str(datetime.now(KSA_TZ).date())
+    if btc_tracker.get("date") != today:
+        btc_tracker = {"date": today, "count": 0, "consecutive_losses": 0, "blocked_until": 0}
+
+def btc_can_trade():
+    btc_roll_daily()
+    now = time.time()
+    if btc_tracker["blocked_until"] > now:
+        return False, f"محظور حتى {datetime.fromtimestamp(btc_tracker['blocked_until'], KSA_TZ).strftime('%H:%M')}"
+    if btc_tracker["count"] >= BTC_MAX_TRADES_PER_DAY:
+        return False, f"وصل لحد {BTC_MAX_TRADES_PER_DAY} صفقات/يوم"
+    if btc_tracker["consecutive_losses"] >= BTC_MAX_CONSECUTIVE_LOSSES:
+        return False, f"توقف بعد {BTC_MAX_CONSECUTIVE_LOSSES} خسائر"
+    return True, ""
+
+def btc_register_entry():
+    btc_roll_daily()
+    btc_tracker["count"] += 1
+
+def btc_register_result(pnl_usdt):
+    btc_roll_daily()
+    if pnl_usdt < 0:
+        btc_tracker["consecutive_losses"] += 1
+        if btc_tracker["consecutive_losses"] >= BTC_MAX_CONSECUTIVE_LOSSES:
+            tomorrow = datetime.now(KSA_TZ).replace(hour=0, minute=0, second=0) + timedelta(days=1)
+            btc_tracker["blocked_until"] = tomorrow.timestamp()
+            send(f"🚫 <b>تم إيقاف BTC لليوم</b>\nالسبب: {BTC_MAX_CONSECUTIVE_LOSSES} خسائر متتالية")
+    else:
+        btc_tracker["consecutive_losses"] = 0
+    save_state()
+
+# ==========================================
+# Journal
+# ==========================================
 JOURNAL_FIELDS = ["close_time", "symbol", "side", "entry", "exit", "initial_contracts", "pnl", "r_multiple", "reason", "regime", "duration_min"]
 
 def journal_append(row):
@@ -251,6 +303,9 @@ def stats_text():
             f"📉 أقصى تراجع: {max_dd:.2f} USDT\n"
             f"━━━━━━━━━━━━━━━")
 
+# ==========================================
+# Telegram
+# ==========================================
 def send(msg, chat_id=None):
     if not TELEGRAM_BOT_TOKEN: return
     targets = [chat_id] if chat_id else list(AUTHORIZED_CHATS)
@@ -276,20 +331,20 @@ REASONS = {
     "Manual/External": "إغلاق من المنصة ⚡",
 }
 
-def msg_entry(sym, side, price, sl, tp, margin, real_order, regime=""):
+def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", lev_used=LEVERAGE):
     title = "🟢 <b>توصية شراء (LONG)</b>" if side == "LONG" else "🔴 <b>توصية بيع (SHORT)</b>"
     status = "✅ <b>تم فتح الصفقة آلياً</b>" if real_order else "⚠️ <b>إشارة فقط</b>"
     sl_pct = abs(price - sl) / price * 100
     tp_pct = abs(tp - price) / price * 100
-    risk_usd = margin * (sl_pct / 100) * LEVERAGE
-    reward_usd = margin * (tp_pct / 100) * LEVERAGE
+    risk_usd = margin * (sl_pct / 100) * lev_used
+    reward_usd = margin * (tp_pct / 100) * lev_used
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     regime_txt = f"\n📡 <b>نظام السوق:</b> {regime}" if regime else ""
     return (f"{title}\n{status}{regime_txt}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🪙 <b>الزوج:</b> <code>{short(sym)}</code>\n"
             f"💵 <b>سعر الدخول:</b> <code>{fmt(price)}</code>\n"
-            f"⚙️ <b>الرافعة:</b> {LEVERAGE}x | <b>الهامش:</b> {margin:.2f} USDT\n"
+            f"⚙️ <b>الرافعة:</b> {lev_used}x | <b>الهامش:</b> {margin:.2f} USDT\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🛑 <b>وقف الخسارة:</b> <code>{fmt(sl)}</code> ({sl_pct:.2f}%)\n"
             f"📉 <i>المخاطرة: {risk_usd:.2f} USDT</i>\n"
@@ -314,6 +369,9 @@ def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margi
             f"📝 السبب: {REASONS.get(reason, reason)}\n"
             f"━━━━━━━━━━━━━━━")
 
+# ==========================================
+# Indicators
+# ==========================================
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
 
 def rsi(s, p=14):
@@ -350,6 +408,9 @@ def add_indicators(df):
     df["vol_ma"] = df["volume"].rolling(20).mean()
     return df
 
+# ==========================================
+# OKX
+# ==========================================
 def create_exchange():
     ex = ccxt.okx({
         'apiKey': OKX_API_KEY, 'secret': OKX_SECRET, 'password': OKX_PASSPHRASE,
@@ -412,10 +473,10 @@ def calculate_contracts(ex, sym, margin, price, lev):
         log.warning(f"[AMOUNT] {sym}: {e}")
         return 0.0
 
-def compute_margin(equity, sl_pct):
+def compute_margin(equity, sl_pct, lev=LEVERAGE):
     if not USE_RISK_SIZING or equity <= 0: return float(POSITION_SIZE_USDT)
     risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
-    margin = risk_usd / (sl_pct * LEVERAGE)
+    margin = risk_usd / (sl_pct * lev)
     cap = min(MAX_MARGIN_USDT, equity * MAX_MARGIN_PCT_EQUITY)
     return max(min(MIN_MARGIN_USDT, cap), min(cap, margin))
 
@@ -519,9 +580,10 @@ def close_full(ex, sym):
 
 def open_position(ex, sym, side, price, sl, tp, margin):
     try:
-        amount = calculate_contracts(ex, sym, margin, price, LEVERAGE)
+        lev = BTC_LEVERAGE if sym.startswith("BTC/") else LEVERAGE
+        amount = calculate_contracts(ex, sym, margin, price, lev)
         if amount <= 0: return False, "كمية غير صالحة", price, 0.0
-        try: ex.set_leverage(LEVERAGE, sym, params={'mgnMode': MARGIN_MODE})
+        try: ex.set_leverage(lev, sym, params={'mgnMode': MARGIN_MODE})
         except Exception as e: log.warning(f"[LEVERAGE] {sym}: {e}")
         cancel_pending(ex, sym)
         order_side = 'buy' if side == "LONG" else 'sell'
@@ -584,6 +646,7 @@ def finalize_trade(ex, sym, reason_hint=None):
 
     add_daily_pnl(final_leg)
     register_trade_result(total)
+    if sym.startswith("BTC/"): btc_register_result(total)
     journal_append({"close_time": datetime.now(KSA_TZ).strftime("%Y-%m-%d %H:%M:%S"), "symbol": short(sym), "side": side, "entry": entry, "exit": exit_price, "initial_contracts": pos_data.get("initial_contracts", 0.0), "pnl": round(total, 4), "r_multiple": round(r_mult, 3), "reason": reason, "regime": pos_data.get("regime", ""), "duration_min": duration})
     reset_sym_state(sym, cooldown=True)
     cancel_pending(ex, sym)
@@ -631,7 +694,7 @@ def detect_regime(df_15m, df_1h, df_4h):
     if adx4 > 20 and (up_4h or down_4h): return "weak_trend"
     return "range"
 
-def check_entry_signal(df_15m, df_1h, df_4h):
+def check_entry_signal(df_15m, df_1h, df_4h, sym=""):
     if len(df_15m) < 70 or len(df_1h) < 60 or len(df_4h) < 60: return None
     last = df_15m.iloc[-2]; prev = df_15m.iloc[-3]
     last_1h = df_1h.iloc[-2]; last_4h = df_4h.iloc[-2]
@@ -644,7 +707,10 @@ def check_entry_signal(df_15m, df_1h, df_4h):
     if regime in ("range", "unknown"): return None
     atr_pct = atr_val / price
     if atr_pct < 0.004 or atr_pct > 0.045: return None
-    if not (last["volume"] > 1.2 * last["vol_ma"]) or adx_val < 23: return None
+    
+    adx_min = BTC_ADX_MIN if sym.startswith("BTC/") else 20  # رفع الحساسية للجميع
+    if not (last["volume"] > 1.2 * last["vol_ma"]) or adx_val < adx_min: return None
+    
     near_ema = abs(price - ema21) / price < 0.011 or abs(price - ema50) / price < 0.016
     bullish_reject = last["close"] > last["open"] and (last["low"] < ema21 or prev["low"] < ema21)
     bearish_reject = last["close"] < last["open"] and (last["high"] > ema21 or prev["high"] > ema21)
@@ -791,7 +857,8 @@ def process_symbol(ex, sym):
                 with state_lock: state[sym]["contracts"] = exch_pos["contracts"]; cur = dict(state[sym])
                 manage_position(ex, sym, cur); return
 
-            if time.time() - pos_data.get("last_exit_ts", 0) < REENTRY_COOLDOWN_SEC: return
+            cooldown = BTC_COOLDOWN_MINUTES * 60 if sym.startswith("BTC/") else REENTRY_COOLDOWN_SEC
+            if time.time() - pos_data.get("last_exit_ts", 0) < cooldown: return
             if not entries_allowed(ex): return
             with state_lock: open_count = sum(1 for v in state.values() if v.get("position"))
             if open_count >= MAX_OPEN_POSITIONS: return
@@ -804,9 +871,15 @@ def process_symbol(ex, sym):
             if len(raw_1h) < 60 or len(raw_4h) < 60: return
             _last_eval[sym] = closed_ts
 
-            signal = check_entry_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
+            signal = check_entry_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h), sym)
             if not signal: return
             side = signal["side"]
+
+            if sym.startswith("BTC/"):
+                btc_ok, why = btc_can_trade()
+                if not btc_ok:
+                    log.info(f"[BTC SKIP] {why}")
+                    return
 
             with state_lock: same_dir = sum(1 for v in state.values() if v.get("position") == side)
             if same_dir >= MAX_SAME_DIRECTION: return
@@ -822,17 +895,20 @@ def process_symbol(ex, sym):
             sl_pct = signal["sl_pct"]
             if side == "LONG": sl = actual_price * (1 - sl_pct); tp = actual_price * (1 + sl_pct * RR_RATIO)
             else: sl = actual_price * (1 + sl_pct); tp = actual_price * (1 - sl_pct * RR_RATIO)
-            margin = compute_margin(get_equity(ex), sl_pct)
+            
+            lev = BTC_LEVERAGE if sym.startswith("BTC/") else LEVERAGE
+            margin = compute_margin(get_equity(ex), sl_pct, lev)
 
             success, info, entry, contracts = open_position(ex, sym, side, actual_price, sl, tp, margin)
             now = time.time()
             if success:
                 with state_lock:
                     state[sym].update({"position": side, "entry": entry, "sl": sl, "tp": tp, "initial_sl": sl, "initial_risk": abs(entry - sl), "contracts": contracts, "initial_contracts": contracts, "margin": margin, "opened_ts": now, "leg_ts": now, "realized_pnl": 0.0, "last_notified_sl": None, "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False, "regime": signal.get("regime", "")})
+                if sym.startswith("BTC/"): btc_register_entry()
             else:
                 with state_lock: state[sym]["last_exit_ts"] = now
             save_state()
-            caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""))
+            caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""), lev)
             if not success: caption += f"\n❌ {info}"
             send(caption)
     except Exception as e:
@@ -913,10 +989,15 @@ def status_text(ex):
     for sym, v in opens.items():
         price, upnl = unrealized(ex, sym, v); total_float += upnl
         lines_pos.append(f"• <code>{short(sym)}</code> {v['position']} | {fmt(v['entry'])} → {fmt(price)} | {upnl:+.2f}{flags_text(v)}")
+    btc_ok, btc_why = btc_can_trade()
+    btc_st = f"✅ ({btc_tracker['count']}/{BTC_MAX_TRADES_PER_DAY})" if btc_ok else f"⛔ {btc_why}"
     lines = [f"📊 <b>حالة البوت {VERSION}</b> {'⏸️' if meta.get('paused') else '▶️'}", "━━━━━━━━━━━━━━━",
              f"💼 الرصيد: {equity:,.2f} USDT",
              f"📅 المحقق اليوم: {snap['value']:+.2f} USDT | صفقات: {snap['trades']} | رابحة: {snap['wins']}",
-             f"📈 <b>الربح العائم: {total_float:+.2f} USDT</b>", "━━━━━━━━━━━━━━━"]
+             f"📈 <b>الربح العائم: {total_float:+.2f} USDT</b>",
+             f"🐋 BTC Bias: {_btc_bias_cache['value']}",
+             f"🎯 BTC اليوم: {btc_st}",
+             "━━━━━━━━━━━━━━━"]
     lines.extend(lines_pos if lines_pos else ["لا توجد صفقات مفتوحة."])
     return "\n".join(lines)
 
@@ -939,10 +1020,11 @@ def risk_text(ex):
     longs = sum(1 for v in opens.values() if v["position"] == "LONG"); shorts = sum(1 for v in opens.values() if v["position"] == "SHORT")
     loss_limit = equity * DAILY_LOSS_LIMIT_PCT / 100.0; profit_target = equity * DAILY_PROFIT_TARGET_PCT / 100.0
     status = "⏸️ متوقف" if meta.get("paused") else "▶️ يعمل"
+    btc_ok, btc_why = btc_can_trade()
     return "\n".join(["🛡️ <b>ملخص إدارة المخاطر</b>", "━━━━━━━━━━━━━━━", f"💼 الرصيد: <b>{equity:,.2f} USDT</b>", f"📊 الحالة: {status} | BTC: {_btc_bias_cache['value']}", "",
                       f"🎯 المخاطرة لكل صفقة: <b>{RISK_PCT_PER_TRADE}%</b>", f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT)", f"📈 هدف الربح اليومي: {DAILY_PROFIT_TARGET_PCT}% ({profit_target:.1f} USDT)", "",
                       f"🔢 المفتوحة: {len(opens)} / {MAX_OPEN_POSITIONS}", f"🟢 LONG: {longs} | 🔴 SHORT: {shorts} (الحد {MAX_SAME_DIRECTION})", "",
-                      f"📅 نتيجة اليوم: <b>{snap['value']:+.2f} USDT</b>", f"🔻 المتبقي للخسارة: {loss_limit + snap['value']:+.2f} USDT", f"🔺 المتبقي للهدف: {profit_target - snap['value']:+.2f} USDT", "━━━━━━━━━━━━━━━"])
+                      f"📅 نتيجة اليوم: <b>{snap['value']:+.2f} USDT</b>", f"🔻 المتبقي للخسارة: {loss_limit + snap['value']:+.2f} USDT", f"🔺 المتبقي للهدف: {profit_target - snap['value']:+.2f} USDT", "", f"🎯 BTC: {btc_ok} ({btc_why})", "━━━━━━━━━━━━━━━"])
 
 def daily_text(ex):
     snap = daily_snapshot(); equity = get_equity(ex, force=True)
@@ -964,22 +1046,22 @@ def handle_command(ex, text, chat_id, active_symbols):
     elif cmd == "/risk": send(risk_text(ex), chat_id)
     elif cmd == "/daily": send(daily_text(ex), chat_id)
     elif cmd == "/stats": send(stats_text(), chat_id)
-    elif cmd == "/pause": set_meta("paused", True); send("⏸️ تم إيقاف فتح صفقات جديدة (الصفقات المفتوحة تبقى مُدارة).", chat_id)
-    elif cmd == "/resume": set_meta("paused", False); send("▶️ تم استئناف البحث عن صفقات.", chat_id)
+    elif cmd == "/pause": set_meta("paused", True); send("⏸️ تم إيقاف فتح صفقات جديدة.", chat_id)
+    elif cmd == "/resume": set_meta("paused", False); send("▶️ تم استئناف البحث.", chat_id)
     elif cmd == "/close":
         if len(parts) < 2: send("استخدم: /close BTC", chat_id); return
         sym = find_symbol(parts[1], active_symbols)
         if not sym: send("عملة غير معروفة.", chat_id); return
         with trade_lock:
             with state_lock: pos_data = dict(state.get(sym, {}))
-            if not pos_data.get("position"): send("لا توجد صفقة مفتوحة على هذه العملة.", chat_id); return
+            if not pos_data.get("position"): send("لا توجد صفقة مفتوحة.", chat_id); return
             if close_full(ex, sym): finalize_trade(ex, sym, reason_hint="Manual")
-            else: send("❌ فشل الإغلاق، تحقق من المنصة.", chat_id)
+            else: send("❌ فشل الإغلاق.", chat_id)
     elif cmd == "/closeall":
-        if len(parts) < 2 or parts[1].lower() != "confirm": send("⚠️ لتأكيد إغلاق كل الصفقات أرسل:\n/closeall confirm", chat_id); return
+        if len(parts) < 2 or parts[1].lower() != "confirm": send("⚠️ للتأكيد: /closeall confirm", chat_id); return
         with trade_lock:
             with state_lock: syms = [k for k, v in state.items() if v.get("position")]
-            if not syms: send("لا توجد صفقات مفتوحة.", chat_id); return
+            if not syms: send("لا توجد صفقات.", chat_id); return
             for sym in syms:
                 if close_full(ex, sym): finalize_trade(ex, sym, reason_hint="Manual")
                 else: send(f"❌ فشل إغلاق <code>{short(sym)}</code>", chat_id)
@@ -1038,7 +1120,7 @@ def trading_loop():
     active_symbols = [s for s in FUTURES_SYMBOLS if s in ex.markets]
     sync_positions(ex, active_symbols)
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
-    send(f"🚀 <b>تم تشغيل البوت {VERSION}</b>\n━━━━━━━━━━━━━━━\n⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n💰 المخاطرة: {RISK_PCT_PER_TRADE}% من الرصيد\n🎯 Partial: {int(PARTIAL1_PCT * 100)}% @ {PARTIAL1_R}R → {int(PARTIAL2_PCT * 100)}% من المتبقي @ {PARTIAL2_R}R + Trailing\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
+    send(f"🚀 <b>تم تشغيل البوت {VERSION} (تركيز BTC + مخاطرة أعلى)</b>\n━━━━━━━━━━━━━━━\n⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة عامة: {LEVERAGE}x\n🎯 رافعة BTC: {BTC_LEVERAGE}x | حد صفقات BTC: {BTC_MAX_TRADES_PER_DAY}/يوم\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
 
     fail_streak = 0
     while True:
