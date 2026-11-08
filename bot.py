@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V44 (Profiles + Tunable Filters)
+OKX Futures Trading Bot - V45 (Relative ATR + Breakout + Per-Strategy Stats)
 
-الجديد عن V43:
-- بروفايلات جاهزة بمتغير واحد PROFILE: conservative | balanced | active
-  (الافتراضي: balanced على Sandbox، و conservative على الحساب الحقيقي).
-- كل حد في الاستراتيجية قابل للتعديل من متغيرات البيئة في Render بدون تغيير الكود
-  (MIN_ATR_PCT, MIN_ADX, MIN_VOL_MULT, REGIME_ADX4_STRONG, REGIME_ADX4_WEAK, REGIME_ADX1_STRONG,
-   RSI_LONG_MIN/MAX, RSI_SHORT_MIN/MAX, NEAR_EMA21_PCT, NEAR_EMA50_PCT, MAX_SPREAD_PCT).
-  المتغير المنفرد يتقدم على البروفايل.
-- حماية: البروفايل active ممنوع على الحساب الحقيقي (يتحول تلقائياً إلى balanced مع تنبيه).
-- تسجيل قيمة السبريد عند الحجب (log) وعرضها في /why BTC.
-- أمر /config لعرض الإعدادات الفعلية الحالية.
+الجديد عن V44:
+1) حد ATR نسبي لكل عملة: تُقبل الشمعة إذا كان ATR مطلقاً كافياً، أو إذا كان تذبذب العملة الآن أعلى من
+   وسيطها خلال آخر ~100 شمعة (مع حد أدنى مطلق للرسوم). يلتقط "أنشط وقت للعملة" بدل التذبذب المطلق فقط.
+2) استراتيجية اختراق (Breakout) إضافية تكمّل استراتيجية الارتداد (Pullback).
+   مفعّلة افتراضياً على Sandbox فقط؛ على الحساب الحقيقي تحتاج ENABLE_BREAKOUT=1 صراحةً.
+3) تسجيل اسم الاستراتيجية مع كل صفقة (الحالة + السجل + الرسائل) و /stats يعرض النتائج لكل استراتيجية
+   ولكل اتجاه (LONG/SHORT) مع تحذير إذا العينة صغيرة. ترحيل تلقائي للسجل القديم.
+4) /why يفصل أسباب الرفض: العامة، ثم الارتداد، ثم الاختراق.
 """
 import os
 import sys
@@ -35,7 +33,7 @@ log = logging.getLogger("bot")
 # ==========================================
 # الإعدادات
 # ==========================================
-VERSION = "V44"
+VERSION = "V45"
 KSA_TZ = timezone(timedelta(hours=3))
 
 
@@ -44,6 +42,13 @@ def env_float(name, default):
         return float(os.getenv(name, default))
     except ValueError:
         return float(default)
+
+
+def env_flag(name, default):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes")
 
 
 OKX_API_KEY = os.getenv("OKX_API_KEY", "")
@@ -110,19 +115,22 @@ USE_BTC_FILTER = True
 
 # ---------- بروفايلات الاستراتيجية ----------
 PROFILES = {
-    # الإعدادات الأصلية (الأكثر تشدداً)
+    # الإعدادات الأصلية (الأكثر تشدداً) — ATR النسبي معطّل (نسبة 99)
     "conservative": {
         "min_atr_pct": 0.004, "min_adx": 23, "min_vol_mult": 1.2,
         "regime_adx4_strong": 28, "regime_adx1_strong": 24, "regime_adx4_weak": 20,
         "rsi_long_min": 40, "rsi_long_max": 61, "rsi_short_min": 39, "rsi_short_max": 60,
         "near_ema21_pct": 0.011, "near_ema50_pct": 0.016, "max_spread_pct": 0.0011,
+        "rel_atr_ratio": 99, "atr_hard_floor": 0.003,
+        "bo_vol_mult": 1.8, "bo_max_ext_atr": 2.0,
     },
-    # وسط: فرص أكثر مع بقاء منطق الاتجاه
     "balanced": {
         "min_atr_pct": 0.003, "min_adx": 20, "min_vol_mult": 1.0,
         "regime_adx4_strong": 26, "regime_adx1_strong": 22, "regime_adx4_weak": 18,
         "rsi_long_min": 38, "rsi_long_max": 64, "rsi_short_min": 36, "rsi_short_max": 62,
         "near_ema21_pct": 0.013, "near_ema50_pct": 0.019, "max_spread_pct": 0.0015,
+        "rel_atr_ratio": 1.15, "atr_hard_floor": 0.0018,
+        "bo_vol_mult": 1.5, "bo_max_ext_atr": 2.5,
     },
     # لاختبار آلية التنفيذ على Sandbox فقط
     "active": {
@@ -130,6 +138,8 @@ PROFILES = {
         "regime_adx4_strong": 24, "regime_adx1_strong": 20, "regime_adx4_weak": 15,
         "rsi_long_min": 35, "rsi_long_max": 67, "rsi_short_min": 33, "rsi_short_max": 65,
         "near_ema21_pct": 0.016, "near_ema50_pct": 0.024, "max_spread_pct": 0.003,
+        "rel_atr_ratio": 0.9, "atr_hard_floor": 0.0015,
+        "bo_vol_mult": 1.2, "bo_max_ext_atr": 3.0,
     },
 }
 _default_profile = "balanced" if USE_SANDBOX else "conservative"
@@ -162,6 +172,20 @@ RSI_SHORT_MAX = _cfg("rsi_short_max")
 NEAR_EMA21_PCT = _cfg("near_ema21_pct")
 NEAR_EMA50_PCT = _cfg("near_ema50_pct")
 MAX_SPREAD_PCT = _cfg("max_spread_pct")
+REL_ATR_RATIO = _cfg("rel_atr_ratio")
+ATR_HARD_FLOOR = _cfg("atr_hard_floor")
+
+# ---------- استراتيجية الاختراق ----------
+# على الحساب الحقيقي معطّلة افتراضياً حتى تُفعَّل صراحةً (ENABLE_BREAKOUT=1)
+ENABLE_BREAKOUT = env_flag("ENABLE_BREAKOUT", USE_SANDBOX)
+BO_LOOKBACK = int(env_float("BO_LOOKBACK", 20))
+BO_VOL_MULT = _cfg("bo_vol_mult")
+BO_MAX_EXT_ATR = _cfg("bo_max_ext_atr")
+BO_BODY_POS = env_float("BO_BODY_POS", 0.6)          # موضع الإغلاق داخل مدى الشمعة
+BO_RSI_LONG_MIN = env_float("BO_RSI_LONG_MIN", 52)
+BO_RSI_LONG_MAX = env_float("BO_RSI_LONG_MAX", 72)
+BO_RSI_SHORT_MIN = env_float("BO_RSI_SHORT_MIN", 28)
+BO_RSI_SHORT_MAX = env_float("BO_RSI_SHORT_MAX", 48)
 
 WATCHDOG_SEC = 300
 
@@ -191,7 +215,13 @@ _warned_external = set()
 _lock_fh = None
 
 # ---------- التشخيص ----------
-diag = {"date": "", "evaluated": 0, "signals": 0, "opened": 0, "reasons": {}, "blocks": {}}
+def _diag_blank(date=""):
+    return {"date": date, "evaluated": 0, "signals": 0, "opened": 0, "signals_by": {},
+            "reasons": {}, "reasons_pullback": {}, "reasons_breakout": {}, "blocks": {}}
+
+
+diag = _diag_blank()
+STRAT_LABEL = {"pullback": "الارتداد", "breakout": "الاختراق", "adopted": "متبنّاة", "legacy": "قديمة"}
 _last_reason = {}      # sym -> (ts, reason)
 loop_info = {"last_cycle_ts": 0.0, "cycles": 0, "last_duration": 0.0, "last_error": "", "alerted": False}
 
@@ -226,29 +256,54 @@ REASON_LABELS = {
     "max_positions": "الحد الأقصى للصفقات",
     "no_data": "لا توجد بيانات شموع",
     "signal": "إشارة ✅",
+    "bo_no_breakout": "لا اختراق لقمة/قاع 20 شمعة",
+    "bo_trend_mismatch": "اتجاه الساعة لا يدعم الاختراق",
+    "bo_low_volume": "حجم الاختراق ضعيف",
+    "bo_weak_candle": "شمعة الاختراق ضعيفة الإغلاق",
+    "bo_rsi": "RSI خارج نطاق الاختراق",
+    "bo_extended": "السعر بعيد عن EMA21 (مطاردة)",
 }
 
 
 def label(r):
+    if r.startswith("signal:"):
+        name = r.split(":", 1)[1]
+        return f"إشارة ✅ ({STRAT_LABEL.get(name, name)})"
     return REASON_LABELS.get(r, r)
 
 
 def _diag_roll_locked():
     today = str(datetime.now(KSA_TZ).date())
     if diag["date"] != today:
-        diag.update({"date": today, "evaluated": 0, "signals": 0, "opened": 0, "reasons": {}, "blocks": {}})
+        diag.clear()
+        diag.update(_diag_blank(today))
 
 
-def note_eval(sym, reason):
-    """reason=None تعني أن الإشارة وُجدت."""
+def note_eval(sym, signal, reasons):
+    """signal: قاموس الإشارة أو None. reasons: {'common': r} أو {'pullback': r, 'breakout': r}."""
     with diag_lock:
         _diag_roll_locked()
         diag["evaluated"] += 1
-        if reason is None:
+        if signal:
             diag["signals"] += 1
+            name = signal.get("strategy", "?")
+            diag["signals_by"][name] = diag["signals_by"].get(name, 0) + 1
+            _last_reason[sym] = (time.time(), f"signal:{name}")
+            return
+        if "common" in reasons:
+            r = reasons["common"]
+            diag["reasons"][r] = diag["reasons"].get(r, 0) + 1
+            text = label(r)
         else:
-            diag["reasons"][reason] = diag["reasons"].get(reason, 0) + 1
-        _last_reason[sym] = (time.time(), reason or "signal")
+            parts = []
+            for strat in ("pullback", "breakout"):
+                if strat in reasons:
+                    r = reasons[strat]
+                    key = f"reasons_{strat}"
+                    diag[key][r] = diag[key].get(r, 0) + 1
+                    parts.append(f"{STRAT_LABEL[strat]}: {label(r)}")
+            text = " | ".join(parts)
+        _last_reason[sym] = (time.time(), text)
 
 
 def note_block(sym, reason):
@@ -324,7 +379,7 @@ def new_sym_state():
         "opened_ts": 0, "leg_ts": 0, "last_exit_ts": 0,
         "realized_pnl": 0.0, "breakeven_hit": False,
         "partial_1_taken": False, "partial_2_taken": False,
-        "last_notified_sl": None, "regime": "unknown",
+        "last_notified_sl": None, "regime": "unknown", "strategy": "",
     }
 
 
@@ -409,7 +464,30 @@ def daily_snapshot():
 # سجل الصفقات
 # ==========================================
 JOURNAL_FIELDS = ["close_time", "symbol", "side", "entry", "exit", "initial_contracts",
-                  "pnl", "r_multiple", "reason", "regime", "duration_min"]
+                  "pnl", "r_multiple", "reason", "regime", "duration_min", "strategy"]
+
+
+def migrate_journal():
+    """يضيف عمود strategy للسجل القديم (القيمة legacy) لتجنب تلف ملف CSV."""
+    try:
+        with journal_lock:
+            if not os.path.exists(JOURNAL_FILE):
+                return
+            with open(JOURNAL_FILE, newline="", encoding="utf-8") as f:
+                header = f.readline().strip().split(",")
+            if "strategy" in header:
+                return
+            with open(JOURNAL_FILE, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            for r in rows:
+                r["strategy"] = "legacy"
+            with open(JOURNAL_FILE, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(rows)
+            log.info(f"[JOURNAL] تم ترحيل {len(rows)} صفقة قديمة (strategy=legacy)")
+    except Exception as e:
+        log.error(f"[JOURNAL MIGRATE] {e}")
 
 
 def journal_append(row):
@@ -425,6 +503,13 @@ def journal_append(row):
         log.error(f"[JOURNAL] {e}")
 
 
+def _group_line(name, g):
+    wins = g[g["pnl"] > 0]
+    wr = len(wins) / len(g) * 100
+    avg_r = g["r_multiple"].mean() if "r_multiple" in g else 0.0
+    return f"• {name}: {len(g)} صفقة | ربح {wr:.0f}% | صافي {g['pnl'].sum():+.2f} | R {avg_r:+.2f}"
+
+
 def stats_text():
     try:
         with journal_lock:
@@ -435,6 +520,9 @@ def stats_text():
         return f"خطأ في قراءة السجل: {e}"
     if df.empty:
         return "📭 لا يوجد سجل صفقات بعد."
+    if "strategy" not in df:
+        df["strategy"] = "legacy"
+    df["strategy"] = df["strategy"].fillna("legacy")
     n = len(df)
     wins = df[df["pnl"] > 0]
     losses = df[df["pnl"] <= 0]
@@ -448,15 +536,25 @@ def stats_text():
     avg_win = wins["pnl"].mean() if len(wins) else 0.0
     avg_loss = losses["pnl"].mean() if len(losses) else 0.0
     pf_txt = "∞" if pf == float("inf") else f"{pf:.2f}"
-    return (f"📈 <b>إحصائيات الأداء الكلية</b>\n━━━━━━━━━━━━━━━\n"
-            f"🔢 عدد الصفقات: {n}\n"
-            f"✅ نسبة الربح: {wr:.1f}%\n"
-            f"💰 الصافي: <b>{df['pnl'].sum():+.2f} USDT</b>\n"
-            f"⚖️ Profit Factor: {pf_txt}\n"
-            f"📐 متوسط R: {avg_r:+.2f}\n"
-            f"🟢 متوسط الربح: {avg_win:+.2f} | 🔴 متوسط الخسارة: {avg_loss:+.2f}\n"
-            f"📉 أقصى تراجع: {max_dd:.2f} USDT\n"
-            f"━━━━━━━━━━━━━━━")
+    lines = [f"📈 <b>إحصائيات الأداء الكلية</b>", "━━━━━━━━━━━━━━━",
+             f"🔢 عدد الصفقات: {n}",
+             f"✅ نسبة الربح: {wr:.1f}%",
+             f"💰 الصافي: <b>{df['pnl'].sum():+.2f} USDT</b>",
+             f"⚖️ Profit Factor: {pf_txt}",
+             f"📐 متوسط R: {avg_r:+.2f}",
+             f"🟢 متوسط الربح: {avg_win:+.2f} | 🔴 متوسط الخسارة: {avg_loss:+.2f}",
+             f"📉 أقصى تراجع: {max_dd:.2f} USDT",
+             "", "<b>حسب الاستراتيجية:</b>"]
+    for name, g in df.groupby("strategy"):
+        lines.append(_group_line(STRAT_LABEL.get(name, name), g))
+    if "side" in df:
+        lines += ["", "<b>حسب الاتجاه:</b>"]
+        for name, g in df.groupby("side"):
+            lines.append(_group_line(name, g))
+    if n < 30:
+        lines += ["", f"⚠️ العينة صغيرة ({n} صفقة) — لا تعتمد على النسب قبل 30 صفقة على الأقل."]
+    lines.append("━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
 
 
 # ==========================================
@@ -495,7 +593,7 @@ REASONS = {
 }
 
 
-def msg_entry(sym, side, price, sl, tp, margin, real_order, regime=""):
+def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy=""):
     title = "🟢 <b>توصية شراء (LONG)</b>" if side == "LONG" else "🔴 <b>توصية بيع (SHORT)</b>"
     status = "✅ <b>تم فتح الصفقة آلياً</b>" if real_order else "⚠️ <b>إشارة فقط</b>"
     sl_pct = abs(price - sl) / price * 100
@@ -504,6 +602,8 @@ def msg_entry(sym, side, price, sl, tp, margin, real_order, regime=""):
     reward_usd = margin * (tp_pct / 100) * LEVERAGE
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     regime_txt = f"\n📡 <b>نظام السوق:</b> {regime}" if regime else ""
+    if strategy:
+        regime_txt += f"\n🧠 <b>الاستراتيجية:</b> {STRAT_LABEL.get(strategy, strategy)}"
     return (f"{title}\n{status}{regime_txt}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🪙 <b>الزوج:</b> <code>{short(sym)}</code>\n"
@@ -518,7 +618,7 @@ def msg_entry(sym, side, price, sl, tp, margin, real_order, regime=""):
             f"⏰ {now_str}")
 
 
-def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margin, r_mult, reason):
+def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margin, r_mult, reason, strategy=""):
     pct = (total_pnl / margin * 100) if margin else 0.0
     if total_pnl > 0:
         title = "🟢 <b>إغلاق بربح</b>"
@@ -535,6 +635,7 @@ def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margi
             f"💰 الصافي الكلي: <b>{total_pnl:+.2f} USDT</b>\n"
             f"🧩 الجزء الأخير: {final_leg_pnl:+.2f} USDT\n"
             f"📝 السبب: {REASONS.get(reason, reason)}\n"
+            f"🧠 الاستراتيجية: {STRAT_LABEL.get(strategy, strategy or '—')}\n"
             f"━━━━━━━━━━━━━━━")
 
 
@@ -934,10 +1035,12 @@ def finalize_trade(ex, sym, reason_hint=None):
         "symbol": short(sym), "side": side, "entry": entry, "exit": exit_price,
         "initial_contracts": pos_data.get("initial_contracts", 0.0),
         "pnl": round(total, 4), "r_multiple": round(r_mult, 3), "reason": reason,
-        "regime": pos_data.get("regime", ""), "duration_min": duration})
+        "regime": pos_data.get("regime", ""), "duration_min": duration,
+        "strategy": pos_data.get("strategy") or "legacy"})
     reset_sym_state(sym, cooldown=True)
     cancel_pending(ex, sym)
-    send(msg_exit(sym, side, exit_price, entry, total, final_leg, margin, r_mult, reason))
+    send(msg_exit(sym, side, exit_price, entry, total, final_leg, margin, r_mult, reason,
+                  pos_data.get("strategy", "")))
 
 
 def emergency_close(ex, sym, why):
@@ -1012,8 +1115,21 @@ def detect_regime(df_15m, df_1h, df_4h):
     return "range"
 
 
-def evaluate_signal(df_15m, df_1h, df_4h):
-    """يرجع (signal, None) عند وجود إشارة أو (None, reason) مع أول شرط فشل. المنطق مطابق لـ V42."""
+def relative_atr(df):
+    """نسبة ATR% الحالي إلى وسيط ATR% لنفس العملة خلال ~100 شمعة مغلقة سابقة. None إذا لا تكفي البيانات."""
+    try:
+        series = (df["atr"] / df["close"]).iloc[-102:-2].dropna()
+        if len(series) < 60:
+            return None
+        base = float(series.median())
+        cur = float(df["atr"].iloc[-2] / df["close"].iloc[-2])
+        return cur / base if base > 0 else None
+    except Exception:
+        return None
+
+
+def build_context(df_15m, df_1h, df_4h):
+    """الشروط العامة المشتركة بين الاستراتيجيتين. يرجع (ctx, None) أو (None, reason)."""
     if len(df_15m) < 70 or len(df_1h) < 60 or len(df_4h) < 60:
         return None, "insufficient_data"
     last = df_15m.iloc[-2]
@@ -1025,9 +1141,6 @@ def evaluate_signal(df_15m, df_1h, df_4h):
         return None, "indicators_nan"
     price = float(last["close"])
     atr_val = float(last["atr"])
-    ema21 = float(last["ema21"])
-    ema50 = float(last["ema50"])
-    rsi_val = float(last["rsi"])
     adx_val = float(last["adx"])
 
     regime = detect_regime(df_15m, df_1h, df_4h)
@@ -1036,26 +1149,50 @@ def evaluate_signal(df_15m, df_1h, df_4h):
     if regime == "range":
         return None, "regime_range"
     atr_pct = atr_val / price
-    if atr_pct < MIN_ATR_PCT:
-        return None, "atr_low"
     if atr_pct > MAX_ATR_PCT:
         return None, "atr_high"
+    rel = relative_atr(df_15m)
+    atr_ok = atr_pct >= MIN_ATR_PCT or (
+        rel is not None and atr_pct >= ATR_HARD_FLOOR and rel >= REL_ATR_RATIO)
+    if not atr_ok:
+        return None, "atr_low"
     if adx_val < MIN_ADX:
         return None, "low_adx"
-    if not (last["volume"] > MIN_VOL_MULT * last["vol_ma"]):
-        return None, "low_volume"
 
     long_dir = regime in ("strong_trend_up", "weak_trend") and last_4h["close"] > last_4h["ema50"]
     short_dir = regime in ("strong_trend_down", "weak_trend") and last_4h["close"] < last_4h["ema50"]
     if not long_dir and not short_dir:
         return None, "direction_mismatch"
 
+    sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * atr_val / price))
+    return {
+        "last": last, "prev": prev, "last_1h": last_1h, "last_4h": last_4h,
+        "price": price, "atr_val": atr_val, "ema21": float(last["ema21"]),
+        "ema50": float(last["ema50"]), "rsi": float(last["rsi"]),
+        "regime": regime, "long_dir": long_dir, "short_dir": short_dir,
+        "sl_pct": sl_pct, "tp_pct": sl_pct * RR_RATIO,
+    }, None
+
+
+def _make_signal(side, ctx, strategy):
+    p, sp, tp_pct = ctx["price"], ctx["sl_pct"], ctx["tp_pct"]
+    if side == "LONG":
+        sl, tp = p * (1 - sp), p * (1 + tp_pct)
+    else:
+        sl, tp = p * (1 + sp), p * (1 - tp_pct)
+    return {"side": side, "price": p, "sl_pct": sp, "sl": sl, "tp": tp,
+            "regime": ctx["regime"], "strategy": strategy}
+
+
+def pullback_signal(ctx):
+    """استراتيجية الارتداد: دخول مع الاتجاه بعد تراجع نحو EMA. يرجع (signal, None) أو (None, reason)."""
+    last, prev, last_1h = ctx["last"], ctx["prev"], ctx["last_1h"]
+    price, ema21, ema50, rsi_val = ctx["price"], ctx["ema21"], ctx["ema50"], ctx["rsi"]
+    if not (last["volume"] > MIN_VOL_MULT * last["vol_ma"]):
+        return None, "low_volume"
     near_ema = (abs(price - ema21) / price < NEAR_EMA21_PCT or
                 abs(price - ema50) / price < NEAR_EMA50_PCT)
-    sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * atr_val / price))
-    tp_pct = sl_pct * RR_RATIO
-
-    if long_dir:
+    if ctx["long_dir"]:
         bullish_reject = last["close"] > last["open"] and (last["low"] < ema21 or prev["low"] < ema21)
         if not (last["ema9"] > last["ema21"] and last_1h["ema9"] > last_1h["ema21"]):
             return None, "ema_misaligned"
@@ -1065,9 +1202,7 @@ def evaluate_signal(df_15m, df_1h, df_4h):
             return None, "rsi_out_of_range"
         if not bullish_reject:
             return None, "no_pullback_candle"
-        return {"side": "LONG", "price": price, "sl_pct": sl_pct, "sl": price * (1 - sl_pct),
-                "tp": price * (1 + tp_pct), "regime": regime}, None
-
+        return _make_signal("LONG", ctx, "pullback"), None
     bearish_reject = last["close"] < last["open"] and (last["high"] > ema21 or prev["high"] > ema21)
     if not (last["ema9"] < last["ema21"] and last_1h["ema9"] < last_1h["ema21"]):
         return None, "ema_misaligned"
@@ -1077,8 +1212,61 @@ def evaluate_signal(df_15m, df_1h, df_4h):
         return None, "rsi_out_of_range"
     if not bearish_reject:
         return None, "no_pullback_candle"
-    return {"side": "SHORT", "price": price, "sl_pct": sl_pct, "sl": price * (1 + sl_pct),
-            "tp": price * (1 - tp_pct), "regime": regime}, None
+    return _make_signal("SHORT", ctx, "pullback"), None
+
+
+def breakout_signal(ctx, df_15m):
+    """استراتيجية الاختراق: إغلاق شمعة خلف قمة/قاع آخر N شمعة بحجم مرتفع وبدعم اتجاه الساعة."""
+    last, last_1h = ctx["last"], ctx["last_1h"]
+    window = df_15m.iloc[-(BO_LOOKBACK + 2):-2]          # الشموع قبل آخر شمعة مغلقة
+    hh, ll = float(window["high"].max()), float(window["low"].min())
+    close, high, low = float(last["close"]), float(last["high"]), float(last["low"])
+    rng = high - low
+    vol_ok = last["volume"] > BO_VOL_MULT * last["vol_ma"]
+    if ctx["long_dir"]:
+        if not close > hh:
+            return None, "bo_no_breakout"
+        if not (last_1h["ema9"] > last_1h["ema21"] and last_1h["close"] > last_1h["ema50"]):
+            return None, "bo_trend_mismatch"
+        if not vol_ok:
+            return None, "bo_low_volume"
+        if rng <= 0 or (close - low) / rng < BO_BODY_POS:
+            return None, "bo_weak_candle"
+        if not (BO_RSI_LONG_MIN < ctx["rsi"] < BO_RSI_LONG_MAX):
+            return None, "bo_rsi"
+        if close - ctx["ema21"] > BO_MAX_EXT_ATR * ctx["atr_val"]:
+            return None, "bo_extended"
+        return _make_signal("LONG", ctx, "breakout"), None
+    if not close < ll:
+        return None, "bo_no_breakout"
+    if not (last_1h["ema9"] < last_1h["ema21"] and last_1h["close"] < last_1h["ema50"]):
+        return None, "bo_trend_mismatch"
+    if not vol_ok:
+        return None, "bo_low_volume"
+    if rng <= 0 or (high - close) / rng < BO_BODY_POS:
+        return None, "bo_weak_candle"
+    if not (BO_RSI_SHORT_MIN < ctx["rsi"] < BO_RSI_SHORT_MAX):
+        return None, "bo_rsi"
+    if ctx["ema21"] - close > BO_MAX_EXT_ATR * ctx["atr_val"]:
+        return None, "bo_extended"
+    return _make_signal("SHORT", ctx, "breakout"), None
+
+
+def evaluate_signal(df_15m, df_1h, df_4h):
+    """يرجع (signal, {}) أو (None, reasons) حيث reasons = {'common': r} أو {'pullback': r, 'breakout': r}."""
+    ctx, reason = build_context(df_15m, df_1h, df_4h)
+    if ctx is None:
+        return None, {"common": reason}
+    sig, r_pull = pullback_signal(ctx)
+    if sig:
+        return sig, {}
+    reasons = {"pullback": r_pull}
+    if ENABLE_BREAKOUT:
+        sig, r_bo = breakout_signal(ctx, df_15m)
+        if sig:
+            return sig, {}
+        reasons["breakout"] = r_bo
+    return None, reasons
 
 
 def market_filters_ok(ex, sym, side):
@@ -1338,12 +1526,12 @@ def process_symbol(ex, sym):
                 return
             _last_eval[sym] = closed_ts
 
-            signal, reason = evaluate_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
-            note_eval(sym, reason)
+            signal, reasons = evaluate_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
+            note_eval(sym, signal, reasons)
             if not signal:
                 return
             side = signal["side"]
-            log.info(f"[SIGNAL] {sym} {side} regime={signal['regime']}")
+            log.info(f"[SIGNAL] {sym} {side} strategy={signal['strategy']} regime={signal['regime']}")
 
             with state_lock:
                 same_dir = sum(1 for v in state.values() if v.get("position") == side)
@@ -1393,13 +1581,15 @@ def process_symbol(ex, sym):
                         "margin": margin, "opened_ts": now, "leg_ts": now,
                         "realized_pnl": 0.0, "last_notified_sl": None,
                         "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False,
-                        "regime": signal.get("regime", "")})
+                        "regime": signal.get("regime", ""),
+                        "strategy": signal.get("strategy", "")})
             else:
                 note_block(sym, "open_failed")
                 with state_lock:
                     state[sym]["last_exit_ts"] = now
             save_state()
-            caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""))
+            caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""),
+                                signal.get("strategy", ""))
             if not success:
                 caption += f"\n❌ {info}"
             send(caption)
@@ -1476,7 +1666,8 @@ def sync_positions(ex, active_symbols):
                             "initial_sl": sl, "initial_risk": abs(entry - sl),
                             "contracts": contracts, "initial_contracts": contracts,
                             "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
-                            "opened_ts": now, "leg_ts": now, "regime": "adopted"})
+                            "opened_ts": now, "leg_ts": now, "regime": "adopted",
+                            "strategy": "adopted"})
                     send(f"♻️ تم تبني مركز <code>{short(sym)}</code> ({side}) — SL {sl_pct * 100:.2f}% (ATR)")
         save_state()
 
@@ -1558,16 +1749,26 @@ def why_text(arg, active_symbols):
     with diag_lock:
         d = json.loads(json.dumps(diag))
     ev = d["evaluated"]
+    sig_txt = " | ".join(f"{STRAT_LABEL.get(k, k)} {v}" for k, v in d.get("signals_by", {}).items()) or "—"
     lines = [f"🔎 <b>لماذا لا توجد صفقات؟</b> — {d['date']}", "━━━━━━━━━━━━━━━",
              f"📊 تقييمات (رمز×شمعة): {ev}",
-             f"✅ إشارات: {d['signals']} | 🟢 صفقات فُتحت: {d['opened']}"]
-    lines.append(f"⚙️ البروفايل: <b>{PROFILE_NAME}</b> (/config)")
+             f"✅ إشارات: {d['signals']} ({sig_txt}) | 🟢 فُتحت: {d['opened']}",
+             f"⚙️ البروفايل: <b>{PROFILE_NAME}</b> | الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'} (/config)"]
     if meta.get("paused"):
         lines.append("⏸️ <b>البوت موقوف (/resume)</b>")
     if ev:
-        lines += ["", "<b>أسباب رفض الشموع:</b>"]
+        lines += ["", "<b>الأسباب العامة (قبل الاستراتيجيات):</b>"]
         for r, n in sorted(d["reasons"].items(), key=lambda x: -x[1])[:8]:
             lines.append(f"• {label(r)}: {n} ({n / ev * 100:.0f}%)")
+        staged = sum(d.get("reasons_pullback", {}).values())
+        if staged:
+            lines.append(f"\nوصلت لمرحلة الاستراتيجيات: {staged + d['signals']} شمعة")
+        for key, title in (("reasons_pullback", "الارتداد"), ("reasons_breakout", "الاختراق")):
+            items = sorted(d.get(key, {}).items(), key=lambda x: -x[1])[:4]
+            if items:
+                lines += ["", f"<b>{title}:</b>"]
+                for r, n in items:
+                    lines.append(f"• {label(r)}: {n}")
     else:
         lines.append("\nلا توجد تقييمات بعد (انتظر إغلاق شمعة 15 دقيقة).")
     if d["blocks"]:
@@ -1581,16 +1782,18 @@ def why_text(arg, active_symbols):
 def config_text():
     return "\n".join([
         f"⚙️ <b>الإعدادات الحالية</b> — البروفايل: <b>{PROFILE_NAME}</b>", "━━━━━━━━━━━━━━━",
-        f"ATR الأدنى (15د): {MIN_ATR_PCT * 100:.2f}%",
+        f"ATR الأدنى المطلق (15د): {MIN_ATR_PCT * 100:.2f}%",
+        f"ATR النسبي: نسبة ≥ {REL_ATR_RATIO:g}× وسيط العملة (حد أدنى {ATR_HARD_FLOOR * 100:.2f}%)"
+        + (" — معطّل" if REL_ATR_RATIO >= 50 else ""),
         f"ADX الأدنى (15د): {MIN_ADX:g}",
         f"ADX 4س قوي/ضعيف: {REGIME_ADX4_STRONG:g} / {REGIME_ADX4_WEAK:g} | ADX 1س قوي: {REGIME_ADX1_STRONG:g}",
-        f"الحجم ≥ {MIN_VOL_MULT:g}× المتوسط",
-        f"RSI LONG: {RSI_LONG_MIN:g}–{RSI_LONG_MAX:g} | SHORT: {RSI_SHORT_MIN:g}–{RSI_SHORT_MAX:g}",
+        f"الارتداد — الحجم ≥ {MIN_VOL_MULT:g}× | RSI LONG {RSI_LONG_MIN:g}–{RSI_LONG_MAX:g} | SHORT {RSI_SHORT_MIN:g}–{RSI_SHORT_MAX:g}",
         f"القرب من EMA21 / EMA50: {NEAR_EMA21_PCT * 100:.1f}% / {NEAR_EMA50_PCT * 100:.1f}%",
+        f"الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'} | نافذة {BO_LOOKBACK} شمعة | حجم ≥ {BO_VOL_MULT:g}× | أقصى مطاردة {BO_MAX_EXT_ATR:g}×ATR",
         f"أقصى سبريد: {MAX_SPREAD_PCT * 100:.2f}%",
         f"المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة {LEVERAGE}x | سقف الهامش {MAX_MARGIN_USDT:.0f}",
         "━━━━━━━━━━━━━━━",
-        "للتعديل: متغيرات البيئة في Render (PROFILE أو أي حد منفرد) ثم إعادة النشر."])
+        "للتعديل: متغيرات البيئة في Render (PROFILE أو أي حد منفرد، ENABLE_BREAKOUT) ثم إعادة النشر."])
 
 
 def positions_text(ex):
@@ -1824,6 +2027,7 @@ def trading_loop():
     try:
         ex = init_exchange()
         load_state()
+        migrate_journal()
         balance = get_equity(ex, force=True)
         mode_str = "تجريبي (Sandbox)" if USE_SANDBOX else "حقيقي"
         log.info(f"[OKX] Connected ({mode_str}). Equity: {balance}")
@@ -1839,7 +2043,7 @@ def trading_loop():
          f"⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n"
          f"📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n"
          f"💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة: {LEVERAGE}x\n"
-         f"🎚️ البروفايل: {PROFILE_NAME}\n"
+         f"🎚️ البروفايل: {PROFILE_NAME} | الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'}\n"
          f"🔎 /why أسباب عدم الدخول | ⚙️ /config الإعدادات\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
     if PROFILE_WARNING:
         send(f"⚠️ {PROFILE_WARNING}")
