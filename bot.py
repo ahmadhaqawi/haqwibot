@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V45 (Relative ATR + Breakout + Per-Strategy Stats)
+OKX Futures Trading Bot - V46 (Execution Costs + Real Risk)
 
-الجديد عن V44:
-1) حد ATR نسبي لكل عملة: تُقبل الشمعة إذا كان ATR مطلقاً كافياً، أو إذا كان تذبذب العملة الآن أعلى من
-   وسيطها خلال آخر ~100 شمعة (مع حد أدنى مطلق للرسوم). يلتقط "أنشط وقت للعملة" بدل التذبذب المطلق فقط.
-2) استراتيجية اختراق (Breakout) إضافية تكمّل استراتيجية الارتداد (Pullback).
-   مفعّلة افتراضياً على Sandbox فقط؛ على الحساب الحقيقي تحتاج ENABLE_BREAKOUT=1 صراحةً.
-3) تسجيل اسم الاستراتيجية مع كل صفقة (الحالة + السجل + الرسائل) و /stats يعرض النتائج لكل استراتيجية
-   ولكل اتجاه (LONG/SHORT) مع تحذير إذا العينة صغيرة. ترحيل تلقائي للسجل القديم.
-4) /why يفصل أسباب الرفض: العامة، ثم الارتداد، ثم الاختراق.
+الجديد عن V45:
+1) المخاطرة الفعلية: رسالة الدخول تعرض المخاطرة كنسبة من الرصيد مع تحذير إذا كانت أقل بكثير من المستهدف
+   (بسبب سقف الهامش)، و /risk يعرض المخاطرة الفعلية عند أوقاف نموذجية.
+2) انزلاق الوقف وانزلاق الدخول: يُحسبان لكل صفقة ويُسجلان في السجل، ويظهران في رسالة الخروج و /stats.
+3) الرسوم الفعلية من تنفيذات المنصة بدل التقدير (مع فحص معقولية وعودة للتقدير عند الشك)،
+   ويُعدَّل الربح اليومي ليطابق الربح الفعلي بعد الرسوم.
+4) ترحيل تلقائي للسجل القديم (يضيف الأعمدة الجديدة).
 """
 import os
 import sys
@@ -33,7 +32,7 @@ log = logging.getLogger("bot")
 # ==========================================
 # الإعدادات
 # ==========================================
-VERSION = "V45"
+VERSION = "V46"
 KSA_TZ = timezone(timedelta(hours=3))
 
 
@@ -380,6 +379,7 @@ def new_sym_state():
         "realized_pnl": 0.0, "breakeven_hit": False,
         "partial_1_taken": False, "partial_2_taken": False,
         "last_notified_sl": None, "regime": "unknown", "strategy": "",
+        "planned_entry": None, "realized_fees_est": 0.0,
     }
 
 
@@ -464,28 +464,30 @@ def daily_snapshot():
 # سجل الصفقات
 # ==========================================
 JOURNAL_FIELDS = ["close_time", "symbol", "side", "entry", "exit", "initial_contracts",
-                  "pnl", "r_multiple", "reason", "regime", "duration_min", "strategy"]
+                  "pnl", "r_multiple", "reason", "regime", "duration_min", "strategy",
+                  "fees", "fees_source", "stop_slip_usd", "stop_slip_r", "entry_slip_usd", "risk_usd"]
 
 
 def migrate_journal():
-    """يضيف عمود strategy للسجل القديم (القيمة legacy) لتجنب تلف ملف CSV."""
+    """يضيف الأعمدة الجديدة للسجل القديم (strategy=legacy، والباقي فارغ) لتجنب تلف ملف CSV."""
     try:
         with journal_lock:
             if not os.path.exists(JOURNAL_FILE):
                 return
             with open(JOURNAL_FILE, newline="", encoding="utf-8") as f:
-                header = f.readline().strip().split(",")
-            if "strategy" in header:
+                header = [h.strip() for h in f.readline().strip().split(",")]
+            if header == JOURNAL_FIELDS:
                 return
             with open(JOURNAL_FILE, newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
             for r in rows:
-                r["strategy"] = "legacy"
+                if not r.get("strategy"):
+                    r["strategy"] = "legacy"
             with open(JOURNAL_FILE, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS, extrasaction="ignore")
+                w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS, extrasaction="ignore", restval="")
                 w.writeheader()
                 w.writerows(rows)
-            log.info(f"[JOURNAL] تم ترحيل {len(rows)} صفقة قديمة (strategy=legacy)")
+            log.info(f"[JOURNAL] تم ترحيل {len(rows)} صفقة إلى الصيغة الجديدة")
     except Exception as e:
         log.error(f"[JOURNAL MIGRATE] {e}")
 
@@ -510,6 +512,12 @@ def _group_line(name, g):
     return f"• {name}: {len(g)} صفقة | ربح {wr:.0f}% | صافي {g['pnl'].sum():+.2f} | R {avg_r:+.2f}"
 
 
+def _num(df, col):
+    if col not in df:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(df[col], errors="coerce")
+
+
 def stats_text():
     try:
         with journal_lock:
@@ -523,6 +531,8 @@ def stats_text():
     if "strategy" not in df:
         df["strategy"] = "legacy"
     df["strategy"] = df["strategy"].fillna("legacy")
+    df["pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0)
+    df["r_multiple"] = _num(df, "r_multiple")
     n = len(df)
     wins = df[df["pnl"] > 0]
     losses = df[df["pnl"] <= 0]
@@ -531,7 +541,7 @@ def stats_text():
     pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
     curve = df["pnl"].cumsum()
     max_dd = (curve.cummax() - curve).max()
-    avg_r = df["r_multiple"].mean() if "r_multiple" in df else 0.0
+    avg_r = df["r_multiple"].mean()
     wr = len(wins) / n * 100
     avg_win = wins["pnl"].mean() if len(wins) else 0.0
     avg_loss = losses["pnl"].mean() if len(losses) else 0.0
@@ -551,6 +561,20 @@ def stats_text():
         lines += ["", "<b>حسب الاتجاه:</b>"]
         for name, g in df.groupby("side"):
             lines.append(_group_line(name, g))
+
+    fees = _num(df, "fees").dropna()
+    stop_usd = _num(df, "stop_slip_usd").dropna()
+    stop_r = _num(df, "stop_slip_r").dropna()
+    entry_slip = _num(df, "entry_slip_usd").dropna()
+    n_actual = int((df["fees_source"] == "actual").sum()) if "fees_source" in df else 0
+    if len(fees) or len(stop_usd) or len(entry_slip):
+        lines += ["", "<b>تكلفة التنفيذ (الموجب = تكلفة عليك):</b>"]
+        if len(fees):
+            lines.append(f"🧾 الرسوم: {fees.sum():.2f} USDT ({n_actual} فعلية / {len(fees) - n_actual} تقديرية)")
+        if len(stop_usd):
+            lines.append(f"⚡ انزلاق الوقف: متوسط {stop_usd.mean():.2f} USDT ({stop_r.mean():.2f}R) على {len(stop_usd)} صفقة")
+        if len(entry_slip):
+            lines.append(f"↘️ انزلاق الدخول: إجمالي {entry_slip.sum():.2f} | متوسط {entry_slip.mean():.2f} USDT")
     if n < 30:
         lines += ["", f"⚠️ العينة صغيرة ({n} صفقة) — لا تعتمد على النسب قبل 30 صفقة على الأقل."]
     lines.append("━━━━━━━━━━━━━━━")
@@ -593,13 +617,30 @@ REASONS = {
 }
 
 
-def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy=""):
+def effective_risk_pct(equity, sl_pct):
+    """المخاطرة الفعلية (% من الرصيد) لوقف بنسبة sl_pct بعد تطبيق سقف الهامش."""
+    if equity <= 0 or sl_pct <= 0:
+        return 0.0
+    risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
+    margin = risk_usd / (sl_pct * LEVERAGE)
+    cap = min(MAX_MARGIN_USDT, equity * MAX_MARGIN_PCT_EQUITY)
+    margin = min(cap, margin)
+    return margin * sl_pct * LEVERAGE / equity * 100.0
+
+
+def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy="", equity=None):
     title = "🟢 <b>توصية شراء (LONG)</b>" if side == "LONG" else "🔴 <b>توصية بيع (SHORT)</b>"
     status = "✅ <b>تم فتح الصفقة آلياً</b>" if real_order else "⚠️ <b>إشارة فقط</b>"
     sl_pct = abs(price - sl) / price * 100
     tp_pct = abs(tp - price) / price * 100
     risk_usd = margin * (sl_pct / 100) * LEVERAGE
     reward_usd = margin * (tp_pct / 100) * LEVERAGE
+    risk_pct_txt = ""
+    if equity and equity > 0:
+        pct = risk_usd / equity * 100
+        risk_pct_txt = f" = {pct:.2f}% من الرصيد"
+        if pct < RISK_PCT_PER_TRADE * 0.5:
+            risk_pct_txt += f" ⚠️ أقل من المستهدف ({RISK_PCT_PER_TRADE}%) بسبب سقف الهامش"
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     regime_txt = f"\n📡 <b>نظام السوق:</b> {regime}" if regime else ""
     if strategy:
@@ -611,14 +652,15 @@ def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy=
             f"⚙️ <b>الرافعة:</b> {LEVERAGE}x | <b>الهامش:</b> {margin:.2f} USDT\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🛑 <b>وقف الخسارة:</b> <code>{fmt(sl)}</code> ({sl_pct:.2f}%)\n"
-            f"📉 <i>المخاطرة: {risk_usd:.2f} USDT</i>\n"
+            f"📉 <i>المخاطرة: {risk_usd:.2f} USDT{risk_pct_txt}</i>\n"
             f"🎯 <b>الهدف:</b> <code>{fmt(tp)}</code> ({tp_pct:.2f}%)\n"
             f"📈 <i>العائد المتوقع: +{reward_usd:.2f} USDT</i>\n"
             f"━━━━━━━━━━━━━━━\n"
             f"⏰ {now_str}")
 
 
-def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margin, r_mult, reason, strategy=""):
+def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margin, r_mult, reason, strategy="",
+             fees=None, fees_src="", stop_slip_usd=None, stop_slip_r=None):
     pct = (total_pnl / margin * 100) if margin else 0.0
     if total_pnl > 0:
         title = "🟢 <b>إغلاق بربح</b>"
@@ -626,6 +668,14 @@ def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margi
         title = "🔴 <b>إغلاق بخسارة</b>"
     else:
         title = "⚪ <b>إغلاق متعادل</b>"
+    extra_lines = ""
+    if fees is not None:
+        extra_lines += f"🧾 الرسوم: {fees:.2f} USDT ({'فعلية' if fees_src == 'actual' else 'تقديرية'})\n"
+    if stop_slip_usd is not None:
+        if stop_slip_usd >= 0:
+            extra_lines += f"⚡ انزلاق الوقف: خسارة إضافية {stop_slip_usd:.2f} USDT ({stop_slip_r:.2f}R)\n"
+        else:
+            extra_lines += f"⚡ انزلاق الوقف لصالحك: {abs(stop_slip_usd):.2f} USDT\n"
     return (f"{title}\n━━━━━━━━━━━━━━━\n"
             f"🪙 <code>{short(sym)}</code> ({side})\n"
             f"📥 الدخول: <code>{fmt(entry_price)}</code>\n"
@@ -636,6 +686,7 @@ def msg_exit(sym, side, exit_price, entry_price, total_pnl, final_leg_pnl, margi
             f"🧩 الجزء الأخير: {final_leg_pnl:+.2f} USDT\n"
             f"📝 السبب: {REASONS.get(reason, reason)}\n"
             f"🧠 الاستراتيجية: {STRAT_LABEL.get(strategy, strategy or '—')}\n"
+            f"{extra_lines}"
             f"━━━━━━━━━━━━━━━")
 
 
@@ -979,18 +1030,51 @@ def open_position(ex, sym, side, price, sl, tp, margin):
 # ==========================================
 # الربح وإنهاء الصفقة
 # ==========================================
+def leg_fee_est(entry, exit_price, contracts, cs):
+    """رسوم تقديرية لجزء من الصفقة (دخول + خروج)."""
+    return (entry + exit_price) * contracts * cs * FEE_RATE
+
+
 def leg_pnl(side, entry, exit_price, contracts, cs):
     d = 1 if side == "LONG" else -1
     gross = (exit_price - entry) * d * contracts * cs
-    fees = (entry + exit_price) * contracts * cs * FEE_RATE
-    return gross - fees
+    return gross - leg_fee_est(entry, exit_price, contracts, cs)
+
+
+def get_actual_fees(ex, sym, pos_data):
+    """مجموع الرسوم الفعلية (USDT) لكل تنفيذات الصفقة (دخول + جزئيات + خروج). None إذا لا تتوفر."""
+    if (pos_data.get("strategy") or "") == "adopted" or not pos_data.get("opened_ts"):
+        return None          # المركز المتبنّى: تنفيذ الدخول سابق ولا يمكن تتبعه
+    try:
+        since = int(pos_data["opened_ts"] * 1000) - 30000
+        trades = ex.fetch_my_trades(sym, since=since, limit=100)
+        total, n = 0.0, 0
+        for t in trades:
+            fee = t.get("fee") or {}
+            cost = fee.get("cost")
+            if cost is None:
+                continue
+            cur = (fee.get("currency") or "").upper()
+            if cur and cur not in ("USDT", "USDC"):
+                continue
+            total += abs(float(cost))
+            n += 1
+        return total if n > 0 else None
+    except Exception as e:
+        log.warning(f"[FEES] {sym}: {e}")
+        return None
 
 
 def get_exit_price(ex, sym, pos_data):
     try:
         close_side = 'sell' if pos_data["position"] == "LONG" else 'buy'
-        since = int(max(pos_data.get("leg_ts") or 0, pos_data.get("opened_ts") or 0) * 1000) - 8000
+        if pos_data.get("partial_1_taken") or pos_data.get("partial_2_taken"):
+            # بعد آخر إغلاق جزئي (leg_ts يُسجَّل بعد تنفيذ الجزئي بـ0.8ث) لتفادي احتساب تنفيذه ضمن سعر الخروج
+            since = int((pos_data.get("leg_ts") or 0) * 1000) + 1500
+        else:
+            since = int((pos_data.get("opened_ts") or 0) * 1000) - 8000
         trades = ex.fetch_my_trades(sym, since=since, limit=80)
+        trades = [t for t in trades if not t.get("timestamp") or t["timestamp"] >= since]
         fills = [t for t in trades if t.get('side') == close_side and t.get('price') and t.get('amount')]
         total = sum(float(t['amount']) for t in fills)
         if total > 0:
@@ -1018,15 +1102,49 @@ def finalize_trade(ex, sym, reason_hint=None):
     if not pos_data.get("position"):
         return
     side, entry = pos_data["position"], pos_data["entry"]
+    d = 1 if side == "LONG" else -1
     exit_price = get_exit_price(ex, sym, pos_data) or get_current_price(ex, sym, 0) or entry
     cs = contract_size(ex, sym)
-    final_leg = leg_pnl(side, entry, exit_price, pos_data.get("contracts", 0.0), cs)
-    total = pos_data.get("realized_pnl", 0.0) + final_leg
+    contracts = pos_data.get("contracts", 0.0)
+    realized = pos_data.get("realized_pnl", 0.0)
+    realized_fees_est = pos_data.get("realized_fees_est", 0.0)
+
+    # --- الربح والرسوم (فعلية إن توفرت وكانت معقولة، وإلا تقديرية) ---
+    gross_final = (exit_price - entry) * d * contracts * cs
+    fee_est_final = leg_fee_est(entry, exit_price, contracts, cs)
+    fees_est_total = realized_fees_est + fee_est_final
+    fees_actual = get_actual_fees(ex, sym, pos_data)
+    use_actual = (fees_actual is not None and fees_est_total > 0 and
+                  0.2 * fees_est_total <= fees_actual <= 5 * fees_est_total)
+    if fees_actual is not None and not use_actual:
+        log.warning(f"[FEES] {sym}: الرسوم الفعلية {fees_actual:.4f} بعيدة عن التقدير {fees_est_total:.4f} — استُخدم التقدير")
+    if use_actual:
+        total = realized + realized_fees_est + gross_final - fees_actual
+        fees_total, fees_src = fees_actual, "actual"
+    else:
+        total = realized + gross_final - fee_est_final
+        fees_total, fees_src = fees_est_total, "est"
+    final_leg = total - realized     # بحيث يتطابق الربح اليومي مع الصافي الفعلي
+
     margin = pos_data.get("margin") or POSITION_SIZE_USDT
     reason = reason_hint or detect_reason(pos_data, exit_price)
-    risk_usd = pos_data.get("initial_risk", 0.0) * pos_data.get("initial_contracts", 0.0) * cs
+    init_risk = pos_data.get("initial_risk", 0.0)
+    risk_usd = init_risk * pos_data.get("initial_contracts", 0.0) * cs
     r_mult = (total / risk_usd) if risk_usd > 0 else 0.0
     duration = int((time.time() - (pos_data.get("opened_ts") or time.time())) / 60)
+
+    # --- الانزلاق (القيمة الموجبة = تكلفة عليك) ---
+    # ملاحظة: يُحتسب انزلاق الوقف فقط عندما يُصنَّف الخروج كوقف (سعر الخروج ضمن 0.35% من الوقف).
+    stop_slip_usd = stop_slip_r = None
+    if reason in ("Stop Loss", "Trailing Stop", "Breakeven Hit") and pos_data.get("sl"):
+        adverse = (pos_data["sl"] - exit_price) if side == "LONG" else (exit_price - pos_data["sl"])
+        stop_slip_usd = adverse * contracts * cs
+        stop_slip_r = (adverse / init_risk) if init_risk else 0.0
+    entry_slip_usd = None
+    pe = pos_data.get("planned_entry")
+    if pe:
+        adverse_e = (entry - pe) if side == "LONG" else (pe - entry)
+        entry_slip_usd = adverse_e * pos_data.get("initial_contracts", 0.0) * cs
 
     add_daily_pnl(final_leg)
     register_trade_result(total)
@@ -1036,11 +1154,16 @@ def finalize_trade(ex, sym, reason_hint=None):
         "initial_contracts": pos_data.get("initial_contracts", 0.0),
         "pnl": round(total, 4), "r_multiple": round(r_mult, 3), "reason": reason,
         "regime": pos_data.get("regime", ""), "duration_min": duration,
-        "strategy": pos_data.get("strategy") or "legacy"})
+        "strategy": pos_data.get("strategy") or "legacy",
+        "fees": round(fees_total, 4), "fees_source": fees_src,
+        "stop_slip_usd": "" if stop_slip_usd is None else round(stop_slip_usd, 4),
+        "stop_slip_r": "" if stop_slip_r is None else round(stop_slip_r, 3),
+        "entry_slip_usd": "" if entry_slip_usd is None else round(entry_slip_usd, 4),
+        "risk_usd": round(risk_usd, 4)})
     reset_sym_state(sym, cooldown=True)
     cancel_pending(ex, sym)
     send(msg_exit(sym, side, exit_price, entry, total, final_leg, margin, r_mult, reason,
-                  pos_data.get("strategy", "")))
+                  pos_data.get("strategy", ""), fees_total, fees_src, stop_slip_usd, stop_slip_r))
 
 
 def emergency_close(ex, sym, why):
@@ -1359,8 +1482,11 @@ def do_partial(ex, sym, st, which):
         log.error(f"[PARTIAL ORDER] {sym}: {e}")
         return False
     time.sleep(0.8)
+    fill_ts = time.time()
     exit_price = get_current_price(ex, sym, 0) or entry
-    pnl = leg_pnl(side, entry, exit_price, amt, contract_size(ex, sym))
+    cs_leg = contract_size(ex, sym)
+    pnl = leg_pnl(side, entry, exit_price, amt, cs_leg)
+    fee_est_leg = leg_fee_est(entry, exit_price, amt, cs_leg)
     new_sl = breakeven_price(side, entry) if which == 1 else st["sl"]
     protected = replace_protection(ex, sym, close_side, remaining, new_sl, st.get("tp"))
     with state_lock:
@@ -1368,7 +1494,8 @@ def do_partial(ex, sym, st, which):
         s["contracts"] = remaining
         s[f"partial_{which}_taken"] = True
         s["realized_pnl"] = s.get("realized_pnl", 0.0) + pnl
-        s["leg_ts"] = time.time()
+        s["realized_fees_est"] = s.get("realized_fees_est", 0.0) + fee_est_leg
+        s["leg_ts"] = fill_ts
         if which == 1 and protected:
             s["sl"] = new_sl
             s["breakeven_hit"] = True
@@ -1563,7 +1690,8 @@ def process_symbol(ex, sym):
                 sl = actual_price * (1 + sl_pct)
                 tp = actual_price * (1 - sl_pct * RR_RATIO)
 
-            margin = compute_margin(get_equity(ex), sl_pct)
+            equity_now = get_equity(ex)
+            margin = compute_margin(equity_now, sl_pct)
             if margin <= 0:
                 log.info(f"[SKIP] {sym}: الهامش غير صالح (رصيد مجهول أو أقل من الحد الأدنى)")
                 note_block(sym, "margin_too_small")
@@ -1579,7 +1707,8 @@ def process_symbol(ex, sym):
                         "initial_sl": sl, "initial_risk": abs(entry - sl),
                         "contracts": contracts, "initial_contracts": contracts,
                         "margin": margin, "opened_ts": now, "leg_ts": now,
-                        "realized_pnl": 0.0, "last_notified_sl": None,
+                        "realized_pnl": 0.0, "realized_fees_est": 0.0, "planned_entry": actual_price,
+                        "last_notified_sl": None,
                         "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False,
                         "regime": signal.get("regime", ""),
                         "strategy": signal.get("strategy", "")})
@@ -1589,7 +1718,7 @@ def process_symbol(ex, sym):
                     state[sym]["last_exit_ts"] = now
             save_state()
             caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""),
-                                signal.get("strategy", ""))
+                                signal.get("strategy", ""), equity_now)
             if not success:
                 caption += f"\n❌ {info}"
             send(caption)
@@ -1838,7 +1967,11 @@ def risk_text(ex):
         "🛡️ <b>ملخص إدارة المخاطر</b>", "━━━━━━━━━━━━━━━",
         f"💼 الرصيد: <b>{equity:,.2f} USDT</b>",
         f"📊 الحالة: {status}", "",
-        f"🎯 المخاطرة لكل صفقة: <b>{RISK_PCT_PER_TRADE}%</b> (سقف الهامش {MAX_MARGIN_USDT:.0f} USDT)",
+        f"🎯 المخاطرة المستهدفة: <b>{RISK_PCT_PER_TRADE}%</b> | سقف الهامش {MAX_MARGIN_USDT:.0f} USDT",
+        f"📐 الفعلية عند وقف 0.8% / 1.5% / 2.5%: "
+        f"<b>{effective_risk_pct(equity, 0.008):.2f}% / {effective_risk_pct(equity, 0.015):.2f}% / {effective_risk_pct(equity, 0.025):.2f}%</b>",
+        *(["⚠️ السقف يحدّ المخاطرة كثيراً — ارفع MAX_MARGIN_USDT أو خفّض RISK_PCT_PER_TRADE لتتطابقا"]
+          if equity > 0 and effective_risk_pct(equity, 0.015) < RISK_PCT_PER_TRADE * 0.5 else []),
         f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT) — يشمل العائم السالب",
         f"📈 هدف الربح اليومي: {DAILY_PROFIT_TARGET_PCT}% ({profit_target:.1f} USDT)", "",
         f"🔢 المفتوحة: {len(opens)} / {MAX_OPEN_POSITIONS}",
