@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V43 (Diagnostics + Hardening)
+OKX Futures Trading Bot - V44 (Profiles + Tunable Filters)
 
-الجديد عن V42:
-- عدّاد أسباب رفض الإشارات (لكل شمعة) + أسباب الحجب بعد الإشارة، وأمر /why و /why BTC.
-- مراقبة حياة الحلقة الرئيسية: /status يعرض آخر دورة + Watchdog ينبهك إذا تعطلت + صفحة /diag.
-- إصلاح خطير: V42 كانت تعتبر رفض OKX لأمر وقف الخسارة (51276/51277) "نجاحاً" فتبقى الصفقة بلا وقف.
-- compute_margin: لا يعود 50 USDT ثابتة عند تعذر الرصيد؛ وتخطي صامت إذا الهامش غير صالح.
-- منع الدخول عند تعذر قراءة الرصيد.
-- ضبط الرافعة قبل الدخول (بعد إلغاء الأوامر المعلقة) مع محاولتين، وفشله يلغي الصفقة.
-- حالة الحماية المجهولة (فشل الاستعلام) لا تُعتبر "وجود حماية".
-- sync_positions: جلب المراكز داخل trade_lock (منع تبني مركز أُغلق للتو) وعند الإقلاع فقط.
-- حد الخسارة اليومي يشمل الخسارة العائمة.
-- فلتر التمويل: فشل الجلب لا يمنع الدخول (فلتر مساعد) لكن يُسجَّل.
+الجديد عن V43:
+- بروفايلات جاهزة بمتغير واحد PROFILE: conservative | balanced | active
+  (الافتراضي: balanced على Sandbox، و conservative على الحساب الحقيقي).
+- كل حد في الاستراتيجية قابل للتعديل من متغيرات البيئة في Render بدون تغيير الكود
+  (MIN_ATR_PCT, MIN_ADX, MIN_VOL_MULT, REGIME_ADX4_STRONG, REGIME_ADX4_WEAK, REGIME_ADX1_STRONG,
+   RSI_LONG_MIN/MAX, RSI_SHORT_MIN/MAX, NEAR_EMA21_PCT, NEAR_EMA50_PCT, MAX_SPREAD_PCT).
+  المتغير المنفرد يتقدم على البروفايل.
+- حماية: البروفايل active ممنوع على الحساب الحقيقي (يتحول تلقائياً إلى balanced مع تنبيه).
+- تسجيل قيمة السبريد عند الحجب (log) وعرضها في /why BTC.
+- أمر /config لعرض الإعدادات الفعلية الحالية.
 """
 import os
 import sys
@@ -36,7 +35,7 @@ log = logging.getLogger("bot")
 # ==========================================
 # الإعدادات
 # ==========================================
-VERSION = "V43"
+VERSION = "V44"
 KSA_TZ = timezone(timedelta(hours=3))
 
 
@@ -105,16 +104,64 @@ DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 4.0)
 DAILY_PROFIT_TARGET_PCT = env_float("DAILY_PROFIT_TARGET_PCT", 6.0)
 INCLUDE_FLOATING_IN_LOSS_LIMIT = True
 MAX_SAME_DIRECTION = 3
-MAX_SPREAD_PCT = 0.0011
 MAX_FUNDING_RATE = 0.00045
 MAX_ENTRY_SLIPPAGE_PCT = 0.004
 USE_BTC_FILTER = True
 
-# حدود الإشارة (للتعديل بعد قراءة /why)
-MIN_ATR_PCT = env_float("MIN_ATR_PCT", 0.004)
+# ---------- بروفايلات الاستراتيجية ----------
+PROFILES = {
+    # الإعدادات الأصلية (الأكثر تشدداً)
+    "conservative": {
+        "min_atr_pct": 0.004, "min_adx": 23, "min_vol_mult": 1.2,
+        "regime_adx4_strong": 28, "regime_adx1_strong": 24, "regime_adx4_weak": 20,
+        "rsi_long_min": 40, "rsi_long_max": 61, "rsi_short_min": 39, "rsi_short_max": 60,
+        "near_ema21_pct": 0.011, "near_ema50_pct": 0.016, "max_spread_pct": 0.0011,
+    },
+    # وسط: فرص أكثر مع بقاء منطق الاتجاه
+    "balanced": {
+        "min_atr_pct": 0.003, "min_adx": 20, "min_vol_mult": 1.0,
+        "regime_adx4_strong": 26, "regime_adx1_strong": 22, "regime_adx4_weak": 18,
+        "rsi_long_min": 38, "rsi_long_max": 64, "rsi_short_min": 36, "rsi_short_max": 62,
+        "near_ema21_pct": 0.013, "near_ema50_pct": 0.019, "max_spread_pct": 0.0015,
+    },
+    # لاختبار آلية التنفيذ على Sandbox فقط
+    "active": {
+        "min_atr_pct": 0.0022, "min_adx": 18, "min_vol_mult": 0.8,
+        "regime_adx4_strong": 24, "regime_adx1_strong": 20, "regime_adx4_weak": 15,
+        "rsi_long_min": 35, "rsi_long_max": 67, "rsi_short_min": 33, "rsi_short_max": 65,
+        "near_ema21_pct": 0.016, "near_ema50_pct": 0.024, "max_spread_pct": 0.003,
+    },
+}
+_default_profile = "balanced" if USE_SANDBOX else "conservative"
+PROFILE_NAME = os.getenv("PROFILE", _default_profile).strip().lower()
+PROFILE_WARNING = ""
+if PROFILE_NAME not in PROFILES:
+    PROFILE_WARNING = f"بروفايل غير معروف '{PROFILE_NAME}' — استُخدم {_default_profile}"
+    PROFILE_NAME = _default_profile
+if not USE_SANDBOX and PROFILE_NAME == "active":
+    PROFILE_WARNING = "البروفايل active ممنوع على الحساب الحقيقي — استُخدم balanced"
+    PROFILE_NAME = "balanced"
+
+
+def _cfg(key):
+    """متغير البيئة (باسم المفتاح بحروف كبيرة) يتقدم على قيمة البروفايل."""
+    return env_float(key.upper(), PROFILES[PROFILE_NAME][key])
+
+
+MIN_ATR_PCT = _cfg("min_atr_pct")
 MAX_ATR_PCT = 0.045
-MIN_ADX = env_float("MIN_ADX", 23)
-MIN_VOL_MULT = env_float("MIN_VOL_MULT", 1.2)
+MIN_ADX = _cfg("min_adx")
+MIN_VOL_MULT = _cfg("min_vol_mult")
+REGIME_ADX4_STRONG = _cfg("regime_adx4_strong")
+REGIME_ADX1_STRONG = _cfg("regime_adx1_strong")
+REGIME_ADX4_WEAK = _cfg("regime_adx4_weak")
+RSI_LONG_MIN = _cfg("rsi_long_min")
+RSI_LONG_MAX = _cfg("rsi_long_max")
+RSI_SHORT_MIN = _cfg("rsi_short_min")
+RSI_SHORT_MAX = _cfg("rsi_short_max")
+NEAR_EMA21_PCT = _cfg("near_ema21_pct")
+NEAR_EMA50_PCT = _cfg("near_ema50_pct")
+MAX_SPREAD_PCT = _cfg("max_spread_pct")
 
 WATCHDOG_SEC = 300
 
@@ -139,6 +186,7 @@ _price_cache = {}
 _equity_cache = {"ts": 0, "value": 0.0}
 _btc_bias_cache = {"ts": 0, "value": "neutral"}
 _last_eval = {}
+_last_spread = {}      # sym -> (ts, spread_fraction)
 _warned_external = set()
 _lock_fh = None
 
@@ -237,6 +285,7 @@ def diag_endpoint():
     last = loop_info["last_cycle_ts"]
     return {
         "version": VERSION,
+        "profile": PROFILE_NAME,
         "paused": bool(meta.get("paused")),
         "loop_age_sec": round(time.time() - last, 1) if last else None,
         "cycles": loop_info["cycles"],
@@ -953,12 +1002,12 @@ def detect_regime(df_15m, df_1h, df_4h):
     ema50_4 = last_4h.get("ema50", last_4h["close"])
     up_4h = last_4h["close"] > ema50_4 and last_4h["ema9"] > last_4h["ema21"]
     down_4h = last_4h["close"] < ema50_4 and last_4h["ema9"] < last_4h["ema21"]
-    if adx4 > 28 and adx1 > 24:
+    if adx4 > REGIME_ADX4_STRONG and adx1 > REGIME_ADX1_STRONG:
         if up_4h:
             return "strong_trend_up"
         if down_4h:
             return "strong_trend_down"
-    if adx4 > 20 and (up_4h or down_4h):
+    if adx4 > REGIME_ADX4_WEAK and (up_4h or down_4h):
         return "weak_trend"
     return "range"
 
@@ -1001,7 +1050,8 @@ def evaluate_signal(df_15m, df_1h, df_4h):
     if not long_dir and not short_dir:
         return None, "direction_mismatch"
 
-    near_ema = abs(price - ema21) / price < 0.011 or abs(price - ema50) / price < 0.016
+    near_ema = (abs(price - ema21) / price < NEAR_EMA21_PCT or
+                abs(price - ema50) / price < NEAR_EMA50_PCT)
     sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * atr_val / price))
     tp_pct = sl_pct * RR_RATIO
 
@@ -1011,7 +1061,7 @@ def evaluate_signal(df_15m, df_1h, df_4h):
             return None, "ema_misaligned"
         if not near_ema:
             return None, "far_from_ema"
-        if not (40 < rsi_val < 61):
+        if not (RSI_LONG_MIN < rsi_val < RSI_LONG_MAX):
             return None, "rsi_out_of_range"
         if not bullish_reject:
             return None, "no_pullback_candle"
@@ -1023,7 +1073,7 @@ def evaluate_signal(df_15m, df_1h, df_4h):
         return None, "ema_misaligned"
     if not near_ema:
         return None, "far_from_ema"
-    if not (39 < rsi_val < 60):
+    if not (RSI_SHORT_MIN < rsi_val < RSI_SHORT_MAX):
         return None, "rsi_out_of_range"
     if not bearish_reject:
         return None, "no_pullback_candle"
@@ -1036,8 +1086,14 @@ def market_filters_ok(ex, sym, side):
     try:
         t = ex.fetch_ticker(sym)
         bid, ask, last = t.get('bid'), t.get('ask'), t.get('last')
-        if bid and ask and last and (ask - bid) / last > MAX_SPREAD_PCT:
-            return False, "spread_high"
+        if bid and ask and last:
+            spread = (ask - bid) / last
+            _last_spread[sym] = (time.time(), spread)
+            if spread > MAX_SPREAD_PCT:
+                log.info(f"[SPREAD] {sym} {spread * 100:.3f}% > الحد {MAX_SPREAD_PCT * 100:.3f}% — حجب")
+                return False, "spread_high"
+        else:
+            log.info(f"[SPREAD] {sym}: لا توجد أسعار bid/ask في الرد (لم يُطبَّق فلتر السبريد)")
     except Exception as e:
         log.warning(f"[FILTER TICKER] {sym}: {e}")
         return False, "ticker_unavailable"
@@ -1478,7 +1534,7 @@ def status_text(ex):
              f"📈 <b>الربح العائم: {total_float:+.2f} USDT</b>",
              f"🔄 آخر دورة فحص: {loop_age_text()} | دورات: {loop_info['cycles']}",
              f"🔎 اليوم: تقييم {ev} | إشارات {sg} | فُتحت {op}  (التفاصيل: /why)",
-             f"🐋 BTC Bias: {bias}",
+             f"🐋 BTC Bias: {bias} | ⚙️ {PROFILE_NAME}",
              "━━━━━━━━━━━━━━━"]
     lines.extend(lines_pos if lines_pos else ["لا توجد صفقات مفتوحة."])
     return "\n".join(lines)
@@ -1494,13 +1550,18 @@ def why_text(arg, active_symbols):
         if not item:
             return f"لا يوجد تقييم بعد لـ {short(sym)}."
         ts, r = item
-        return f"🔍 <b>{short(sym)}</b>\nآخر نتيجة: {label(r)}\nقبل {int((time.time() - ts) / 60)} دقيقة"
+        txt = f"🔍 <b>{short(sym)}</b>\nآخر نتيجة: {label(r)}\nقبل {int((time.time() - ts) / 60)} دقيقة"
+        sp = _last_spread.get(sym)
+        if sp:
+            txt += f"\nآخر سبريد مقاس: {sp[1] * 100:.3f}% (الحد {MAX_SPREAD_PCT * 100:.2f}%)"
+        return txt
     with diag_lock:
         d = json.loads(json.dumps(diag))
     ev = d["evaluated"]
     lines = [f"🔎 <b>لماذا لا توجد صفقات؟</b> — {d['date']}", "━━━━━━━━━━━━━━━",
              f"📊 تقييمات (رمز×شمعة): {ev}",
              f"✅ إشارات: {d['signals']} | 🟢 صفقات فُتحت: {d['opened']}"]
+    lines.append(f"⚙️ البروفايل: <b>{PROFILE_NAME}</b> (/config)")
     if meta.get("paused"):
         lines.append("⏸️ <b>البوت موقوف (/resume)</b>")
     if ev:
@@ -1515,6 +1576,21 @@ def why_text(arg, active_symbols):
             lines.append(f"• {label(r)}: {n}")
     lines.append("\nلتفاصيل عملة: /why BTC")
     return "\n".join(lines)
+
+
+def config_text():
+    return "\n".join([
+        f"⚙️ <b>الإعدادات الحالية</b> — البروفايل: <b>{PROFILE_NAME}</b>", "━━━━━━━━━━━━━━━",
+        f"ATR الأدنى (15د): {MIN_ATR_PCT * 100:.2f}%",
+        f"ADX الأدنى (15د): {MIN_ADX:g}",
+        f"ADX 4س قوي/ضعيف: {REGIME_ADX4_STRONG:g} / {REGIME_ADX4_WEAK:g} | ADX 1س قوي: {REGIME_ADX1_STRONG:g}",
+        f"الحجم ≥ {MIN_VOL_MULT:g}× المتوسط",
+        f"RSI LONG: {RSI_LONG_MIN:g}–{RSI_LONG_MAX:g} | SHORT: {RSI_SHORT_MIN:g}–{RSI_SHORT_MAX:g}",
+        f"القرب من EMA21 / EMA50: {NEAR_EMA21_PCT * 100:.1f}% / {NEAR_EMA50_PCT * 100:.1f}%",
+        f"أقصى سبريد: {MAX_SPREAD_PCT * 100:.2f}%",
+        f"المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة {LEVERAGE}x | سقف الهامش {MAX_MARGIN_USDT:.0f}",
+        "━━━━━━━━━━━━━━━",
+        "للتعديل: متغيرات البيئة في Render (PROFILE أو أي حد منفرد) ثم إعادة النشر."])
 
 
 def positions_text(ex):
@@ -1606,6 +1682,8 @@ def handle_command(ex, text, chat_id, active_symbols):
         send(daily_text(ex), chat_id)
     elif cmd == "/stats":
         send(stats_text(), chat_id)
+    elif cmd == "/config":
+        send(config_text(), chat_id)
     elif cmd == "/why":
         send(why_text(parts[1] if len(parts) > 1 else None, active_symbols), chat_id)
     elif cmd == "/pause":
@@ -1652,6 +1730,7 @@ def handle_command(ex, text, chat_id, active_symbols):
              "/status - نظرة عامة + حالة الحلقة\n"
              "/why - لماذا لا توجد صفقات؟ (أسباب الرفض)\n"
              "/why BTC - آخر سبب لعملة محددة\n"
+             "/config - الإعدادات والحدود الحالية\n"
              "/pos - تفاصيل كل صفقة مفتوحة\n"
              "/risk - ملخص إدارة المخاطر\n"
              "/daily - ملخص أداء اليوم\n"
@@ -1760,7 +1839,10 @@ def trading_loop():
          f"⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n"
          f"📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n"
          f"💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة: {LEVERAGE}x\n"
-         f"🔎 /why لمعرفة أسباب عدم الدخول\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
+         f"🎚️ البروفايل: {PROFILE_NAME}\n"
+         f"🔎 /why أسباب عدم الدخول | ⚙️ /config الإعدادات\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
+    if PROFILE_WARNING:
+        send(f"⚠️ {PROFILE_WARNING}")
 
     loop_info["last_cycle_ts"] = time.time()
     fail_streak = 0
