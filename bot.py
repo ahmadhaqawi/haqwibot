@@ -1,24 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V48 (Multi-Horizon + Ranked Entries)
+OKX Futures Trading Bot - V49 (Liquidity-Aware Multi-Horizon)
 
-الجديد عن V47:
-1) ثلاثة آفاق زمنية بإعدادات مستقلة:
-   - scalp    (قصير):  دخول 5د  | تأكيد 15د | اتجاه 1س
-   - swing    (متوسط): دخول 15د | تأكيد 1س  | اتجاه 4س   (السلوك الأصلي)
-   - position (طويل):  دخول 4س  | تأكيد/اتجاه 1ي
-   لكل أفق: رافعة، مخاطرة، وقف ATR، RR، وقف متحرك، جزئيات، مدة قصوى، حد صفقات، حد درجة.
-2) مسح ثم ترتيب: تُجمع كل الإشارات في الدورة وتُنفَّذ الأعلى درجة أولاً (بدل أسبقية الترتيب).
-3) سقف مخاطرة المحفظة (Portfolio Heat) لجمع مخاطر الصفقات غير المؤمَّنة.
-4) فلتر تكلفة التنفيذ (رسوم + انزلاق مقدّر ÷ مسافة الوقف).
-5) فلتر عمر الإشارة (لا تنفيذ إشارة من شمعة أُغلقت منذ مدة).
-6) Time Stop: إغلاق الصفقة التي لم تتأمن خلال المدة القصوى لأفقها.
-7) إصلاح BE_FEE_BUFFER (كان أقل من الرسوم الفعلية) + إصلاح قائمة العملات في خيط تيليجرام.
-8) الجزئي الأخير يترك "Runner" خاصة في الأفق الطويل (هدف بعيد + وقف متحرك).
-9) السجل والإحصائيات تُقسَّم حسب الأفق ودرجة الفرصة (للتحقق من فائدة التقييم).
+الجديد عن V48:
+1) محرك السيولة (Liquidity Engine):
+   - كشف كنس السيولة (Sweep) في آخر شمعة مغلقة.
+   - كشف برك السيولة (Equal Highs/Lows).
+   - كشف فجوات FVG غير المملوءة (Fair Value Gap).
+   - قياس اختلال دفتر الأوامر (Order Book Imbalance).
+2) استراتيجية ثالثة "liquidity_sweep": دخول بعد كنس + رفض + توافق اتجاه.
+3) مكافأة Score (حتى +15) لكل الاستراتيجيات عند توفر سياق سيولة (Sweep/FVG/OB).
+4) أمر /liq SYMBOL لتقرير سيولة تفصيلي.
+5) Swap اختياري (AUTO_SWAP_ON_BETTER): عند امتلاء الأماكن، يُغلق أضعف صفقة
+   خاسرة (غير محمية) لصالح إشارة أقوى بفارق SWAP_SCORE_MARGIN درجة.
 
-تنبيه: على الحساب الحقيقي يعمل swing فقط افتراضياً. فعّل غيره عبر HORIZONS=scalp,swing,position
-بعد اختباره على Sandbox ومراجعة /stats لكل أفق.
+تنبيهات:
+- AUTO_SWAP_ON_BETTER معطّل افتراضياً — فعّله فقط بعد اختبار Sandbox مطوّل.
+- على الحقيقي: swing فقط افتراضياً. فعّل الآخرين عبر HORIZONS=...
 """
 import os
 import sys
@@ -40,9 +38,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bot")
 
 # ==========================================
-# الإعدادات
+# الإعدادات العامة
 # ==========================================
-VERSION = "V48"
+VERSION = "V49"
 KSA_TZ = timezone(timedelta(hours=3))
 
 
@@ -93,18 +91,18 @@ UNIVERSE_REFRESH_SEC = int(env_float("UNIVERSE_REFRESH_SEC", 1800))
 MAX_UNIVERSE_SYMBOLS = int(env_float("MAX_UNIVERSE_SYMBOLS", 60))
 MIN_SIGNAL_SCORE = int(env_float("MIN_SIGNAL_SCORE", 74))
 INCLUDE_NEW_MARKETS_DAYS = int(env_float("INCLUDE_NEW_MARKETS_DAYS", 45))
-LEVERAGE = int(env_float("LEVERAGE", 5))          # رافعة أفق swing
+LEVERAGE = int(env_float("LEVERAGE", 5))
 MARGIN_MODE = "isolated"
 MAX_OPEN_POSITIONS = int(env_float("MAX_OPEN_POSITIONS", 5))
 REENTRY_COOLDOWN_SEC = 1500
 
 USE_RISK_SIZING = True
-RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 0.75)   # مخاطرة أفق swing
+RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 0.75)
 POSITION_SIZE_USDT = 50
 MIN_MARGIN_USDT = 12
 MAX_MARGIN_USDT = env_float("MAX_MARGIN_USDT", 130)
 MAX_MARGIN_PCT_EQUITY = 0.30
-MAX_PORTFOLIO_RISK_PCT = env_float("MAX_PORTFOLIO_RISK_PCT", 3.0)   # مجموع مخاطر الصفقات غير المؤمَّنة
+MAX_PORTFOLIO_RISK_PCT = env_float("MAX_PORTFOLIO_RISK_PCT", 3.0)
 
 ATR_SL_MULT = 1.55
 RR_RATIO = 2.3
@@ -116,9 +114,8 @@ FALLBACK_SL_PCT = 0.017
 
 FEE_RATE = 0.0005
 EST_SLIPPAGE_PCT = env_float("EST_SLIPPAGE_PCT", 0.0003)
-# تعادل حقيقي = رسوم الدخول والخروج + انزلاق مقدّر (كان 0.0008 وهو أقل من الرسوم)
 BE_FEE_BUFFER = 2 * FEE_RATE + EST_SLIPPAGE_PCT
-MAX_COST_R = env_float("MAX_COST_R", 0.22)   # أقصى نسبة (رسوم+انزلاق) إلى مسافة الوقف
+MAX_COST_R = env_float("MAX_COST_R", 0.22)
 
 DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 4.0)
 DAILY_PROFIT_TARGET_PCT = env_float("DAILY_PROFIT_TARGET_PCT", 6.0)
@@ -126,6 +123,21 @@ INCLUDE_FLOATING_IN_LOSS_LIMIT = True
 MAX_SAME_DIRECTION = 3
 MAX_FUNDING_RATE = 0.00045
 USE_BTC_FILTER = True
+
+# ---------- محرك السيولة (V49) ----------
+ENABLE_LIQUIDITY_SWEEP = env_flag("ENABLE_LIQUIDITY_SWEEP", True)
+LIQ_SWEEP_LOOKBACK     = int(env_float("LIQ_SWEEP_LOOKBACK", 20))
+LIQ_SWEEP_TOL_PCT      = env_float("LIQ_SWEEP_TOL_PCT", 0.0015)
+LIQ_WICK_RATIO         = env_float("LIQ_WICK_RATIO", 0.5)
+LIQ_POOL_TOL_PCT       = env_float("LIQ_POOL_TOL_PCT", 0.002)
+LIQ_FVG_LOOKBACK       = int(env_float("LIQ_FVG_LOOKBACK", 30))
+USE_ORDERBOOK          = env_flag("USE_ORDERBOOK", True)
+ORDERBOOK_DEPTH        = int(env_float("ORDERBOOK_DEPTH", 20))
+OB_IMBALANCE_LONG      = env_float("OB_IMBALANCE_LONG", 0.62)
+OB_IMBALANCE_SHORT     = env_float("OB_IMBALANCE_SHORT", 0.38)
+AUTO_SWAP_ON_BETTER    = env_flag("AUTO_SWAP_ON_BETTER", False)
+SWAP_SCORE_MARGIN      = int(env_float("SWAP_SCORE_MARGIN", 8))
+SWAP_MIN_HOLD_H        = env_float("SWAP_MIN_HOLD_H", 1.0)
 
 # ---------- بروفايلات الاستراتيجية ----------
 PROFILES = {
@@ -164,9 +176,6 @@ if not USE_SANDBOX and PROFILE_NAME == "active":
     PROFILE_WARNING = "البروفايل active ممنوع على الحساب الحقيقي — استُخدم balanced"
     PROFILE_NAME = "balanced"
 
-# ---------- الآفاق الزمنية ----------
-# tfs = (إطار الدخول، إطار التأكيد، إطار الاتجاه)
-# mult: مضاعِف لقيمة البروفايل (يحافظ على صرامة البروفايل المختار) | abs: قيمة مطلقة
 HORIZON_DEFS = {
     "scalp": {
         "label": "قصير ⚡", "tfs": ("5m", "15m", "1h"),
@@ -211,8 +220,7 @@ HORIZON_DEFS = {
         "abs": {"max_atr_pct": 0.080},
     },
 }
-HORIZON_ORDER = ["position", "swing", "scalp"]      # أولوية التقييم: الأطول أولاً (اتجاه أوثق)
-
+HORIZON_ORDER = ["position", "swing", "scalp"]
 _hz_env = os.getenv("HORIZONS", "scalp,swing,position" if USE_SANDBOX else "swing")
 ENABLED_HORIZONS = [h for h in HORIZON_ORDER if h in {x.strip().lower() for x in _hz_env.split(",")}]
 if not ENABLED_HORIZONS:
@@ -225,7 +233,6 @@ def build_params(name):
     for k, m in hd.get("mult", {}).items():
         P[k] = P[k] * m
     P.update(hd.get("abs", {}))
-    # متغير البيئة يتقدم: SCALP_MIN_ADX ... ولـ swing أيضاً MIN_ADX (توافق مع V47)
     for k in list(P):
         keys = [f"{name.upper()}_{k.upper()}"] + ([k.upper()] if name == "swing" else [])
         for ek in keys:
@@ -236,7 +243,6 @@ def build_params(name):
 
 PARAMS = {n: build_params(n) for n in HORIZON_DEFS}
 
-# ---------- استراتيجية الاختراق ----------
 ENABLE_BREAKOUT = env_flag("ENABLE_BREAKOUT", USE_SANDBOX)
 BO_LOOKBACK = int(env_float("BO_LOOKBACK", 20))
 BO_BODY_POS = env_float("BO_BODY_POS", 0.6)
@@ -246,7 +252,6 @@ BO_RSI_SHORT_MIN = env_float("BO_RSI_SHORT_MIN", 28)
 BO_RSI_SHORT_MAX = env_float("BO_RSI_SHORT_MAX", 48)
 
 WATCHDOG_SEC = 300
-
 TF_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 
 DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
@@ -267,7 +272,7 @@ _data_cache = {}
 _price_cache = {}
 _equity_cache = {"ts": 0, "value": 0.0}
 _btc_bias_cache = {"ts": 0, "value": "neutral"}
-_last_eval = {}        # (sym, horizon) -> closed candle ts
+_last_eval = {}
 _last_spread = {}
 _lock_fh = None
 
@@ -280,11 +285,13 @@ def hz_of(st):
 # ---------- التشخيص ----------
 def _diag_blank(date=""):
     return {"date": date, "evaluated": 0, "signals": 0, "opened": 0, "signals_by": {}, "by_h": {},
-            "reasons": {}, "reasons_pullback": {}, "reasons_breakout": {}, "blocks": {}}
+            "reasons": {}, "reasons_pullback": {}, "reasons_breakout": {}, "reasons_liquidity": {},
+            "blocks": {}}
 
 
 diag = _diag_blank()
-STRAT_LABEL = {"pullback": "الارتداد", "breakout": "الاختراق", "adopted": "متبنّاة", "legacy": "قديمة"}
+STRAT_LABEL = {"pullback": "الارتداد", "breakout": "الاختراق",
+               "liquidity_sweep": "كنس السيولة", "adopted": "متبنّاة", "legacy": "قديمة"}
 _last_reason = {}
 loop_info = {"last_cycle_ts": 0.0, "cycles": 0, "last_duration": 0.0, "last_error": "", "alerted": False}
 
@@ -330,6 +337,13 @@ REASON_LABELS = {
     "bo_rsi": "RSI خارج نطاق الاختراق",
     "bo_extended": "السعر بعيد عن EMA21 (مطاردة)",
     "score_low": "درجة الفرصة أقل من الحد المطلوب",
+    # V49
+    "liq_no_sweep": "لا كنس سيولة حديث",
+    "liq_direction_mismatch": "الكنس عكس الاتجاه العام",
+    "liq_low_volume": "حجم الكنس ضعيف",
+    "liq_rsi_overbought": "RSI تشبع شرائي (لا نشتري)",
+    "liq_rsi_oversold": "RSI تشبع بيعي (لا نبيع)",
+    "disabled": "معطّل",
 }
 
 
@@ -373,13 +387,13 @@ def note_eval(sym, signal, reasons, h="swing"):
             text = label(rk)
         else:
             parts = []
-            for strat in ("pullback", "breakout"):
+            for strat in ("pullback", "breakout", "liquidity"):
                 if strat in reasons:
                     r = reasons[strat]
                     key = f"reasons_{strat}"
                     rk = f"{r}@{h}"
                     diag[key][rk] = diag[key].get(rk, 0) + 1
-                    parts.append(f"{STRAT_LABEL[strat]}: {label(r)}")
+                    parts.append(f"{STRAT_LABEL.get(strat, strat)}: {label(r)}")
             text = f"[{HORIZON_DEFS[h]['label']}] " + " | ".join(parts)
         _last_reason[sym] = (time.time(), text)
 
@@ -418,15 +432,12 @@ def diag_endpoint():
         d = json.loads(json.dumps(diag))
     last = loop_info["last_cycle_ts"]
     return {
-        "version": VERSION,
-        "profile": PROFILE_NAME,
-        "horizons": ENABLED_HORIZONS,
+        "version": VERSION, "profile": PROFILE_NAME, "horizons": ENABLED_HORIZONS,
         "paused": bool(meta.get("paused")),
         "loop_age_sec": round(time.time() - last, 1) if last else None,
         "cycles": loop_info["cycles"],
         "last_cycle_duration": round(loop_info["last_duration"], 1),
-        "last_error": loop_info["last_error"],
-        "today": d,
+        "last_error": loop_info["last_error"], "today": d,
     }, 200
 
 
@@ -554,7 +565,6 @@ JOURNAL_FIELDS = ["close_time", "symbol", "side", "entry", "exit", "initial_cont
 
 
 def migrate_journal():
-    """يضيف الأعمدة الجديدة للسجل القديم (strategy=legacy، horizon=swing)."""
     try:
         with journal_lock:
             if not os.path.exists(JOURNAL_FILE):
@@ -574,7 +584,7 @@ def migrate_journal():
                 w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS, extrasaction="ignore", restval="")
                 w.writeheader()
                 w.writerows(rows)
-            log.info(f"[JOURNAL] تم ترحيل {len(rows)} صفقة إلى الصيغة الجديدة")
+            log.info(f"[JOURNAL] تم ترحيل {len(rows)} صفقة")
     except Exception as e:
         log.error(f"[JOURNAL MIGRATE] {e}")
 
@@ -637,14 +647,11 @@ def stats_text():
     avg_loss = losses["pnl"].mean() if len(losses) else 0.0
     pf_txt = "∞" if pf == float("inf") else f"{pf:.2f}"
     lines = ["📈 <b>إحصائيات الأداء الكلية</b>", "━━━━━━━━━━━━━━━",
-             f"🔢 عدد الصفقات: {n}",
-             f"✅ نسبة الربح: {wr:.1f}%",
+             f"🔢 عدد الصفقات: {n}", f"✅ نسبة الربح: {wr:.1f}%",
              f"💰 الصافي: <b>{df['pnl'].sum():+.2f} USDT</b>",
-             f"⚖️ Profit Factor: {pf_txt}",
-             f"📐 متوسط R: {avg_r:+.2f}",
+             f"⚖️ Profit Factor: {pf_txt}", f"📐 متوسط R: {avg_r:+.2f}",
              f"🟢 متوسط الربح: {avg_win:+.2f} | 🔴 متوسط الخسارة: {avg_loss:+.2f}",
-             f"📉 أقصى تراجع: {max_dd:.2f} USDT",
-             "", "<b>حسب الأفق الزمني:</b>"]
+             f"📉 أقصى تراجع: {max_dd:.2f} USDT", "", "<b>حسب الأفق الزمني:</b>"]
     for name, g in df.groupby("horizon"):
         lines.append(_group_line(HORIZON_DEFS.get(name, {}).get("label", name), g))
     lines += ["", "<b>حسب الاستراتيجية:</b>"]
@@ -654,29 +661,27 @@ def stats_text():
         lines += ["", "<b>حسب الاتجاه:</b>"]
         for name, g in df.groupby("side"):
             lines.append(_group_line(name, g))
-
     sc = _num(df, "score")
     if sc.notna().sum() >= 10:
         bucket = pd.cut(sc, [0, 75, 80, 85, 101], right=False, labels=["<75", "75-79", "80-84", "85+"])
-        lines += ["", "<b>حسب درجة الفرصة (هل التقييم مفيد فعلاً؟):</b>"]
+        lines += ["", "<b>حسب درجة الفرصة:</b>"]
         for name, g in df.groupby(bucket, observed=True):
             lines.append(_group_line(str(name), g))
-
     fees = _num(df, "fees").dropna()
     stop_usd = _num(df, "stop_slip_usd").dropna()
     stop_r = _num(df, "stop_slip_r").dropna()
     entry_slip = _num(df, "entry_slip_usd").dropna()
     n_actual = int((df["fees_source"] == "actual").sum()) if "fees_source" in df else 0
     if len(fees) or len(stop_usd) or len(entry_slip):
-        lines += ["", "<b>تكلفة التنفيذ (الموجب = تكلفة عليك):</b>"]
+        lines += ["", "<b>تكلفة التنفيذ:</b>"]
         if len(fees):
             lines.append(f"🧾 الرسوم: {fees.sum():.2f} USDT ({n_actual} فعلية / {len(fees) - n_actual} تقديرية)")
         if len(stop_usd):
-            lines.append(f"⚡ انزلاق الوقف: متوسط {stop_usd.mean():.2f} USDT ({stop_r.mean():.2f}R) على {len(stop_usd)} صفقة")
+            lines.append(f"⚡ انزلاق الوقف: متوسط {stop_usd.mean():.2f} USDT ({stop_r.mean():.2f}R)")
         if len(entry_slip):
             lines.append(f"↘️ انزلاق الدخول: إجمالي {entry_slip.sum():.2f} | متوسط {entry_slip.mean():.2f} USDT")
     if n < 30:
-        lines += ["", f"⚠️ العينة صغيرة ({n} صفقة) — لا تعتمد على النسب قبل 30 صفقة على الأقل (ولكل أفق على حدة)."]
+        lines += ["", f"⚠️ العينة صغيرة ({n} صفقة) — لا تعتمد قبل 30 صفقة لكل أفق."]
     lines.append("━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
@@ -715,11 +720,11 @@ REASONS = {
     "Manual": "إغلاق يدوي 🖐️",
     "Emergency": "إغلاق طارئ 🚨",
     "Manual/External": "إغلاق من المنصة ⚡",
+    "Swap": "استبدال بفرصة أقوى 🔄",
 }
 
 
 def effective_risk_pct(equity, sl_pct, h="swing"):
-    """المخاطرة الفعلية (% من الرصيد) لوقف بنسبة sl_pct بعد تطبيق سقف الهامش."""
     if equity <= 0 or sl_pct <= 0:
         return 0.0
     Hc = HORIZON_DEFS[h]
@@ -731,7 +736,7 @@ def effective_risk_pct(equity, sl_pct, h="swing"):
 
 
 def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy="", equity=None,
-              horizon="swing"):
+              horizon="swing", score=None):
     Hc = HORIZON_DEFS[horizon]
     lev = Hc["leverage"]
     title = "🟢 <b>توصية شراء (LONG)</b>" if side == "LONG" else "🔴 <b>توصية بيع (SHORT)</b>"
@@ -745,13 +750,15 @@ def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy=
         pct = risk_usd / equity * 100
         risk_pct_txt = f" = {pct:.2f}% من الرصيد"
         if pct < Hc["risk_pct"] * 0.5:
-            risk_pct_txt += f" ⚠️ أقل من المستهدف ({Hc['risk_pct']}%) بسبب سقف الهامش"
+            risk_pct_txt += f" ⚠️ أقل من المستهدف ({Hc['risk_pct']}%)"
     now_str = datetime.now(KSA_TZ).strftime("%I:%M %p")
     regime_txt = f"\n⏳ <b>الأفق:</b> {Hc['label']} ({'/'.join(dict.fromkeys(Hc['tfs']))})"
     if regime:
         regime_txt += f"\n📡 <b>نظام السوق:</b> {regime}"
     if strategy:
         regime_txt += f"\n🧠 <b>الاستراتيجية:</b> {STRAT_LABEL.get(strategy, strategy)}"
+    if score is not None:
+        regime_txt += f"\n🎚️ <b>درجة الفرصة:</b> {score}/100"
     return (f"{title}\n{status}{regime_txt}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🪙 <b>الزوج:</b> <code>{short(sym)}</code>\n"
@@ -847,6 +854,118 @@ def add_indicators(df):
 
 
 # ==========================================
+# V49 — محرك السيولة (Liquidity Engine)
+# ==========================================
+def detect_liquidity_sweep(df, lookback=None, tol_pct=None, wick_ratio=None):
+    """يكشف كنس السيولة في آخر شمعة مغلقة.
+    bullish_sweep: الذيل السفلي كسر قاع سوينغ ثم أُغلق فوقه (فرصة LONG).
+    bearish_sweep: الذيل العلوي كسر قمة سوينغ ثم أُغلق تحتها (فرصة SHORT).
+    """
+    lookback = lookback or LIQ_SWEEP_LOOKBACK
+    tol_pct = tol_pct or LIQ_SWEEP_TOL_PCT
+    wick_ratio = wick_ratio or LIQ_WICK_RATIO
+    if len(df) < lookback + 5:
+        return None, {}
+    last = df.iloc[-2]
+    window = df.iloc[-(lookback + 2):-2]
+
+    prev_low = float(window["low"].min())
+    prev_high = float(window["high"].max())
+    low, high = float(last["low"]), float(last["high"])
+    open_, close = float(last["open"]), float(last["close"])
+    rng = high - low
+    if rng <= 0:
+        return None, {}
+    body = abs(close - open_)
+    lower_wick = min(open_, close) - low
+    upper_wick = high - max(open_, close)
+    tol = close * tol_pct
+
+    if low < prev_low - tol and close > prev_low and lower_wick > body * wick_ratio:
+        return "bullish_sweep", {
+            "swept_level": prev_low,
+            "wick_depth_pct": round((prev_low - low) / prev_low * 100, 3),
+        }
+    if high > prev_high + tol and close < prev_high and upper_wick > body * wick_ratio:
+        return "bearish_sweep", {
+            "swept_level": prev_high,
+            "wick_depth_pct": round((high - prev_high) / prev_high * 100, 3),
+        }
+    return None, {}
+
+
+def detect_liquidity_pools(df, lookback=50, tol_pct=None):
+    tol_pct = tol_pct or LIQ_POOL_TOL_PCT
+    if len(df) < lookback + 5:
+        return {"equal_highs": [], "equal_lows": []}
+    window = df.iloc[-(lookback + 2):-2]
+    highs, lows = window["high"].values, window["low"].values
+    ref = float(window["close"].iloc[-1])
+    tol = ref * tol_pct
+    eq_highs, eq_lows = [], []
+    n = len(highs)
+    for i in range(n - 1):
+        for j in range(i + 1, min(i + 10, n)):
+            if abs(highs[i] - highs[j]) < tol:
+                eq_highs.append(float(highs[i]))
+            if abs(lows[i] - lows[j]) < tol:
+                eq_lows.append(float(lows[i]))
+    return {
+        "equal_highs": sorted(set(eq_highs))[-3:],
+        "equal_lows": sorted(set(eq_lows))[-3:],
+        "nearest_above": float(window["high"].max()),
+        "nearest_below": float(window["low"].min()),
+    }
+
+
+def detect_fvg(df, lookback=None):
+    """FVG غير مملوءة (آخر 5). bullish: بين c1.high و c3.low. bearish: بين c3.high و c1.low."""
+    lookback = lookback or LIQ_FVG_LOOKBACK
+    if len(df) < lookback + 3:
+        return []
+    gaps = []
+    window = df.iloc[-(lookback + 3):]
+    for i in range(2, len(window)):
+        c1, c3 = window.iloc[i - 2], window.iloc[i]
+        if c1["high"] < c3["low"]:
+            gaps.append({"type": "bullish", "low": float(c1["high"]),
+                         "high": float(c3["low"]),
+                         "mid": (float(c1["high"]) + float(c3["low"])) / 2})
+        elif c1["low"] > c3["high"]:
+            gaps.append({"type": "bearish", "low": float(c3["high"]),
+                         "high": float(c1["low"]),
+                         "mid": (float(c3["high"]) + float(c1["low"])) / 2})
+    current = float(df.iloc[-2]["close"])
+    alive = []
+    for g in gaps:
+        if g["type"] == "bullish" and current < g["low"]:
+            continue
+        if g["type"] == "bearish" and current > g["high"]:
+            continue
+        alive.append(g)
+    return alive[-5:]
+
+
+def fetch_orderbook_imbalance(ex, sym, depth=None):
+    if not USE_ORDERBOOK:
+        return None
+    depth = depth or ORDERBOOK_DEPTH
+    try:
+        ob = ex.fetch_order_book(sym, limit=depth)
+        bids, asks = ob.get("bids", []), ob.get("asks", [])
+        bv = sum(float(b[1]) for b in bids) if bids else 0.0
+        av = sum(float(a[1]) for a in asks) if asks else 0.0
+        total = bv + av
+        if total <= 0:
+            return None
+        return {"bid_vol": bv, "ask_vol": av, "ratio": bv / total,
+                "bid_ask_ratio": (bv / av) if av > 0 else float("inf")}
+    except Exception as e:
+        log.debug(f"[ORDERBOOK] {sym}: {e}")
+        return None
+
+
+# ==========================================
 # المنصة (OKX)
 # ==========================================
 def create_exchange():
@@ -890,7 +1009,6 @@ def get_current_price(ex, sym, max_age=20):
 
 
 def get_equity(ex, force=False):
-    """يرجع 0.0 عند تعذر القراءة (لا نستخدم رصيداً قديماً لقرارات جديدة)."""
     if not force and time.time() - _equity_cache["ts"] < 60 and _equity_cache["value"] > 0:
         return _equity_cache["value"]
     try:
@@ -931,7 +1049,6 @@ def calculate_contracts(ex, sym, margin, price, lev):
 
 
 def compute_margin(equity, sl_pct, h="swing"):
-    """يرجع 0.0 إذا تعذر تحديد حجم آمن (الرصيد مجهول أو الهامش أقل من الحد الأدنى)."""
     if equity <= 0:
         return 0.0
     if not USE_RISK_SIZING:
@@ -945,7 +1062,6 @@ def compute_margin(equity, sl_pct, h="swing"):
 
 
 def get_open_position(ex, sym):
-    """None فقط إذا لا يوجد مركز. أي خطأ API يرفع Exception."""
     for p in ex.fetch_positions([sym]):
         contracts = abs(float(p.get('contracts') or 0))
         if contracts > 0:
@@ -956,7 +1072,6 @@ def get_open_position(ex, sym):
     return None
 
 
-# ---------- أوامر الحماية ----------
 def _valid_trigger(value):
     try:
         return float(value or 0) > 0
@@ -976,7 +1091,6 @@ def get_algos(ex, sym):
 
 
 def has_protection(ex, sym):
-    """(has_sl, has_tp) أو (None, None) إذا تعذر الاستعلام."""
     try:
         algos = get_algos(ex, sym)
         return any(a["is_sl"] for a in algos), any(a["is_tp"] for a in algos)
@@ -1024,7 +1138,6 @@ def place_sl_tp(ex, sym, side, contracts, trigger, is_sl):
 
 
 def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
-    """وقف الخسارة: أي رفض = فشل. الهدف: رفض بسبب تجاوز السعر لا يُعد فشلاً حرجاً."""
     sl_ok = tp_ok = False
     if sl is not None:
         for i in range(retries):
@@ -1052,7 +1165,6 @@ def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
 
 
 def replace_protection(ex, sym, close_side, contracts, sl, tp=None):
-    """نضع الجديد أولاً ثم نلغي القديم. فشل الوقف الجديد = تبقى القديمة."""
     try:
         old = get_algos(ex, sym)
     except Exception as e:
@@ -1148,7 +1260,6 @@ def leg_pnl(side, entry, exit_price, contracts, cs):
 
 
 def get_actual_fees(ex, sym, pos_data):
-    """مجموع الرسوم الفعلية (USDT) لكل تنفيذات الصفقة. None إذا لا تتوفر."""
     if (pos_data.get("strategy") or "") == "adopted" or not pos_data.get("opened_ts"):
         return None
     try:
@@ -1214,7 +1325,6 @@ def finalize_trade(ex, sym, reason_hint=None):
     contracts = pos_data.get("contracts", 0.0)
     realized = pos_data.get("realized_pnl", 0.0)
     realized_fees_est = pos_data.get("realized_fees_est", 0.0)
-
     gross_final = (exit_price - entry) * d * contracts * cs
     fee_est_final = leg_fee_est(entry, exit_price, contracts, cs)
     fees_est_total = realized_fees_est + fee_est_final
@@ -1222,7 +1332,7 @@ def finalize_trade(ex, sym, reason_hint=None):
     use_actual = (fees_actual is not None and fees_est_total > 0 and
                   0.2 * fees_est_total <= fees_actual <= 5 * fees_est_total)
     if fees_actual is not None and not use_actual:
-        log.warning(f"[FEES] {sym}: الرسوم الفعلية {fees_actual:.4f} بعيدة عن التقدير {fees_est_total:.4f} — استُخدم التقدير")
+        log.warning(f"[FEES] {sym}: الفعلية {fees_actual:.4f} بعيدة عن التقدير {fees_est_total:.4f}")
     if use_actual:
         total = realized + realized_fees_est + gross_final - fees_actual
         fees_total, fees_src = fees_actual, "actual"
@@ -1230,14 +1340,12 @@ def finalize_trade(ex, sym, reason_hint=None):
         total = realized + gross_final - fee_est_final
         fees_total, fees_src = fees_est_total, "est"
     final_leg = total - realized
-
     margin = pos_data.get("margin") or POSITION_SIZE_USDT
     reason = reason_hint or detect_reason(pos_data, exit_price)
     init_risk = pos_data.get("initial_risk", 0.0)
     risk_usd = init_risk * pos_data.get("initial_contracts", 0.0) * cs
     r_mult = (total / risk_usd) if risk_usd > 0 else 0.0
     duration = int((time.time() - (pos_data.get("opened_ts") or time.time())) / 60)
-
     stop_slip_usd = stop_slip_r = None
     if reason in ("Stop Loss", "Trailing Stop", "Breakeven Hit") and pos_data.get("sl"):
         adverse = (pos_data["sl"] - exit_price) if side == "LONG" else (exit_price - pos_data["sl"])
@@ -1248,7 +1356,6 @@ def finalize_trade(ex, sym, reason_hint=None):
     if pe:
         adverse_e = (entry - pe) if side == "LONG" else (pe - entry)
         entry_slip_usd = adverse_e * pos_data.get("initial_contracts", 0.0) * cs
-
     add_daily_pnl(final_leg)
     register_trade_result(total)
     journal_append({
@@ -1320,7 +1427,7 @@ def btc_bias(ex):
 
 
 # ==========================================
-# نظام السوق + الاستراتيجية (مع سبب الرفض)
+# الاستراتيجيات
 # ==========================================
 def detect_regime(P, df_c, df_t):
     if len(df_t) < 50 or len(df_c) < 50:
@@ -1343,7 +1450,6 @@ def detect_regime(P, df_c, df_t):
 
 
 def relative_atr(df):
-    """نسبة ATR% الحالي إلى وسيط ATR% لنفس العملة خلال ~100 شمعة مغلقة سابقة."""
     try:
         series = (df["atr"] / df["close"]).iloc[-102:-2].dropna()
         if len(series) < 60:
@@ -1356,7 +1462,6 @@ def relative_atr(df):
 
 
 def build_context(h, df_e, df_c, df_t):
-    """الشروط العامة المشتركة بين الاستراتيجيتين لأفق h. يرجع (ctx, None) أو (None, reason)."""
     P, Hc = PARAMS[h], HORIZON_DEFS[h]
     if len(df_e) < 70 or len(df_c) < 60 or len(df_t) < 60:
         return None, "insufficient_data"
@@ -1370,7 +1475,6 @@ def build_context(h, df_e, df_c, df_t):
     price = float(last["close"])
     atr_val = float(last["atr"])
     adx_val = float(last["adx"])
-
     regime = detect_regime(P, df_c, df_t)
     if regime == "unknown":
         return None, "insufficient_data"
@@ -1386,12 +1490,10 @@ def build_context(h, df_e, df_c, df_t):
         return None, "atr_low"
     if adx_val < P["min_adx"]:
         return None, "low_adx"
-
     long_dir = regime in ("strong_trend_up", "weak_trend") and last_t["close"] > last_t["ema50"]
     short_dir = regime in ("strong_trend_down", "weak_trend") and last_t["close"] < last_t["ema50"]
     if not long_dir and not short_dir:
         return None, "direction_mismatch"
-
     sl_pct = max(Hc["min_sl"], min(Hc["max_sl"], Hc["atr_sl_mult"] * atr_val / price))
     return {
         "h": h, "P": P, "last": last, "prev": prev, "last_c": last_c, "last_t": last_t,
@@ -1413,7 +1515,6 @@ def _make_signal(side, ctx, strategy):
 
 
 def pullback_signal(ctx):
-    """استراتيجية الارتداد: دخول مع الاتجاه بعد تراجع نحو EMA."""
     P = ctx["P"]
     last, prev, last_c = ctx["last"], ctx["prev"], ctx["last_c"]
     price, ema21, ema50, rsi_val = ctx["price"], ctx["ema21"], ctx["ema50"], ctx["rsi"]
@@ -1445,7 +1546,6 @@ def pullback_signal(ctx):
 
 
 def breakout_signal(ctx, df_e):
-    """استراتيجية الاختراق: إغلاق خلف قمة/قاع آخر N شمعة بحجم مرتفع وبدعم إطار التأكيد."""
     P = ctx["P"]
     last, last_c = ctx["last"], ctx["last_c"]
     window = df_e.iloc[-(BO_LOOKBACK + 2):-2]
@@ -1482,29 +1582,56 @@ def breakout_signal(ctx, df_e):
     return _make_signal("SHORT", ctx, "breakout"), None
 
 
+def liquidity_sweep_signal(ctx, df_e, ex=None, sym=None):
+    """V49: دخول بعد كنس السيولة + رفض + توافق اتجاه."""
+    P, last = ctx["P"], ctx["last"]
+    sweep_type, info = detect_liquidity_sweep(df_e)
+    if not sweep_type:
+        return None, "liq_no_sweep"
+    if sweep_type == "bullish_sweep" and not ctx["long_dir"]:
+        return None, "liq_direction_mismatch"
+    if sweep_type == "bearish_sweep" and not ctx["short_dir"]:
+        return None, "liq_direction_mismatch"
+    if not (last["volume"] > P["min_vol_mult"] * last["vol_ma"]):
+        return None, "liq_low_volume"
+    rsi_val = ctx["rsi"]
+    if sweep_type == "bullish_sweep" and rsi_val > 75:
+        return None, "liq_rsi_overbought"
+    if sweep_type == "bearish_sweep" and rsi_val < 25:
+        return None, "liq_rsi_oversold"
+    side = "LONG" if sweep_type == "bullish_sweep" else "SHORT"
+    sig = _make_signal(side, ctx, "liquidity_sweep")
+    sig["sweep_info"] = info
+    sig["sweep_type"] = sweep_type
+    # FVG (سياق إضافي)
+    for g in detect_fvg(df_e):
+        if g["low"] <= ctx["price"] <= g["high"]:
+            if (side == "LONG" and g["type"] == "bullish") or \
+               (side == "SHORT" and g["type"] == "bearish"):
+                sig["in_fvg"] = g["type"]
+                break
+    # دفتر الأوامر (اختياري)
+    if ex and sym:
+        ob = fetch_orderbook_imbalance(ex, sym)
+        if ob:
+            sig["ob_ratio"] = ob["ratio"]
+    return sig, None
+
+
 def score_signal(signal, ctx):
-    """درجة جودة 0-100 مبنية على بيانات الشموع والمؤشرات المتاحة فقط."""
     last, hc, ht = ctx["last"], ctx["last_c"], ctx["last_t"]
     side = signal["side"]
     score, factors = 0, {}
-
-    # توافق الاتجاه متعدد الأطر (حتى 20)
     aligned = ((side == "LONG" and hc["ema9"] > hc["ema21"] and ht["close"] > ht["ema50"])
                or (side == "SHORT" and hc["ema9"] < hc["ema21"] and ht["close"] < ht["ema50"]))
     factors["trend"] = 20 if aligned else 6
     score += factors["trend"]
-
-    # الحجم النسبي (حتى 15)
     vol_ratio = float(last["volume"] / last["vol_ma"]) if last["vol_ma"] else 0.0
     factors["volume"] = min(15, max(0, int(7.5 * vol_ratio)))
     score += factors["volume"]
-
-    # قوة الاتجاه ADX (حتى 15)
     adx_value = float(last["adx"])
     factors["adx"] = min(15, max(0, int((adx_value - 12) * 0.75)))
     score += factors["adx"]
-
-    # الزخم RSI (حتى 15)
     r = float(last["rsi"])
     if side == "LONG":
         momentum = 15 if 52 <= r <= 66 else (10 if 47 <= r < 52 or 66 < r <= 70 else 4)
@@ -1512,48 +1639,71 @@ def score_signal(signal, ctx):
         momentum = 15 if 34 <= r <= 48 else (10 if 30 <= r < 34 or 48 < r <= 53 else 4)
     factors["momentum"] = momentum
     score += momentum
-
-    # جودة شمعة الإشارة (حتى 10)
     rng = max(float(last["high"] - last["low"]), 1e-12)
     body = abs(float(last["close"] - last["open"])) / rng
     factors["candle"] = min(10, int(body * 10))
     score += factors["candle"]
-
-    # طبيعة الاستراتيجية (حتى 15)
-    factors["setup"] = 15 if signal.get("strategy") == "breakout" else 12
+    factors["setup"] = 15 if signal.get("strategy") in ("breakout", "liquidity_sweep") else 12
     score += factors["setup"]
-
-    # تمدد السعر عن EMA21 (حتى 10)
     extension = abs(float(last["close"]) - float(last["ema21"])) / max(float(last["atr"]), 1e-12)
     factors["entry_quality"] = 10 if extension <= 0.8 else (7 if extension <= 1.4 else 3)
     score += factors["entry_quality"]
-
+    # V49: مكافأة السيولة (حتى +15)
+    liq_bonus = 0
+    if signal.get("sweep_type"):
+        liq_bonus += 5
+    if signal.get("in_fvg"):
+        liq_bonus += 5
+    ob = signal.get("ob_ratio")
+    if ob is not None:
+        if (side == "LONG" and ob > OB_IMBALANCE_LONG) or \
+           (side == "SHORT" and ob < OB_IMBALANCE_SHORT):
+            liq_bonus += 5
+    factors["liquidity"] = liq_bonus
+    score += liq_bonus
     signal["score"] = min(100, int(score))
     signal["score_factors"] = factors
     signal["volume_ratio"] = round(vol_ratio, 2)
     return signal
 
 
-def evaluate_signal(h, df_e, df_c, df_t):
-    """يرجع (signal, {}) أو (None, reasons)."""
-    ctx, reason = build_context(h, df_e, df_c, df_t)
-    if ctx is None:
-        return None, {"common": reason}
-    sig, r_pull = pullback_signal(ctx)
-    if not sig and ENABLE_BREAKOUT:
-        sig, r_bo = breakout_signal(ctx, df_e)
-        if not sig:
-            return None, {"pullback": r_pull, "breakout": r_bo}
-    elif not sig:
-        return None, {"pullback": r_pull}
+def _finish_signal(sig, ctx, h, ex=None, sym=None, df_e=None):
+    """V49: post-process — إثراء بـ FVG/OB ثم التسجيل."""
+    if df_e is not None and not sig.get("in_fvg"):
+        for g in detect_fvg(df_e):
+            if g["low"] <= ctx["price"] <= g["high"]:
+                if (sig["side"] == "LONG" and g["type"] == "bullish") or \
+                   (sig["side"] == "SHORT" and g["type"] == "bearish"):
+                    sig["in_fvg"] = g["type"]
+                    break
+    if ex and sym and "ob_ratio" not in sig and (sig.get("sweep_type") or sig.get("in_fvg")):
+        ob = fetch_orderbook_imbalance(ex, sym)
+        if ob:
+            sig["ob_ratio"] = ob["ratio"]
     sig = score_signal(sig, ctx)
     if sig["score"] < HORIZON_DEFS[h]["min_score"]:
         return None, {"common": "score_low"}
     return sig, {}
 
 
+def evaluate_signal(h, df_e, df_c, df_t, ex=None, sym=None):
+    ctx, reason = build_context(h, df_e, df_c, df_t)
+    if ctx is None:
+        return None, {"common": reason}
+    sig, r_pull = pullback_signal(ctx)
+    if sig:
+        return _finish_signal(sig, ctx, h, ex, sym, df_e)
+    sig, r_bo = breakout_signal(ctx, df_e) if ENABLE_BREAKOUT else (None, "disabled")
+    if sig:
+        return _finish_signal(sig, ctx, h, ex, sym, df_e)
+    sig, r_liq = (liquidity_sweep_signal(ctx, df_e, ex, sym)
+                  if ENABLE_LIQUIDITY_SWEEP else (None, "disabled"))
+    if sig:
+        return _finish_signal(sig, ctx, h, ex, sym, df_e)
+    return None, {"pullback": r_pull, "breakout": r_bo, "liquidity": r_liq}
+
+
 def market_filters_ok(ex, sym, side, h="swing"):
-    """يرجع (ok, reason_code). السبريد المجهول يمنع الدخول، التمويل المجهول لا يمنع."""
     P, Hc = PARAMS[h], HORIZON_DEFS[h]
     try:
         t = ex.fetch_ticker(sym)
@@ -1562,10 +1712,8 @@ def market_filters_ok(ex, sym, side, h="swing"):
             spread = (ask - bid) / last
             _last_spread[sym] = (time.time(), spread)
             if spread > P["max_spread_pct"]:
-                log.info(f"[SPREAD] {sym} {spread * 100:.3f}% > الحد {P['max_spread_pct'] * 100:.3f}% — حجب")
+                log.info(f"[SPREAD] {sym} {spread * 100:.3f}% > الحد")
                 return False, "spread_high"
-        else:
-            log.info(f"[SPREAD] {sym}: لا توجد أسعار bid/ask في الرد (لم يُطبَّق فلتر السبريد)")
     except Exception as e:
         log.warning(f"[FILTER TICKER] {sym}: {e}")
         return False, "ticker_unavailable"
@@ -1680,23 +1828,19 @@ def manage_position(ex, sym, st):
     if not price:
         return
     close_side = 'sell' if side == "LONG" else 'buy'
-
     has_sl, _ = has_protection(ex, sym)
     if has_sl is None:
-        log.warning(f"[MANAGE] حالة الحماية مجهولة لـ {sym} — تأجيل الإدارة")
+        log.warning(f"[MANAGE] حالة الحماية مجهولة لـ {sym}")
         return
     if not has_sl:
         ok = replace_protection(ex, sym, close_side, st["contracts"], st["sl"], st.get("tp"))
         if not ok:
             emergency_close(ex, sym, "الصفقة بدون وقف خسارة")
             return
-
     risk = st.get("initial_risk") or abs(entry - (st.get("initial_sl") or st["sl"]))
     if risk <= 0:
         return
     r_now = (price - entry) * d / risk
-
-    # Time Stop: صفقة لم تتأمن خلال المدة القصوى لأفقها = فرصة ضعفت، نحرر الهامش
     held_h = (time.time() - (st.get("opened_ts") or time.time())) / 3600
     if held_h > Hc["max_hold_h"] and not st.get("breakeven_hit"):
         send(f"⏱️ <b>انتهت مدة الصفقة ({Hc['max_hold_h']:g}س) دون تأمين</b> — <code>{short(sym)}</code> ({r_now:+.2f}R) — إغلاق.")
@@ -1705,20 +1849,17 @@ def manage_position(ex, sym, st):
         else:
             send(f"❌ فشل إغلاق Time Stop لـ <code>{short(sym)}</code>")
         return
-
     if not st.get("partial_1_taken") and r_now >= Hc["p1_r"]:
         if do_partial(ex, sym, st, 1):
             return
     elif st.get("partial_1_taken") and not st.get("partial_2_taken") and r_now >= Hc["p2_r"]:
         if do_partial(ex, sym, st, 2):
             return
-
     if not st.get("breakeven_hit"):
         if r_now >= Hc["be_r"]:
             move_sl(ex, sym, st, breakeven_price(side, entry), "🛡️ تأمين الصفقة (Breakeven)")
         return
-
-    raw = fetch_data(ex, sym, Hc["tfs"][0])     # الوقف المتحرك على ATR إطار الدخول لأفق الصفقة
+    raw = fetch_data(ex, sym, Hc["tfs"][0])
     if len(raw) < 50:
         return
     atr_val = to_df(raw).iloc[-2].get("atr")
@@ -1742,7 +1883,7 @@ def manage_position(ex, sym, st):
 
 
 # ==========================================
-# السماح بالدخول + المخاطرة الكلية
+# السماح بالدخول + Swap
 # ==========================================
 def floating_pnl_cached(ex):
     total = 0.0
@@ -1755,7 +1896,6 @@ def floating_pnl_cached(ex):
 
 
 def open_risk_usd(ex):
-    """مجموع المخاطرة المتبقية للصفقات غير المؤمَّنة (التي لم يُنقل وقفها للتعادل بعد)."""
     total = 0.0
     for sym, v in open_positions_snapshot().items():
         if v.get("breakeven_hit"):
@@ -1765,7 +1905,6 @@ def open_risk_usd(ex):
 
 
 def entries_allowed(ex):
-    """يرجع (ok, reason)."""
     if meta.get("paused"):
         return False, "paused"
     snap = daily_snapshot()
@@ -1788,781 +1927,17 @@ def entries_allowed(ex):
     return True, ""
 
 
-# ==========================================
-# المسح (تقييم الآفاق) ثم التنفيذ بالترتيب
-# ==========================================
-def evaluate_horizon(ex, sym, h):
-    """يقيّم أفقاً واحداً عند إغلاق شمعة جديدة لإطار دخوله. يرجع مرشحاً أو None."""
-    Hc = HORIZON_DEFS[h]
-    tf_e, tf_c, tf_t = Hc["tfs"]
-    raw_e = fetch_data(ex, sym, tf_e)
-    if len(raw_e) < 70:
-        set_last_reason(sym, "no_data")
-        return None
-    closed_ts = raw_e[-2][0]
-    if _last_eval.get((sym, h)) == closed_ts:
-        return None
-    raw_c = fetch_data(ex, sym, tf_c)
-    raw_t = raw_c if tf_t == tf_c else fetch_data(ex, sym, tf_t)
-    if len(raw_c) < 60 or len(raw_t) < 60:
-        set_last_reason(sym, "no_data")
-        return None
-    _last_eval[(sym, h)] = closed_ts
-    df_e = to_df(raw_e)
-    df_c = to_df(raw_c)
-    df_t = df_c if raw_t is raw_c else to_df(raw_t)
-    signal, reasons = evaluate_signal(h, df_e, df_c, df_t)
-    note_eval(sym, signal, reasons, h)
-    if not signal:
-        return None
-    signal["closed_ms"] = closed_ts + TF_MS[tf_e]
-    return {"sym": sym, "signal": signal, "h": h}
-
-
-def scan_symbol(ex, sym):
-    """يدير المركز المفتوح، أو يقيّم الآفاق المفعّلة ويرجع أول مرشح (بأولوية الأفق الأطول)."""
-    try:
-        with trade_lock:
-            with state_lock:
-                st = state.setdefault(sym, new_sym_state())
-                pos_data = dict(st)
-
-            if pos_data.get("position") is not None:
-                exch_pos = get_open_position(ex, sym)
-                if exch_pos is None:
-                    finalize_trade(ex, sym)
-                    return None
-                with state_lock:
-                    state[sym]["contracts"] = exch_pos["contracts"]
-                    cur = dict(state[sym])
-                manage_position(ex, sym, cur)
-                return None
-
-            if time.time() - pos_data.get("last_exit_ts", 0) < pos_data.get("cooldown_sec", REENTRY_COOLDOWN_SEC):
-                set_last_reason(sym, "cooldown")
-                return None
-            ok, gate = entries_allowed(ex)
-            if not ok:
-                set_last_reason(sym, gate)
-                return None
-            with state_lock:
-                open_count = sum(1 for v in state.values() if v.get("position"))
-                by_h = {}
-                for v in state.values():
-                    if v.get("position"):
-                        by_h[hz_of(v)] = by_h.get(hz_of(v), 0) + 1
-            if open_count >= MAX_OPEN_POSITIONS:
-                set_last_reason(sym, "max_positions")
-                return None
-
-            for h in ENABLED_HORIZONS:
-                if by_h.get(h, 0) >= HORIZON_DEFS[h]["max_open"]:
-                    set_last_reason(sym, f"horizon_limit@{h}")
-                    continue
-                cand = evaluate_horizon(ex, sym, h)
-                if cand:
-                    return cand
-            return None
-    except Exception as e:
-        loop_info["last_error"] = f"{sym}: {str(e)[:150]}"
-        log.error(f"[ERROR] {sym}: {e}")
-        return None
-
-
-def execute_entry(ex, cand):
-    sym, signal, h = cand["sym"], cand["signal"], cand["h"]
-    Hc = HORIZON_DEFS[h]
-    lev = Hc["leverage"]
-    side = signal["side"]
-    try:
-        with trade_lock:
-            with state_lock:
-                st = state.setdefault(sym, new_sym_state())
-                if st.get("position") is not None:
-                    return
-                open_count = sum(1 for v in state.values() if v.get("position"))
-                same_dir = sum(1 for v in state.values() if v.get("position") == side)
-                h_count = sum(1 for v in state.values() if v.get("position") and hz_of(v) == h)
-            log.info(f"[SIGNAL] {sym} {side} [{h}] score={signal.get('score', 0)}/100 "
-                     f"strategy={signal['strategy']} regime={signal['regime']}")
-
-            ok, gate = entries_allowed(ex)
-            if not ok:
-                note_block(sym, gate)
-                return
-            if open_count >= MAX_OPEN_POSITIONS:
-                note_block(sym, "max_positions")
-                return
-            if h_count >= Hc["max_open"]:
-                note_block(sym, "horizon_limit")
-                return
-            if same_dir >= MAX_SAME_DIRECTION:
-                note_block(sym, "max_same_direction")
-                return
-            if sector_limit_reached(sym, side):
-                note_block(sym, "sector_limit")
-                return
-            if (time.time() * 1000 - signal.get("closed_ms", 0)) > Hc["max_signal_age_s"] * 1000:
-                note_block(sym, "signal_stale")
-                return
-            if USE_BTC_FILTER and not sym.startswith("BTC/"):
-                bias = btc_bias(ex)
-                if (side == "LONG" and bias == "down") or (side == "SHORT" and bias == "up"):
-                    note_block(sym, "btc_filter")
-                    return
-            ok, code = market_filters_ok(ex, sym, side, h)
-            if not ok:
-                note_block(sym, code)
-                return
-
-            actual_price = get_current_price(ex, sym, 0) or signal["price"]
-            if abs(actual_price - signal["price"]) / signal["price"] > Hc["max_entry_slip"]:
-                note_block(sym, "slippage")
-                return
-            sl_pct = signal["sl_pct"]
-            if (2 * FEE_RATE + EST_SLIPPAGE_PCT) / sl_pct > MAX_COST_R:
-                note_block(sym, "cost_too_high")
-                return
-            if side == "LONG":
-                sl = actual_price * (1 - sl_pct)
-                tp = actual_price * (1 + sl_pct * Hc["rr"])
-            else:
-                sl = actual_price * (1 + sl_pct)
-                tp = actual_price * (1 - sl_pct * Hc["rr"])
-
-            equity_now = get_equity(ex)
-            margin = compute_margin(equity_now, sl_pct, h)
-            if margin <= 0:
-                log.info(f"[SKIP] {sym}: الهامش غير صالح (رصيد مجهول أو أقل من الحد الأدنى)")
-                note_block(sym, "margin_too_small")
-                return
-            new_risk = margin * sl_pct * lev
-            if open_risk_usd(ex) + new_risk > equity_now * MAX_PORTFOLIO_RISK_PCT / 100.0:
-                note_block(sym, "portfolio_heat")
-                return
-
-            success, info, entry, contracts = open_position(ex, sym, side, actual_price, sl, tp, margin, lev)
-            now = time.time()
-            if success:
-                note_opened(h)
-                with state_lock:
-                    state[sym].update({
-                        "position": side, "entry": entry, "sl": sl, "tp": tp,
-                        "initial_sl": sl, "initial_risk": abs(entry - sl),
-                        "contracts": contracts, "initial_contracts": contracts,
-                        "margin": margin, "opened_ts": now, "leg_ts": now,
-                        "realized_pnl": 0.0, "realized_fees_est": 0.0, "planned_entry": actual_price,
-                        "last_notified_sl": None,
-                        "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False,
-                        "regime": signal.get("regime", ""), "horizon": h,
-                        "strategy": signal.get("strategy", ""), "signal_score": signal.get("score", 0)})
-            else:
-                note_block(sym, "open_failed")
-                with state_lock:
-                    state[sym]["last_exit_ts"] = now
-                    state[sym]["cooldown_sec"] = Hc["cooldown"]
-            save_state()
-            caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""),
-                                signal.get("strategy", ""), equity_now, h)
-            caption += f"\n🧠 تقييم الفرصة: <b>{signal.get('score', 0)}/100</b> | حجم التداول: {signal.get('volume_ratio', 0):.2f}×"
-            if not success:
-                caption += f"\n❌ {info}"
-            send(caption)
-    except Exception as e:
-        loop_info["last_error"] = f"{sym}: {str(e)[:150]}"
-        log.error(f"[ERROR-EXEC] {sym}: {e}")
-
-
-# ==========================================
-# مزامنة عند الإقلاع
-# ==========================================
-def adopt_sl_pct(ex, sym):
-    try:
-        raw = fetch_data(ex, sym, "15m")
-        if len(raw) >= 60:
-            df = to_df(raw)
-            a, c = float(df.iloc[-2]["atr"]), float(df.iloc[-2]["close"])
-            if c > 0 and not np.isnan(a):
-                return max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * a / c))
-    except Exception:
-        pass
-    return FALLBACK_SL_PCT
-
-
-def sync_positions(ex, active_symbols):
-    """تُستدعى عند الإقلاع فقط. جلب المراكز داخل trade_lock لتفادي لقطة قديمة."""
-    with trade_lock:
-        try:
-            exch = {}
-            for p in ex.fetch_positions():
-                c = abs(float(p.get('contracts') or 0))
-                if c > 0 and p.get('symbol') in active_symbols:
-                    exch[p['symbol']] = p
-        except Exception as e:
-            log.error(f"[SYNC] {e}")
-            return
-        for sym in active_symbols:
-            with state_lock:
-                st = dict(state.get(sym, new_sym_state()))
-            if st.get("position") and sym not in exch:
-                finalize_trade(ex, sym)
-            elif st.get("position") and sym in exch:
-                contracts = abs(float(exch[sym].get('contracts')))
-                with state_lock:
-                    state[sym]["contracts"] = contracts
-                has_sl, _ = has_protection(ex, sym)
-                if has_sl is False:
-                    close_side = 'sell' if st["position"] == "LONG" else 'buy'
-                    replace_protection(ex, sym, close_side, contracts, st["sl"], st.get("tp"))
-            elif not st.get("position") and sym in exch:
-                p = exch[sym]
-                side = "LONG" if p.get('side') == 'long' else "SHORT"
-                entry = float(p.get('entryPrice') or 0)
-                contracts = abs(float(p.get('contracts')))
-                sl_pct = adopt_sl_pct(ex, sym)
-                if side == "LONG":
-                    sl, tp = entry * (1 - sl_pct), entry * (1 + sl_pct * RR_RATIO)
-                else:
-                    sl, tp = entry * (1 + sl_pct), entry * (1 - sl_pct * RR_RATIO)
-                current_price = get_current_price(ex, sym)
-                if current_price and ((side == "LONG" and current_price >= tp) or
-                                      (side == "SHORT" and current_price <= tp)):
-                    log.warning(f"[SYNC] {sym} تجاوز الهدف أثناء الإيقاف — إغلاق")
-                    close_full(ex, sym)
-                    continue
-                close_side = 'sell' if side == "LONG" else 'buy'
-                cancel_pending(ex, sym)
-                if protect_position(ex, sym, close_side, contracts, sl, tp)[0]:
-                    now = time.time()
-                    with state_lock:
-                        state[sym] = new_sym_state()
-                        state[sym].update({
-                            "position": side, "entry": entry, "sl": sl, "tp": tp,
-                            "initial_sl": sl, "initial_risk": abs(entry - sl),
-                            "contracts": contracts, "initial_contracts": contracts,
-                            "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
-                            "opened_ts": now, "leg_ts": now, "regime": "adopted",
-                            "strategy": "adopted", "horizon": "swing"})
-                    send(f"♻️ تم تبني مركز <code>{short(sym)}</code> ({side}) — SL {sl_pct * 100:.2f}% (ATR)")
-        save_state()
-
-
-# ==========================================
-# أوامر تيليجرام
-# ==========================================
-def open_positions_snapshot():
+def maybe_swap_weaker(ex, new_cand):
+    """
+    V49: إذا امتلأت الأماكن ووصلت إشارة أقوى، نستبدل أضعف صفقة خاسرة غير محمية.
+    شروط: خاسرة + لم تنقل للتعادل + عمرها ≥ SWAP_MIN_HOLD_H + فارق الدرجة ≥ SWAP_SCORE_MARGIN.
+    """
+    if not AUTO_SWAP_ON_BETTER:
+        return False
+    new_score = new_cand["signal"].get("score", 0)
     with state_lock:
-        return {k: dict(v) for k, v in state.items() if v.get("position")}
-
-
-def unrealized(ex, sym, v):
-    price = get_current_price(ex, sym) or v["entry"]
-    d = 1 if v["position"] == "LONG" else -1
-    upnl = (price - v["entry"]) * d * v["contracts"] * contract_size(ex, sym)
-    return price, upnl
-
-
-def flags_text(v):
-    f = ""
-    if v.get("partial_2_taken"):
-        f += " 💰💰"
-    elif v.get("partial_1_taken"):
-        f += " 💰"
-    if v.get("breakeven_hit"):
-        f += " 🛡️"
-    return f
-
-
-def loop_age_text():
-    last = loop_info["last_cycle_ts"]
-    if not last:
-        return "لم تبدأ بعد"
-    age = int(time.time() - last)
-    return f"قبل {age}ث" + (" ⚠️" if age > WATCHDOG_SEC else " ✅")
-
-
-def status_text(ex):
-    snap = daily_snapshot()
-    equity = get_equity(ex, force=True)
-    opens = open_positions_snapshot()
-    total_float = 0.0
-    lines_pos = []
-    for sym, v in opens.items():
-        price, upnl = unrealized(ex, sym, v)
-        total_float += upnl
-        hl = HORIZON_DEFS[hz_of(v)]["label"]
-        lines_pos.append(f"• <code>{short(sym)}</code> {v['position']} [{hl}] | {fmt(v['entry'])} → {fmt(price)} | {upnl:+.2f}{flags_text(v)}")
-    with diag_lock:
-        ev, sg, op = diag["evaluated"], diag["signals"], diag["opened"]
-    bias = _btc_bias_cache["value"] if _btc_bias_cache["ts"] else "لم يُحسب بعد"
-    hz_txt = " ".join(HORIZON_DEFS[h]["label"] for h in ENABLED_HORIZONS)
-    lines = [f"📊 <b>حالة البوت {VERSION}</b> {'⏸️' if meta.get('paused') else '▶️'}", "━━━━━━━━━━━━━━━",
-             f"💼 الرصيد: {equity:,.2f} USDT",
-             f"📅 المحقق اليوم: {snap['value']:+.2f} USDT | صفقات: {snap['trades']} | رابحة: {snap['wins']}",
-             f"📈 <b>المكسب والخسارة: {total_float:+.2f} USDT</b>",
-             f"🔄 آخر دورة فحص: {loop_age_text()} | دورات: {loop_info['cycles']}",
-             f"🔎 اليوم: تقييم {ev} | إشارات {sg} | فُتحت {op}  (التفاصيل: /why)",
-             f"🐋 BTC Bias: {bias} | ⚙️ {PROFILE_NAME} | ⏳ {hz_txt}",
-             "━━━━━━━━━━━━━━━"]
-    lines.extend(lines_pos if lines_pos else ["لا توجد صفقات مفتوحة."])
-    return "\n".join(lines)
-
-
-def why_text(arg, active_symbols):
-    if arg:
-        sym = find_symbol(arg, active_symbols)
-        if not sym:
-            return "عملة غير معروفة."
-        with diag_lock:
-            item = _last_reason.get(sym)
-        if not item:
-            return f"لا يوجد تقييم بعد لـ {short(sym)}."
-        ts, r = item
-        txt = f"🔍 <b>{short(sym)}</b>\nآخر نتيجة: {label(r)}\nقبل {int((time.time() - ts) / 60)} دقيقة"
-        sp = _last_spread.get(sym)
-        if sp:
-            txt += f"\nآخر سبريد مقاس: {sp[1] * 100:.3f}%"
-        return txt
-    with diag_lock:
-        d = json.loads(json.dumps(diag))
-    ev = d["evaluated"]
-    sig_txt = " | ".join(f"{STRAT_LABEL.get(k, k)} {v}" for k, v in d.get("signals_by", {}).items()) or "—"
-    lines = [f"🔎 <b>لماذا لا توجد صفقات؟</b> — {d['date']}", "━━━━━━━━━━━━━━━",
-             f"📊 تقييمات (رمز×شمعة×أفق): {ev}",
-             f"✅ إشارات: {d['signals']} ({sig_txt}) | 🟢 فُتحت: {d['opened']}",
-             f"⚙️ البروفايل: <b>{PROFILE_NAME}</b> | الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'} (/config)"]
-    for h, c in d.get("by_h", {}).items():
-        lines.append(f"• {HORIZON_DEFS.get(h, {}).get('label', h)}: تقييم {c['evaluated']} | إشارات {c['signals']} | فُتحت {c['opened']}")
-    if meta.get("paused"):
-        lines.append("⏸️ <b>البوت موقوف (/resume)</b>")
-    if ev:
-        lines += ["", "<b>الأسباب العامة (قبل الاستراتيجيات):</b>"]
-        for r, n in sorted(d["reasons"].items(), key=lambda x: -x[1])[:8]:
-            lines.append(f"• {label(r)}: {n} ({n / ev * 100:.0f}%)")
-        for key, title in (("reasons_pullback", "الارتداد"), ("reasons_breakout", "الاختراق")):
-            items = sorted(d.get(key, {}).items(), key=lambda x: -x[1])[:4]
-            if items:
-                lines += ["", f"<b>{title}:</b>"]
-                for r, n in items:
-                    lines.append(f"• {label(r)}: {n}")
-    else:
-        lines.append("\nلا توجد تقييمات بعد (انتظر إغلاق شمعة).")
-    if d["blocks"]:
-        lines += ["", "<b>إشارات حُجبت بعد ظهورها:</b>"]
-        for r, n in sorted(d["blocks"].items(), key=lambda x: -x[1]):
-            lines.append(f"• {label(r)}: {n}")
-    lines.append("\nلتفاصيل عملة: /why BTC")
-    return "\n".join(lines)
-
-
-def config_text():
-    lines = [f"⚙️ <b>الإعدادات الحالية</b> — البروفايل: <b>{PROFILE_NAME}</b>", "━━━━━━━━━━━━━━━",
-             "<b>الآفاق الزمنية:</b>"]
-    for h in HORIZON_ORDER:
-        Hc, P = HORIZON_DEFS[h], PARAMS[h]
-        on = "✅" if h in ENABLED_HORIZONS else "⛔"
-        lines.append(
-            f"{on} {Hc['label']} ({'/'.join(dict.fromkeys(Hc['tfs']))}) | {Hc['leverage']}x | مخاطرة {Hc['risk_pct']}%\n"
-            f"   وقف {Hc['atr_sl_mult']}×ATR ({Hc['min_sl'] * 100:.1f}–{Hc['max_sl'] * 100:.1f}%) | RR {Hc['rr']} | "
-            f"مدة قصوى {Hc['max_hold_h']:g}س | درجة ≥ {Hc['min_score']} | أقصى {Hc['max_open']}\n"
-            f"   ATR≥{P['min_atr_pct'] * 100:.2f}% | ADX≥{P['min_adx']:g} | سبريد ≤{P['max_spread_pct'] * 100:.2f}%")
-    lines += [
-        "",
-        f"الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'} | نافذة {BO_LOOKBACK} شمعة",
-        f"سقف مخاطرة المحفظة: {MAX_PORTFOLIO_RISK_PCT}% | أقصى تكلفة/وقف: {MAX_COST_R:.2f} | تعادل: +{BE_FEE_BUFFER * 100:.2f}%",
-        f"سقف الهامش {MAX_MARGIN_USDT:.0f} | أقصى صفقات {MAX_OPEN_POSITIONS}",
-        "━━━━━━━━━━━━━━━",
-        "للتعديل: متغيرات البيئة (HORIZONS, PROFILE, SCALP_*, POSITION_*, ...) ثم إعادة النشر."]
-    return "\n".join(lines)
-
-
-def positions_text(ex):
-    opens = open_positions_snapshot()
+        opens = [(sym, dict(v)) for sym, v in state.items() if v.get("position")]
     if not opens:
-        return "📭 لا توجد صفقات مفتوحة حالياً."
-    lines = ["📊 <b>تفاصيل الصفقات المفتوحة</b>", "━━━━━━━━━━━━━━━"]
-    total = 0.0
-    for sym, v in opens.items():
-        price, upnl = unrealized(ex, sym, v)
-        total += upnl
-        Hc = HORIZON_DEFS[hz_of(v)]
-        pct = (upnl / v["margin"] * 100) if v.get("margin") else 0.0
-        mins = int((time.time() - v["opened_ts"]) / 60) if v.get("opened_ts") else 0
-        duration = f"{mins // 1440}ي {(mins % 1440) // 60}س" if mins >= 1440 else (f"{mins // 60}س {mins % 60}د" if mins >= 60 else f"{mins}د")
-        risk = v.get("initial_risk") or 0
-        d = 1 if v["position"] == "LONG" else -1
-        r_now = ((price - v["entry"]) * d / risk) if risk else 0.0
-        locked_line = ""
-        if v.get("partial_1_taken") or v.get("partial_2_taken"):
-            locked_line = f"🧾 ربح مقفول من الجزئيات: {v.get('realized_pnl', 0.0):+.2f}\n"
-        lines.append(
-            f"🪙 <b>{short(sym)}</b> ({v['position']}) — {Hc['label']}\n"
-            f"📥 الدخول: <code>{fmt(v['entry'])}</code>\n"
-            f"📤 الحالي: <code>{fmt(price)}</code>\n"
-            f"💰 المكسب والخسارة: <b>{upnl:+.2f} USDT</b> ({pct:+.1f}%) | {r_now:+.2f}R\n"
-            f"{locked_line}"
-            f"🛑 الوقف: <code>{fmt(v['sl']) if v.get('sl') else '—'}</code> | 🎯 <code>{fmt(v['tp']) if v.get('tp') else '—'}</code>\n"
-            f"⏱ المدة: {duration} (الحد {Hc['max_hold_h']:g}س){flags_text(v)}\n"
-            f"────────────────")
-    lines.append(f"\n📈 <b>الإجمالي: {total:+.2f} USDT</b>")
-    return "\n".join(lines)
-
-
-def risk_text(ex):
-    snap = daily_snapshot()
-    equity = get_equity(ex, force=True)
-    opens = open_positions_snapshot()
-    longs = sum(1 for v in opens.values() if v["position"] == "LONG")
-    shorts = sum(1 for v in opens.values() if v["position"] == "SHORT")
-    loss_limit = equity * DAILY_LOSS_LIMIT_PCT / 100.0
-    profit_target = equity * DAILY_PROFIT_TARGET_PCT / 100.0
-    floating = floating_pnl_cached(ex)
-    heat = open_risk_usd(ex)
-    heat_cap = equity * MAX_PORTFOLIO_RISK_PCT / 100.0
-    status = "⏸️ متوقف" if meta.get("paused") else "▶️ يعمل"
-    lines = ["🛡️ <b>ملخص إدارة المخاطر</b>", "━━━━━━━━━━━━━━━",
-             f"💼 الرصيد: <b>{equity:,.2f} USDT</b>",
-             f"📊 الحالة: {status}", ""]
-    for h in ENABLED_HORIZONS:
-        Hc = HORIZON_DEFS[h]
-        lines.append(f"🎯 {Hc['label']}: مستهدف {Hc['risk_pct']}% | فعلية عند وقف "
-                     f"{Hc['min_sl'] * 100:.1f}% / {Hc['max_sl'] * 50 + Hc['min_sl'] * 50:.1f}%: "
-                     f"<b>{effective_risk_pct(equity, Hc['min_sl'], h):.2f}% / "
-                     f"{effective_risk_pct(equity, (Hc['min_sl'] + Hc['max_sl']) / 2, h):.2f}%</b>")
-    lines += [
-        f"🔥 مخاطرة غير مؤمَّنة: {heat:.2f} / {heat_cap:.2f} USDT ({MAX_PORTFOLIO_RISK_PCT}% من الرصيد)",
-        f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT) — يشمل خسارة الصفقات المفتوحة",
-        f"📈 هدف الربح اليومي: {DAILY_PROFIT_TARGET_PCT}% ({profit_target:.1f} USDT)", "",
-        f"🔢 المفتوحة: {len(opens)} / {MAX_OPEN_POSITIONS}",
-        f"🟢 LONG: {longs} | 🔴 SHORT: {shorts} (الحد {MAX_SAME_DIRECTION})", "",
-        f"📅 المحقق اليوم: <b>{snap['value']:+.2f} USDT</b> | الحالي: {floating:+.2f}",
-        f"🔻 المتبقي للخسارة: {loss_limit + snap['value'] + min(floating, 0):+.2f} USDT",
-        f"🔺 المتبقي للهدف: {profit_target - snap['value']:+.2f} USDT",
-        "━━━━━━━━━━━━━━━"]
-    return "\n".join(lines)
-
-
-def daily_text(ex):
-    snap = daily_snapshot()
-    equity = get_equity(ex, force=True)
-    total_upnl = sum(unrealized(ex, s, v)[1] for s, v in open_positions_snapshot().items())
-    wr = (snap["wins"] / snap["trades"] * 100) if snap["trades"] else 0
-    return "\n".join([
-        f"📅 <b>ملخص اليوم</b> — {snap['date']}", "━━━━━━━━━━━━━━━",
-        f"💰 المحقق اليوم: <b>{snap['value']:+.2f} USDT</b>",
-        f"📈 المكسب والخسارة: <b>{total_upnl:+.2f} USDT</b>",
-        f"📊 الإجمالي التقديري: <b>{snap['value'] + total_upnl:+.2f} USDT</b>", "",
-        f"🔢 الصفقات المكتملة: {snap['trades']}",
-        f"✅ الرابحة: {snap['wins']} ({wr:.0f}%)",
-        f"💼 الرصيد: {equity:,.2f} USDT", "━━━━━━━━━━━━━━━"])
-
-
-def find_symbol(arg, active_symbols):
-    arg = arg.upper().replace("/USDT", "").replace("USDT", "")
-    for s in list(active_symbols):
-        if s.startswith(arg + "/"):
-            return s
-    return None
-
-
-def handle_command(ex, text, chat_id, active_symbols):
-    parts = text.strip().split()
-    cmd = parts[0].lower().split("@")[0]
-    if cmd in ("/status", "/start"):
-        send(status_text(ex), chat_id)
-    elif cmd in ("/pos", "/positions"):
-        send(positions_text(ex), chat_id)
-    elif cmd == "/risk":
-        send(risk_text(ex), chat_id)
-    elif cmd == "/daily":
-        send(daily_text(ex), chat_id)
-    elif cmd == "/stats":
-        send(stats_text(), chat_id)
-    elif cmd == "/config":
-        send(config_text(), chat_id)
-    elif cmd == "/why":
-        send(why_text(parts[1] if len(parts) > 1 else None, active_symbols), chat_id)
-    elif cmd == "/pause":
-        set_meta("paused", True)
-        send("⏸️ تم إيقاف فتح صفقات جديدة.", chat_id)
-    elif cmd == "/resume":
-        set_meta("paused", False)
-        send("▶️ تم استئناف البحث.", chat_id)
-    elif cmd == "/close":
-        if len(parts) < 2:
-            send("استخدم: /close BTC", chat_id)
-            return
-        sym = find_symbol(parts[1], active_symbols)
-        if not sym:
-            send("عملة غير معروفة.", chat_id)
-            return
-        with trade_lock:
-            with state_lock:
-                pos_data = dict(state.get(sym, {}))
-            if not pos_data.get("position"):
-                send("لا توجد صفقة مفتوحة.", chat_id)
-                return
-            if close_full(ex, sym):
-                finalize_trade(ex, sym, reason_hint="Manual")
-            else:
-                send("❌ فشل الإغلاق.", chat_id)
-    elif cmd == "/closeall":
-        if len(parts) < 2 or parts[1].lower() != "confirm":
-            send("⚠️ للتأكيد: /closeall confirm", chat_id)
-            return
-        with trade_lock:
-            with state_lock:
-                syms = [k for k, v in state.items() if v.get("position")]
-            if not syms:
-                send("لا توجد صفقات.", chat_id)
-                return
-            for sym in syms:
-                if close_full(ex, sym):
-                    finalize_trade(ex, sym, reason_hint="Manual")
-                else:
-                    send(f"❌ فشل إغلاق <code>{short(sym)}</code>", chat_id)
-    elif cmd == "/help":
-        send("<b>📋 الأوامر المتاحة:</b>\n\n"
-             "/status - نظرة عامة + حالة الحلقة\n"
-             "/why - لماذا لا توجد صفقات؟ (أسباب الرفض لكل أفق)\n"
-             "/why BTC - آخر سبب لعملة محددة\n"
-             "/config - الآفاق الزمنية والحدود الحالية\n"
-             "/pos - تفاصيل كل صفقة مفتوحة\n"
-             "/risk - ملخص إدارة المخاطر (مع سقف المحفظة)\n"
-             "/daily - ملخص أداء اليوم\n"
-             "/stats - إحصائيات الأداء (حسب الأفق ودرجة الفرصة)\n"
-             "/pause - إيقاف الدخول مؤقتاً\n"
-             "/resume - استئناف الدخول\n"
-             "/close BTC - إغلاق عملة محددة\n"
-             "/closeall confirm - إغلاق جميع الصفقات\n"
-             "/help - عرض هذه القائمة", chat_id)
-
-
-def telegram_listener(active_symbols):
-    if not TELEGRAM_BOT_TOKEN or not AUTHORIZED_CHATS:
-        return
-    try:
-        ex2 = init_exchange()
-    except Exception as e:
-        log.error(f"[TG INIT] {e}")
-        return
-    offset = None
-    while True:
-        try:
-            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                             params={"timeout": 25, "offset": offset}, timeout=35).json()
-            for upd in r.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
-                text, chat_id = msg.get("text", ""), str(msg.get("chat", {}).get("id", ""))
-                if chat_id not in AUTHORIZED_CHATS or not text.startswith("/"):
-                    continue
-                try:
-                    handle_command(ex2, text, chat_id, active_symbols)
-                except Exception as e:
-                    send(f"خطأ: {e}", chat_id)
-        except Exception as e:
-            log.warning(f"[TG POLL] {e}")
-            time.sleep(5)
-
-
-def watchdog():
-    """ينبهك إذا توقفت الحلقة الرئيسية (وهي مستقلة عن خيط تيليجرام)."""
-    while True:
-        time.sleep(60)
-        last = loop_info["last_cycle_ts"]
-        if not last:
-            continue
-        age = time.time() - last
-        if age > WATCHDOG_SEC and not loop_info["alerted"]:
-            loop_info["alerted"] = True
-            send(f"🚨 <b>تحذير:</b> حلقة الفحص متوقفة منذ {int(age)} ثانية.\nآخر خطأ: {loop_info['last_error'] or '—'}")
-        elif age <= WATCHDOG_SEC and loop_info["alerted"]:
-            loop_info["alerted"] = False
-            send("✅ عادت حلقة الفحص للعمل.")
-
-
-# ==========================================
-# التقارير الدورية
-# ==========================================
-def maybe_send_daily_report(ex):
-    now = datetime.now(KSA_TZ)
-    today = str(now.date())
-    if now.hour == 23 and now.minute >= 55 and meta.get("last_report") != today:
-        snap = daily_snapshot()
-        wr = (snap["wins"] / snap["trades"] * 100) if snap["trades"] else 0
-        with diag_lock:
-            ev, sg, op = diag["evaluated"], diag["signals"], diag["opened"]
-        send(f"📋 <b>التقرير اليومي {VERSION}</b> — {today}\n━━━━━━━━━━━━━━━\n"
-             f"💰 النتيجة: {snap['value']:+.2f} USDT\n"
-             f"🔢 الصفقات: {snap['trades']} | الرابحة: {snap['wins']} ({wr:.0f}%)\n"
-             f"🔎 تقييمات {ev} | إشارات {sg} | فُتحت {op}\n"
-             f"💼 الرصيد: {get_equity(ex, force=True):,.2f} USDT")
-        set_meta("last_report", today)
-
-
-def maybe_send_heartbeat(ex):
-    now = datetime.now(KSA_TZ)
-    current_hour = now.strftime("%Y-%m-%d %H")
-    if meta.get("last_heartbeat") != current_hour and now.minute < 4:
-        set_meta("last_heartbeat", current_hour)
-        log.info(f"[HEARTBEAT] Open: {len(open_positions_snapshot())} | Equity: {get_equity(ex)}")
-
-
-# ==========================================
-# ماسح السوق الديناميكي (الأعلى سيولة + الأسواق الحديثة)
-# ==========================================
-def discover_universe(ex):
-    """يبني قائمة محدودة من عقود USDT النشطة لتفادي إغراق OKX بطلبات REST."""
-    now_ms = ex.milliseconds()
-    candidates = []
-    for sym, market in ex.markets.items():
-        if not market.get("active", True) or not market.get("swap") or market.get("quote") != "USDT":
-            continue
-        if market.get("settle") not in (None, "USDT"):
-            continue
-        candidates.append((sym, market))
-    volumes = {}
-    try:
-        tickers = ex.fetch_tickers([x[0] for x in candidates])
-        for sym, ticker in tickers.items():
-            qv = ticker.get("quoteVolume")
-            if qv is None and ticker.get("baseVolume") and ticker.get("last"):
-                qv = float(ticker["baseVolume"]) * float(ticker["last"])
-            volumes[sym] = float(qv or 0)
-    except Exception as exc:
-        log.warning(f"[UNIVERSE] تعذر جلب أحجام السوق، استخدام قائمة العملات الثابتة: {exc}")
-        return [x for x in FUTURES_SYMBOLS if x in ex.markets]
-
-    ranked = sorted(candidates, key=lambda item: volumes.get(item[0], 0), reverse=True)
-    liquid = [sym for sym, _ in ranked if volumes.get(sym, 0) > 0][:MAX_UNIVERSE_SYMBOLS]
-    cutoff = now_ms - INCLUDE_NEW_MARKETS_DAYS * 86400_000
-    fresh = []
-    for sym, market in candidates:
-        stamp = market.get("created") or market.get("info", {}).get("listTime") or market.get("info", {}).get("listingTime")
-        try:
-            stamp = int(stamp)
-            if stamp < 10_000_000_000:
-                stamp *= 1000
-            if stamp >= cutoff and sym not in liquid and volumes.get(sym, 0) > 0:
-                fresh.append(sym)
-        except (TypeError, ValueError):
-            continue
-    result = list(dict.fromkeys(liquid + fresh))[:MAX_UNIVERSE_SYMBOLS]
-    for sym in FUTURES_SYMBOLS:
-        if sym in ex.markets and sym not in result and len(result) < MAX_UNIVERSE_SYMBOLS:
-            result.append(sym)
-    log.info(f"[UNIVERSE] {len(result)} عقد USDT نشط | {len(fresh)} سوق حديث مكتشف")
-    return result or [x for x in FUTURES_SYMBOLS if x in ex.markets]
-
-
-# ==========================================
-# الحلقة الرئيسية
-# ==========================================
-def trading_loop():
-    log.info(f"[INIT] Starting {VERSION} ...")
-    if not OKX_API_KEY:
-        send("❌ مفاتيح API غير موجودة")
-        return
-    try:
-        ex = init_exchange()
-        load_state()
-        migrate_journal()
-        balance = get_equity(ex, force=True)
-        mode_str = "تجريبي (Sandbox)" if USE_SANDBOX else "حقيقي"
-        log.info(f"[OKX] Connected ({mode_str}). Equity: {balance}")
-    except Exception as e:
-        send(f"❌ فشل الاتصال: {e}")
-        return
-
-    # قائمة مشتركة تُحدَّث في مكانها ليراها خيط تيليجرام أيضاً
-    active_symbols = list(discover_universe(ex))
-    universe_refresh_ts = time.time()
-    sync_positions(ex, active_symbols)
-    threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
-    threading.Thread(target=watchdog, daemon=True).start()
-    hz_txt = " / ".join(HORIZON_DEFS[h]["label"] for h in ENABLED_HORIZONS)
-    send(f"🚀 <b>تم تشغيل البوت {VERSION}</b>\n━━━━━━━━━━━━━━━\n"
-         f"⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)} (ماسح سيولة ديناميكي)\n"
-         f"⏳ الآفاق: {hz_txt}\n"
-         f"📊 أقصى صفقات: {MAX_OPEN_POSITIONS} | سقف مخاطرة المحفظة: {MAX_PORTFOLIO_RISK_PCT}%\n"
-         f"🎚️ البروفايل: {PROFILE_NAME} | الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'}\n"
-         f"🔎 /why أسباب عدم الدخول | ⚙️ /config الإعدادات\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
-    if PROFILE_WARNING:
-        send(f"⚠️ {PROFILE_WARNING}")
-
-    loop_info["last_cycle_ts"] = time.time()
-    fail_streak = 0
-    while True:
-        start = time.time()
-        cycle_errors = 0
-        try:
-            if time.time() - universe_refresh_ts >= UNIVERSE_REFRESH_SEC:
-                refreshed = discover_universe(ex)
-                if refreshed:
-                    with state_lock:
-                        held = [sym for sym, st in state.items() if st.get("position")]
-                    active_symbols[:] = list(dict.fromkeys(refreshed + held))
-                    universe_refresh_ts = time.time()
-                    log.info(f"[UNIVERSE] تم تحديث القائمة: {len(active_symbols)} رمز")
-            refresh_prices(ex, active_symbols)
-            if USE_BTC_FILTER:
-                btc_bias(ex)
-
-            # المرحلة 1: إدارة المراكز + جمع المرشحين
-            candidates = []
-            for sym in list(active_symbols):
-                try:
-                    cand = scan_symbol(ex, sym)
-                    if cand:
-                        candidates.append(cand)
-                except Exception as e:
-                    cycle_errors += 1
-                    loop_info["last_error"] = f"{sym}: {str(e)[:150]}"
-                    log.error(f"[LOOP] {sym}: {e}")
-                time.sleep(0.25)
-
-            # المرحلة 2: تنفيذ الأعلى درجة أولاً
-            candidates.sort(key=lambda c: c["signal"].get("score", 0), reverse=True)
-            if candidates:
-                log.info("[RANK] " + " > ".join(
-                    f"{short(c['sym'])}[{c['h']}]={c['signal'].get('score', 0)}" for c in candidates[:6]))
-            for cand in candidates:
-                try:
-                    execute_entry(ex, cand)
-                except Exception as e:
-                    cycle_errors += 1
-                    loop_info["last_error"] = f"{cand['sym']}: {str(e)[:150]}"
-                    log.error(f"[EXEC] {cand['sym']}: {e}")
-
-            maybe_send_daily_report(ex)
-            maybe_send_heartbeat(ex)
-        except Exception as e:
-            cycle_errors += 1
-            loop_info["last_error"] = str(e)[:150]
-            log.error(f"[LOOP FATAL] {e}")
-        loop_info["cycles"] += 1
-        loop_info["last_cycle_ts"] = time.time()
-        loop_info["last_duration"] = time.time() - start
-        if loop_info["cycles"] % 10 == 1:
-            with diag_lock:
-                ev, sg, op = diag["evaluated"], diag["signals"], diag["opened"]
-            log.info(f"[CYCLE] #{loop_info['cycles']} {loop_info['last_duration']:.0f}s | "
-                     f"open={len(open_positions_snapshot())} | eval={ev} signals={sg} opened={op}")
-        fail_streak = fail_streak + 1 if cycle_errors >= 5 else 0
-        if fail_streak >= 3:
-            try:
-                ex = init_exchange()
-                fail_streak = 0
-                log.warning("[RECONNECT] تم إعادة الاتصال")
-            except Exception as e:
-                log.error(f"[RECONNECT FAIL] {e}")
-        time.sleep(max(8, SCAN_INTERVAL - (time.time() - start)))
-
-
-if __name__ == "__main__":
-    if not acquire_single_instance():
-        log.error("نسخة أخرى من البوت تعمل بالفعل — إيقاف.")
-        sys.exit(1)
-    threading.Thread(target=run_flask, daemon=True).start()
-    trading_loop()
+        return False
+    weakest, weakest_r, weakest_score = None, 0.0, 0
+    for sym
