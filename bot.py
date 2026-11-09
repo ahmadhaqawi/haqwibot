@@ -1913,7 +1913,7 @@ def status_text(ex):
     lines = [f"📊 <b>حالة البوت {VERSION}</b> {'⏸️' if meta.get('paused') else '▶️'}", "━━━━━━━━━━━━━━━",
              f"💼 الرصيد: {equity:,.2f} USDT",
              f"📅 المحقق اليوم: {snap['value']:+.2f} USDT | صفقات: {snap['trades']} | رابحة: {snap['wins']}",
-             f"📈 <b>الربح العائم: {total_float:+.2f} USDT</b>",
+             f"📈 <b>المكسب والخسارة: {total_float:+.2f} USDT</b>",
              f"🔄 آخر دورة فحص: {loop_age_text()} | دورات: {loop_info['cycles']}",
              f"🔎 اليوم: تقييم {ev} | إشارات {sg} | فُتحت {op}  (التفاصيل: /why)",
              f"🐋 BTC Bias: {bias} | ⚙️ {PROFILE_NAME}",
@@ -2002,16 +2002,19 @@ def positions_text(ex):
         risk = v.get("initial_risk") or 0
         d = 1 if v["position"] == "LONG" else -1
         r_now = ((price - v["entry"]) * d / risk) if risk else 0.0
+        locked_line = ""
+        if v.get("partial_1_taken") or v.get("partial_2_taken"):
+            locked_line = f"🧾 ربح مقفول من الجزئيات: {v.get('realized_pnl', 0.0):+.2f}\n"
         lines.append(
             f"🪙 <b>{short(sym)}</b> ({v['position']})\n"
             f"📥 الدخول: <code>{fmt(v['entry'])}</code>\n"
             f"📤 الحالي: <code>{fmt(price)}</code>\n"
-            f"💰 العائم: <b>{upnl:+.2f} USDT</b> ({pct:+.1f}%) | {r_now:+.2f}R\n"
-            f"🧾 المحقق من الجزئيات: {v.get('realized_pnl', 0.0):+.2f}\n"
+            f"💰 المكسب والخسارة: <b>{upnl:+.2f} USDT</b> ({pct:+.1f}%) | {r_now:+.2f}R\n"
+            f"{locked_line}"
             f"🛑 الوقف: <code>{fmt(v['sl']) if v.get('sl') else '—'}</code> | 🎯 <code>{fmt(v['tp']) if v.get('tp') else '—'}</code>\n"
             f"⏱ المدة: {duration}{flags_text(v)}\n"
             f"────────────────")
-    lines.append(f"\n📈 <b>إجمالي العائم: {total:+.2f} USDT</b>")
+    lines.append(f"\n📈 <b>الإجمالي: {total:+.2f} USDT</b>")
     return "\n".join(lines)
 
 
@@ -2034,11 +2037,11 @@ def risk_text(ex):
         f"<b>{effective_risk_pct(equity, 0.008):.2f}% / {effective_risk_pct(equity, 0.015):.2f}% / {effective_risk_pct(equity, 0.025):.2f}%</b>",
         *(["⚠️ السقف يحدّ المخاطرة كثيراً — ارفع MAX_MARGIN_USDT أو خفّض RISK_PCT_PER_TRADE لتتطابقا"]
           if equity > 0 and effective_risk_pct(equity, 0.015) < RISK_PCT_PER_TRADE * 0.5 else []),
-        f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT) — يشمل العائم السالب",
+        f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT) — يشمل خسارة الصفقات المفتوحة",
         f"📈 هدف الربح اليومي: {DAILY_PROFIT_TARGET_PCT}% ({profit_target:.1f} USDT)", "",
         f"🔢 المفتوحة: {len(opens)} / {MAX_OPEN_POSITIONS}",
         f"🟢 LONG: {longs} | 🔴 SHORT: {shorts} (الحد {MAX_SAME_DIRECTION})", "",
-        f"📅 المحقق اليوم: <b>{snap['value']:+.2f} USDT</b> | العائم: {floating:+.2f}",
+        f"📅 المحقق اليوم: <b>{snap['value']:+.2f} USDT</b> | الحالي: {floating:+.2f}",
         f"🔻 المتبقي للخسارة: {loss_limit + snap['value'] + min(floating, 0):+.2f} USDT",
         f"🔺 المتبقي للهدف: {profit_target - snap['value']:+.2f} USDT",
         "━━━━━━━━━━━━━━━"])
@@ -2052,7 +2055,7 @@ def daily_text(ex):
     return "\n".join([
         f"📅 <b>ملخص اليوم</b> — {snap['date']}", "━━━━━━━━━━━━━━━",
         f"💰 المحقق اليوم: <b>{snap['value']:+.2f} USDT</b>",
-        f"📈 العائم حالياً: <b>{total_upnl:+.2f} USDT</b>",
+        f"📈 المكسب والخسارة: <b>{total_upnl:+.2f} USDT</b>",
         f"📊 الإجمالي التقديري: <b>{snap['value'] + total_upnl:+.2f} USDT</b>", "",
         f"🔢 الصفقات المكتملة: {snap['trades']}",
         f"✅ الرابحة: {snap['wins']} ({wr:.0f}%)",
