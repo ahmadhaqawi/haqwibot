@@ -1940,4 +1940,4 @@ def maybe_swap_weaker(ex, new_cand):
     if not opens:
         return False
     weakest, weakest_r, weakest_score = None, 0.0, 0
-    for sym
+    for sym in symbols:
