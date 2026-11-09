@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V46 (Execution Costs + Real Risk)
+OKX Futures Trading Bot - V47 (Scored Signals + Dynamic Universe)
 
-الجديد عن V45:
+الجديد عن V46:
 1) المخاطرة الفعلية: رسالة الدخول تعرض المخاطرة كنسبة من الرصيد مع تحذير إذا كانت أقل بكثير من المستهدف
    (بسبب سقف الهامش)، و /risk يعرض المخاطرة الفعلية عند أوقاف نموذجية.
 2) انزلاق الوقف وانزلاق الدخول: يُحسبان لكل صفقة ويُسجلان في السجل، ويظهران في رسالة الخروج و /stats.
 3) الرسوم الفعلية من تنفيذات المنصة بدل التقدير (مع فحص معقولية وعودة للتقدير عند الشك)،
    ويُعدَّل الربح اليومي ليطابق الربح الفعلي بعد الرسوم.
 4) ترحيل تلقائي للسجل القديم (يضيف الأعمدة الجديدة).
+5) تقييم جودة الإشارة 0-100 من توافق الاتجاه والحجم وADX والزخم والشمعة وجودة الدخول.
+6) ماسح ديناميكي لعقود USDT النشطة مع إدراج الأسواق الحديثة ضمن سقف قابل للضبط.
+7) حد أدنى لدرجة الإشارة قبل السماح بالتنفيذ؛ لا توجد ادعاءات ببيانات حيتان أو OI غير موصولة.
 """
 import os
 import sys
@@ -32,7 +35,7 @@ log = logging.getLogger("bot")
 # ==========================================
 # الإعدادات
 # ==========================================
-VERSION = "V46"
+VERSION = "V47"
 KSA_TZ = timezone(timedelta(hours=3))
 
 
@@ -78,7 +81,11 @@ SECTORS = {
 }
 MAX_PER_SECTOR_SAME_DIR = 2
 
-SCAN_INTERVAL = 30
+SCAN_INTERVAL = int(env_float("SCAN_INTERVAL", 15))
+UNIVERSE_REFRESH_SEC = int(env_float("UNIVERSE_REFRESH_SEC", 1800))
+MAX_UNIVERSE_SYMBOLS = int(env_float("MAX_UNIVERSE_SYMBOLS", 60))
+MIN_SIGNAL_SCORE = int(env_float("MIN_SIGNAL_SCORE", 74))
+INCLUDE_NEW_MARKETS_DAYS = int(env_float("INCLUDE_NEW_MARKETS_DAYS", 45))
 LEVERAGE = int(env_float("LEVERAGE", 5))
 MARGIN_MODE = "isolated"
 MAX_OPEN_POSITIONS = 5
@@ -141,7 +148,7 @@ PROFILES = {
         "bo_vol_mult": 1.2, "bo_max_ext_atr": 3.0,
     },
 }
-_default_profile = "balanced" if USE_SANDBOX else "conservative"
+_default_profile = "active" if USE_SANDBOX else "conservative"
 PROFILE_NAME = os.getenv("PROFILE", _default_profile).strip().lower()
 PROFILE_WARNING = ""
 if PROFILE_NAME not in PROFILES:
@@ -261,6 +268,7 @@ REASON_LABELS = {
     "bo_weak_candle": "شمعة الاختراق ضعيفة الإغلاق",
     "bo_rsi": "RSI خارج نطاق الاختراق",
     "bo_extended": "السعر بعيد عن EMA21 (مطاردة)",
+    "score_low": "درجة الفرصة أقل من الحد المطلوب",
 }
 
 
@@ -1375,21 +1383,74 @@ def breakout_signal(ctx, df_15m):
     return _make_signal("SHORT", ctx, "breakout"), None
 
 
+def score_signal(signal, ctx, df_15m):
+    """درجة جودة 0-100 مبنية على بيانات الشموع والمؤشرات المتاحة فقط؛ لا تدّعي قراءة الحيتان أو OI."""
+    last, h1, h4 = ctx["last"], ctx["last_1h"], ctx["last_4h"]
+    side = signal["side"]
+    score, factors = 0, {}
+
+    # توافق الاتجاه متعدد الأطر (0-25)
+    aligned = ((side == "LONG" and h1["ema9"] > h1["ema21"] and h4["close"] > h4["ema50"])
+               or (side == "SHORT" and h1["ema9"] < h1["ema21"] and h4["close"] < h4["ema50"]))
+    factors["trend"] = 20 if aligned else 6
+    score += factors["trend"]
+
+    # الحجم النسبي (0-20)
+    vol_ratio = float(last["volume"] / last["vol_ma"]) if last["vol_ma"] else 0.0
+    factors["volume"] = min(15, max(0, int(7.5 * vol_ratio)))
+    score += factors["volume"]
+
+    # قوة الاتجاه ADX (0-15)
+    adx_value = float(last["adx"])
+    factors["adx"] = min(15, max(0, int((adx_value - 12) * 0.75)))
+    score += factors["adx"]
+
+    # الزخم RSI (0-15): نتجنب التشبع الشديد
+    r = float(last["rsi"])
+    if side == "LONG":
+        momentum = 15 if 52 <= r <= 66 else (10 if 47 <= r < 52 or 66 < r <= 70 else 4)
+    else:
+        momentum = 15 if 34 <= r <= 48 else (10 if 30 <= r < 34 or 48 < r <= 53 else 4)
+    factors["momentum"] = momentum
+    score += momentum
+
+    # جودة شمعة الإشارة (0-10)
+    rng = max(float(last["high"] - last["low"]), 1e-12)
+    body = abs(float(last["close"] - last["open"])) / rng
+    factors["candle"] = min(10, int(body * 10))
+    score += factors["candle"]
+
+    # طبيعة الاستراتيجية (0-15)
+    factors["setup"] = 15 if signal.get("strategy") == "breakout" else 12
+    score += factors["setup"]
+
+    # تمدد السعر عن EMA21 (0-10)
+    extension = abs(float(last["close"]) - float(last["ema21"])) / max(float(last["atr"]), 1e-12)
+    factors["entry_quality"] = 10 if extension <= 0.8 else (7 if extension <= 1.4 else 3)
+    score += factors["entry_quality"]
+
+    signal["score"] = min(100, int(score))
+    signal["score_factors"] = factors
+    signal["volume_ratio"] = round(vol_ratio, 2)
+    return signal
+
+
 def evaluate_signal(df_15m, df_1h, df_4h):
     """يرجع (signal, {}) أو (None, reasons) حيث reasons = {'common': r} أو {'pullback': r, 'breakout': r}."""
     ctx, reason = build_context(df_15m, df_1h, df_4h)
     if ctx is None:
         return None, {"common": reason}
     sig, r_pull = pullback_signal(ctx)
-    if sig:
-        return sig, {}
-    reasons = {"pullback": r_pull}
-    if ENABLE_BREAKOUT:
+    if not sig and ENABLE_BREAKOUT:
         sig, r_bo = breakout_signal(ctx, df_15m)
-        if sig:
-            return sig, {}
-        reasons["breakout"] = r_bo
-    return None, reasons
+        if not sig:
+            return None, {"pullback": r_pull, "breakout": r_bo}
+    elif not sig:
+        return None, {"pullback": r_pull}
+    sig = score_signal(sig, ctx, df_15m)
+    if sig["score"] < MIN_SIGNAL_SCORE:
+        return None, {"common": "score_low"}
+    return sig, {}
 
 
 def market_filters_ok(ex, sym, side):
@@ -1658,7 +1719,7 @@ def process_symbol(ex, sym):
             if not signal:
                 return
             side = signal["side"]
-            log.info(f"[SIGNAL] {sym} {side} strategy={signal['strategy']} regime={signal['regime']}")
+            log.info(f"[SIGNAL] {sym} {side} score={signal.get('score', 0)}/100 strategy={signal['strategy']} regime={signal['regime']}")
 
             with state_lock:
                 same_dir = sum(1 for v in state.values() if v.get("position") == side)
@@ -1711,7 +1772,7 @@ def process_symbol(ex, sym):
                         "last_notified_sl": None,
                         "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False,
                         "regime": signal.get("regime", ""),
-                        "strategy": signal.get("strategy", "")})
+                        "strategy": signal.get("strategy", ""), "signal_score": signal.get("score", 0)})
             else:
                 note_block(sym, "open_failed")
                 with state_lock:
@@ -1719,6 +1780,7 @@ def process_symbol(ex, sym):
             save_state()
             caption = msg_entry(sym, side, entry, sl, tp, margin, success, signal.get("regime", ""),
                                 signal.get("strategy", ""), equity_now)
+            caption += f"\n🧠 تقييم الفرصة: <b>{signal.get('score', 0)}/100</b> | حجم التداول: {signal.get('volume_ratio', 0):.2f}×"
             if not success:
                 caption += f"\n❌ {info}"
             send(caption)
@@ -2150,6 +2212,54 @@ def maybe_send_heartbeat(ex):
 
 
 # ==========================================
+# ماسح السوق الديناميكي (الأعلى سيولة + الأسواق الحديثة)
+# ==========================================
+def discover_universe(ex):
+    """يبني قائمة محدودة من عقود USDT النشطة لتفادي إغراق OKX بطلبات REST."""
+    now_ms = ex.milliseconds()
+    candidates = []
+    for sym, market in ex.markets.items():
+        if not market.get("active", True) or not market.get("swap") or market.get("quote") != "USDT":
+            continue
+        if market.get("settle") not in (None, "USDT"):
+            continue
+        candidates.append((sym, market))
+    volumes = {}
+    try:
+        tickers = ex.fetch_tickers([x[0] for x in candidates])
+        for sym, ticker in tickers.items():
+            qv = ticker.get("quoteVolume")
+            if qv is None and ticker.get("baseVolume") and ticker.get("last"):
+                qv = float(ticker["baseVolume"]) * float(ticker["last"])
+            volumes[sym] = float(qv or 0)
+    except Exception as exc:
+        log.warning(f"[UNIVERSE] تعذر جلب أحجام السوق، استخدام قائمة العملات الثابتة: {exc}")
+        return [x for x in FUTURES_SYMBOLS if x in ex.markets]
+
+    ranked = sorted(candidates, key=lambda item: volumes.get(item[0], 0), reverse=True)
+    liquid = [sym for sym, _ in ranked if volumes.get(sym, 0) > 0][:MAX_UNIVERSE_SYMBOLS]
+    cutoff = now_ms - INCLUDE_NEW_MARKETS_DAYS * 86400_000
+    fresh = []
+    for sym, market in candidates:
+        stamp = market.get("created") or market.get("info", {}).get("listTime") or market.get("info", {}).get("listingTime")
+        try:
+            stamp = int(stamp)
+            if stamp < 10_000_000_000:
+                stamp *= 1000
+            if stamp >= cutoff and sym not in liquid and volumes.get(sym, 0) > 0:
+                fresh.append(sym)
+        except (TypeError, ValueError):
+            continue
+    result = list(dict.fromkeys(liquid + fresh))[:MAX_UNIVERSE_SYMBOLS]
+    # حافظ على الأزواج الأساسية المعروفة إذا كانت متاحة، دون تجاوز سقف الكون.
+    for sym in FUTURES_SYMBOLS:
+        if sym in ex.markets and sym not in result and len(result) < MAX_UNIVERSE_SYMBOLS:
+            result.append(sym)
+    log.info(f"[UNIVERSE] {len(result)} عقد USDT نشط | {len(fresh)} سوق حديث مكتشف")
+    return result or [x for x in FUTURES_SYMBOLS if x in ex.markets]
+
+
+# ==========================================
 # الحلقة الرئيسية
 # ==========================================
 def trading_loop():
@@ -2168,15 +2278,17 @@ def trading_loop():
         send(f"❌ فشل الاتصال: {e}")
         return
 
-    active_symbols = [s for s in FUTURES_SYMBOLS if s in ex.markets]
+    active_symbols = discover_universe(ex)
+    universe_refresh_ts = time.time()
     sync_positions(ex, active_symbols)
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
     send(f"🚀 <b>تم تشغيل البوت {VERSION}</b>\n━━━━━━━━━━━━━━━\n"
-         f"⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n"
+         f"⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)} (ماسح سيولة ديناميكي)\n"
          f"📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n"
          f"💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة: {LEVERAGE}x\n"
          f"🎚️ البروفايل: {PROFILE_NAME} | الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'}\n"
+         f"🧠 حد تقييم الفرصة: {MIN_SIGNAL_SCORE}/100 | تحديث السوق: {UNIVERSE_REFRESH_SEC//60} دقيقة\n"
          f"🔎 /why أسباب عدم الدخول | ⚙️ /config الإعدادات\n📱 /help لعرض الأوامر\n━━━━━━━━━━━━━━━")
     if PROFILE_WARNING:
         send(f"⚠️ {PROFILE_WARNING}")
@@ -2187,6 +2299,15 @@ def trading_loop():
         start = time.time()
         cycle_errors = 0
         try:
+            if time.time() - universe_refresh_ts >= UNIVERSE_REFRESH_SEC:
+                refreshed = discover_universe(ex)
+                if refreshed:
+                    # أضف أي رمز لديه مركز مفتوح حتى لا يتوقف عن إدارته عند خروجه من قائمة السيولة.
+                    with state_lock:
+                        held = [sym for sym, st in state.items() if st.get("position")]
+                    active_symbols = list(dict.fromkeys(refreshed + held))
+                    universe_refresh_ts = time.time()
+                    log.info(f"[UNIVERSE] تم تحديث القائمة: {len(active_symbols)} رمز")
             refresh_prices(ex, active_symbols)
             if USE_BTC_FILTER:
                 btc_bias(ex)
