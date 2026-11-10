@@ -219,23 +219,19 @@ _lock_fh = None
 # ---------- فلتر أوقات السوق للأسهم ----------
 def is_market_open(symbol):
     base = symbol.split("/")[0].upper()
-    # قائمة الأسهم أو المؤشرات التي تتأثر بأوقات السوق الأمريكي
     stock_symbols = ["ASML", "QQQ", "SPY", "AAPL", "TSLA", "NVDA", "ANTHROPIC"]
     if base in stock_symbols:
         try:
             ny_time = datetime.now(pytz.timezone('US/Eastern'))
-            # إغلاق عطلة نهاية الأسبوع
             if ny_time.weekday() >= 5: 
                 return False
-            # التداول من 9:30 صباحاً حتى 4:00 عصراً
             if not (9 <= ny_time.hour < 16):
                 return False
-            # تجنب أول 15 دقيقة من الافتتاح للتقلب العالي
             if ny_time.hour == 9 and ny_time.minute < 45:
                 return False
             return True
         except Exception:
-            return True # في حال فشل قراءة الوقت، لا نمنع التداول
+            return True 
     return True
 
 # ---------- التشخيص ----------
