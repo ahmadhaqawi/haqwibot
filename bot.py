@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V47 (Scored Signals + Dynamic Universe)
+OKX Futures Trading Bot - V48 (Scored Signals + Dynamic Universe + Market Hours)
 
-الجديد عن V46:
-1) المخاطرة الفعلية: رسالة الدخول تعرض المخاطرة كنسبة من الرصيد مع تحذير إذا كانت أقل بكثير من المستهدف
-   (بسبب سقف الهامش)، و /risk يعرض المخاطرة الفعلية عند أوقاف نموذجية.
-2) انزلاق الوقف وانزلاق الدخول: يُحسبان لكل صفقة ويُسجلان في السجل، ويظهران في رسالة الخروج و /stats.
-3) الرسوم الفعلية من تنفيذات المنصة بدل التقدير (مع فحص معقولية وعودة للتقدير عند الشك)،
-   ويُعدَّل الربح اليومي ليطابق الربح الفعلي بعد الرسوم.
-4) ترحيل تلقائي للسجل القديم (يضيف الأعمدة الجديدة).
-5) تقييم جودة الإشارة 0-100 من توافق الاتجاه والحجم وADX والزخم والشمعة وجودة الدخول.
-6) ماسح ديناميكي لعقود USDT النشطة مع إدراج الأسواق الحديثة ضمن سقف قابل للضبط.
-7) حد أدنى لدرجة الإشارة قبل السماح بالتنفيذ؛ لا توجد ادعاءات ببيانات حيتان أو OI غير موصولة.
+الجديد عن V47:
+1) توسيع وقف الخسارة (1.5% كحد أدنى) وزيادة مضاعف ATR إلى 2.2 لتفادي ضرب الوقف في التذبذب الطبيعي.
+2) تعديل نسبة الربح للخسارة (RR) إلى 2.0 لتسهيل الوصول للهدف.
+3) رفع الحد الأدنى لدرجة الإشارة إلى 80، ورفع قوة الاتجاه ADX إلى 25 لتقليل الإشارات الضعيفة.
+4) تشديد شروط الاختراق (حجم أعلى 2.0x).
+5) إضافة فلتر أوقات السوق للأسهم (مثل QQQ و ASML) لتفادي التداول وقت الإغلاق أو الفجوات السعرية.
+6) تعديل الوقف المتحرك (Trailing Stop) ليكون أكثر مرونة.
 """
 import os
 import sys
@@ -27,6 +24,7 @@ import pandas as pd
 import ccxt
 import requests
 from flask import Flask
+import pytz  # تمت إضافته لفلترة أوقات السوق
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -35,7 +33,7 @@ log = logging.getLogger("bot")
 # ==========================================
 # الإعدادات
 # ==========================================
-VERSION = "V47"
+VERSION = "V48"
 KSA_TZ = timezone(timedelta(hours=3))
 
 
@@ -69,6 +67,8 @@ FUTURES_SYMBOLS = [
     "INJ/USDT:USDT", "ATOM/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "FIL/USDT:USDT",
     "SEI/USDT:USDT", "TIA/USDT:USDT", "STX/USDT:USDT", "IMX/USDT:USDT", "RUNE/USDT:USDT",
     "FET/USDT:USDT", "WLD/USDT:USDT", "PEPE/USDT:USDT", "WIF/USDT:USDT", "ORDI/USDT:USDT",
+    # رموز توكنات الأسهم (إذا كانت متاحة على المنصة)
+    "QQQ/USDT:USDT", "ASML/USDT:USDT", "ANTHROPIC/USDT:USDT"
 ]
 
 SECTORS = {
@@ -78,13 +78,14 @@ SECTORS = {
     "meme": {"DOGE", "PEPE", "WIF"},
     "ai": {"FET", "WLD"},
     "legacy": {"XRP", "LTC", "BCH", "FIL", "LINK", "RUNE", "ORDI"},
+    "stocks": {"QQQ", "ASML", "ANTHROPIC"},
 }
 MAX_PER_SECTOR_SAME_DIR = 2
 
 SCAN_INTERVAL = int(env_float("SCAN_INTERVAL", 15))
 UNIVERSE_REFRESH_SEC = int(env_float("UNIVERSE_REFRESH_SEC", 1800))
 MAX_UNIVERSE_SYMBOLS = int(env_float("MAX_UNIVERSE_SYMBOLS", 60))
-MIN_SIGNAL_SCORE = int(env_float("MIN_SIGNAL_SCORE", 74))
+MIN_SIGNAL_SCORE = int(env_float("MIN_SIGNAL_SCORE", 80)) # تم الرفع من 74
 INCLUDE_NEW_MARKETS_DAYS = int(env_float("INCLUDE_NEW_MARKETS_DAYS", 45))
 LEVERAGE = int(env_float("LEVERAGE", 5))
 MARGIN_MODE = "isolated"
@@ -98,13 +99,14 @@ MIN_MARGIN_USDT = 12
 MAX_MARGIN_USDT = env_float("MAX_MARGIN_USDT", 130)
 MAX_MARGIN_PCT_EQUITY = 0.30
 
-ATR_SL_MULT = 1.55
-RR_RATIO = 2.3
-MIN_SL_PCT = 0.0065
-MAX_SL_PCT = 0.032
-TRAIL_ATR_MULT = 1.05
+# تعديلات إدارة المخاطر
+ATR_SL_MULT = 2.2          # تم الرفع من 1.55
+RR_RATIO = 2.0             # تم التعديل من 2.3
+MIN_SL_PCT = 0.015         # تم الرفع من 0.0065 (1.5%)
+MAX_SL_PCT = 0.040         # تم الرفع من 0.032 (4%)
+TRAIL_ATR_MULT = 1.2       # تم الرفع من 1.05
 BE_FEE_BUFFER = 0.0008
-BE_TRIGGER_R = 0.9
+BE_TRIGGER_R = 1.0         # تأمين الصفقة عند 1R بدلاً من 0.9
 FALLBACK_SL_PCT = 0.017
 
 PARTIAL1_R, PARTIAL1_PCT = 1.3, 0.40
@@ -121,31 +123,29 @@ USE_BTC_FILTER = True
 
 # ---------- بروفايلات الاستراتيجية ----------
 PROFILES = {
-    # الإعدادات الأصلية (الأكثر تشدداً) — ATR النسبي معطّل (نسبة 99)
     "conservative": {
-        "min_atr_pct": 0.004, "min_adx": 23, "min_vol_mult": 1.2,
+        "min_atr_pct": 0.004, "min_adx": 25, "min_vol_mult": 1.2, # ADX 25
         "regime_adx4_strong": 28, "regime_adx1_strong": 24, "regime_adx4_weak": 20,
         "rsi_long_min": 40, "rsi_long_max": 61, "rsi_short_min": 39, "rsi_short_max": 60,
-        "near_ema21_pct": 0.011, "near_ema50_pct": 0.016, "max_spread_pct": 0.0011,
+        "near_ema21_pct": 0.011, "near_ema50_pct": 0.016, "max_spread_pct": 0.002, # Spread 0.2%
         "rel_atr_ratio": 99, "atr_hard_floor": 0.003,
-        "bo_vol_mult": 1.8, "bo_max_ext_atr": 2.0,
+        "bo_vol_mult": 2.0, "bo_max_ext_atr": 2.0, # اختراق أقوى
     },
     "balanced": {
-        "min_atr_pct": 0.003, "min_adx": 20, "min_vol_mult": 1.0,
+        "min_atr_pct": 0.003, "min_adx": 25, "min_vol_mult": 1.0, # ADX 25
         "regime_adx4_strong": 26, "regime_adx1_strong": 22, "regime_adx4_weak": 18,
         "rsi_long_min": 38, "rsi_long_max": 64, "rsi_short_min": 36, "rsi_short_max": 62,
-        "near_ema21_pct": 0.013, "near_ema50_pct": 0.019, "max_spread_pct": 0.0015,
+        "near_ema21_pct": 0.013, "near_ema50_pct": 0.019, "max_spread_pct": 0.002,
         "rel_atr_ratio": 1.15, "atr_hard_floor": 0.0018,
-        "bo_vol_mult": 1.5, "bo_max_ext_atr": 2.5,
+        "bo_vol_mult": 2.0, "bo_max_ext_atr": 2.0,
     },
-    # لاختبار آلية التنفيذ على Sandbox فقط
     "active": {
-        "min_atr_pct": 0.0022, "min_adx": 18, "min_vol_mult": 0.8,
+        "min_atr_pct": 0.0022, "min_adx": 25, "min_vol_mult": 0.8, # ADX 25
         "regime_adx4_strong": 24, "regime_adx1_strong": 20, "regime_adx4_weak": 15,
         "rsi_long_min": 35, "rsi_long_max": 67, "rsi_short_min": 33, "rsi_short_max": 65,
-        "near_ema21_pct": 0.016, "near_ema50_pct": 0.024, "max_spread_pct": 0.003,
+        "near_ema21_pct": 0.016, "near_ema50_pct": 0.024, "max_spread_pct": 0.002,
         "rel_atr_ratio": 0.9, "atr_hard_floor": 0.0015,
-        "bo_vol_mult": 1.2, "bo_max_ext_atr": 3.0,
+        "bo_vol_mult": 2.0, "bo_max_ext_atr": 2.0,
     },
 }
 _default_profile = "active" if USE_SANDBOX else "conservative"
@@ -160,7 +160,6 @@ if not USE_SANDBOX and PROFILE_NAME == "active":
 
 
 def _cfg(key):
-    """متغير البيئة (باسم المفتاح بحروف كبيرة) يتقدم على قيمة البروفايل."""
     return env_float(key.upper(), PROFILES[PROFILE_NAME][key])
 
 
@@ -181,20 +180,17 @@ MAX_SPREAD_PCT = _cfg("max_spread_pct")
 REL_ATR_RATIO = _cfg("rel_atr_ratio")
 ATR_HARD_FLOOR = _cfg("atr_hard_floor")
 
-# ---------- استراتيجية الاختراق ----------
-# على الحساب الحقيقي معطّلة افتراضياً حتى تُفعَّل صراحةً (ENABLE_BREAKOUT=1)
 ENABLE_BREAKOUT = env_flag("ENABLE_BREAKOUT", USE_SANDBOX)
 BO_LOOKBACK = int(env_float("BO_LOOKBACK", 20))
 BO_VOL_MULT = _cfg("bo_vol_mult")
 BO_MAX_EXT_ATR = _cfg("bo_max_ext_atr")
-BO_BODY_POS = env_float("BO_BODY_POS", 0.6)          # موضع الإغلاق داخل مدى الشمعة
+BO_BODY_POS = env_float("BO_BODY_POS", 0.6)
 BO_RSI_LONG_MIN = env_float("BO_RSI_LONG_MIN", 52)
 BO_RSI_LONG_MAX = env_float("BO_RSI_LONG_MAX", 72)
 BO_RSI_SHORT_MIN = env_float("BO_RSI_SHORT_MIN", 28)
 BO_RSI_SHORT_MAX = env_float("BO_RSI_SHORT_MAX", 48)
 
 WATCHDOG_SEC = 300
-
 TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 
 DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
@@ -216,19 +212,40 @@ _price_cache = {}
 _equity_cache = {"ts": 0, "value": 0.0}
 _btc_bias_cache = {"ts": 0, "value": "neutral"}
 _last_eval = {}
-_last_spread = {}      # sym -> (ts, spread_fraction)
+_last_spread = {}
 _warned_external = set()
 _lock_fh = None
+
+# ---------- فلتر أوقات السوق للأسهم ----------
+def is_market_open(symbol):
+    base = symbol.split("/")[0].upper()
+    # قائمة الأسهم أو المؤشرات التي تتأثر بأوقات السوق الأمريكي
+    stock_symbols = ["ASML", "QQQ", "SPY", "AAPL", "TSLA", "NVDA", "ANTHROPIC"]
+    if base in stock_symbols:
+        try:
+            ny_time = datetime.now(pytz.timezone('US/Eastern'))
+            # إغلاق عطلة نهاية الأسبوع
+            if ny_time.weekday() >= 5: 
+                return False
+            # التداول من 9:30 صباحاً حتى 4:00 عصراً
+            if not (9 <= ny_time.hour < 16):
+                return False
+            # تجنب أول 15 دقيقة من الافتتاح للتقلب العالي
+            if ny_time.hour == 9 and ny_time.minute < 45:
+                return False
+            return True
+        except Exception:
+            return True # في حال فشل قراءة الوقت، لا نمنع التداول
+    return True
 
 # ---------- التشخيص ----------
 def _diag_blank(date=""):
     return {"date": date, "evaluated": 0, "signals": 0, "opened": 0, "signals_by": {},
             "reasons": {}, "reasons_pullback": {}, "reasons_breakout": {}, "blocks": {}}
 
-
 diag = _diag_blank()
 STRAT_LABEL = {"pullback": "الارتداد", "breakout": "الاختراق", "adopted": "متبنّاة", "legacy": "قديمة"}
-_last_reason = {}      # sym -> (ts, reason)
+_last_reason = {}
 loop_info = {"last_cycle_ts": 0.0, "cycles": 0, "last_duration": 0.0, "last_error": "", "alerted": False}
 
 REASON_LABELS = {
@@ -269,6 +286,7 @@ REASON_LABELS = {
     "bo_rsi": "RSI خارج نطاق الاختراق",
     "bo_extended": "السعر بعيد عن EMA21 (مطاردة)",
     "score_low": "درجة الفرصة أقل من الحد المطلوب",
+    "market_closed": "السوق مغلق (أسهم/مؤشرات)",
 }
 
 
@@ -287,7 +305,6 @@ def _diag_roll_locked():
 
 
 def note_eval(sym, signal, reasons):
-    """signal: قاموس الإشارة أو None. reasons: {'common': r} أو {'pullback': r, 'breakout': r}."""
     with diag_lock:
         _diag_roll_locked()
         diag["evaluated"] += 1
@@ -477,7 +494,6 @@ JOURNAL_FIELDS = ["close_time", "symbol", "side", "entry", "exit", "initial_cont
 
 
 def migrate_journal():
-    """يضيف الأعمدة الجديدة للسجل القديم (strategy=legacy، والباقي فارغ) لتجنب تلف ملف CSV."""
     try:
         with journal_lock:
             if not os.path.exists(JOURNAL_FILE):
@@ -626,7 +642,6 @@ REASONS = {
 
 
 def effective_risk_pct(equity, sl_pct):
-    """المخاطرة الفعلية (% من الرصيد) لوقف بنسبة sl_pct بعد تطبيق سقف الهامش."""
     if equity <= 0 or sl_pct <= 0:
         return 0.0
     risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
@@ -790,7 +805,6 @@ def get_current_price(ex, sym, max_age=20):
 
 
 def get_equity(ex, force=False):
-    """يرجع 0.0 عند تعذر القراءة (لا نستخدم رصيداً قديماً لقرارات جديدة)."""
     if not force and time.time() - _equity_cache["ts"] < 60 and _equity_cache["value"] > 0:
         return _equity_cache["value"]
     try:
@@ -831,7 +845,6 @@ def calculate_contracts(ex, sym, margin, price, lev):
 
 
 def compute_margin(equity, sl_pct):
-    """يرجع 0.0 إذا تعذر تحديد حجم آمن (الرصيد مجهول أو الهامش أقل من الحد الأدنى)."""
     if equity <= 0:
         return 0.0
     if not USE_RISK_SIZING:
@@ -844,7 +857,6 @@ def compute_margin(equity, sl_pct):
 
 
 def get_open_position(ex, sym):
-    """None فقط إذا لا يوجد مركز. أي خطأ API يرفع Exception."""
     for p in ex.fetch_positions([sym]):
         contracts = abs(float(p.get('contracts') or 0))
         if contracts > 0:
@@ -875,7 +887,6 @@ def get_algos(ex, sym):
 
 
 def has_protection(ex, sym):
-    """(has_sl, has_tp) أو (None, None) إذا تعذر الاستعلام."""
     try:
         algos = get_algos(ex, sym)
         return any(a["is_sl"] for a in algos), any(a["is_tp"] for a in algos)
@@ -923,9 +934,6 @@ def place_sl_tp(ex, sym, side, contracts, trigger, is_sl):
 
 
 def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
-    """
-    وقف الخسارة: أي رفض = فشل (لا نعتبر الصفقة محمية). الهدف: رفض بسبب تجاوز السعر لا يُعد فشلاً حرجاً.
-    """
     sl_ok = tp_ok = False
     if sl is not None:
         for i in range(retries):
@@ -953,7 +961,6 @@ def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
 
 
 def replace_protection(ex, sym, close_side, contracts, sl, tp=None):
-    """نضع الجديد أولاً ثم نلغي القديم. فشل الوقف الجديد = تبقى القديمة."""
     try:
         old = get_algos(ex, sym)
     except Exception as e:
@@ -1039,7 +1046,6 @@ def open_position(ex, sym, side, price, sl, tp, margin):
 # الربح وإنهاء الصفقة
 # ==========================================
 def leg_fee_est(entry, exit_price, contracts, cs):
-    """رسوم تقديرية لجزء من الصفقة (دخول + خروج)."""
     return (entry + exit_price) * contracts * cs * FEE_RATE
 
 
@@ -1050,9 +1056,8 @@ def leg_pnl(side, entry, exit_price, contracts, cs):
 
 
 def get_actual_fees(ex, sym, pos_data):
-    """مجموع الرسوم الفعلية (USDT) لكل تنفيذات الصفقة (دخول + جزئيات + خروج). None إذا لا تتوفر."""
     if (pos_data.get("strategy") or "") == "adopted" or not pos_data.get("opened_ts"):
-        return None          # المركز المتبنّى: تنفيذ الدخول سابق ولا يمكن تتبعه
+        return None
     try:
         since = int(pos_data["opened_ts"] * 1000) - 30000
         trades = ex.fetch_my_trades(sym, since=since, limit=100)
@@ -1077,7 +1082,6 @@ def get_exit_price(ex, sym, pos_data):
     try:
         close_side = 'sell' if pos_data["position"] == "LONG" else 'buy'
         if pos_data.get("partial_1_taken") or pos_data.get("partial_2_taken"):
-            # بعد آخر إغلاق جزئي (leg_ts يُسجَّل بعد تنفيذ الجزئي بـ0.8ث) لتفادي احتساب تنفيذه ضمن سعر الخروج
             since = int((pos_data.get("leg_ts") or 0) * 1000) + 1500
         else:
             since = int((pos_data.get("opened_ts") or 0) * 1000) - 8000
@@ -1117,7 +1121,6 @@ def finalize_trade(ex, sym, reason_hint=None):
     realized = pos_data.get("realized_pnl", 0.0)
     realized_fees_est = pos_data.get("realized_fees_est", 0.0)
 
-    # --- الربح والرسوم (فعلية إن توفرت وكانت معقولة، وإلا تقديرية) ---
     gross_final = (exit_price - entry) * d * contracts * cs
     fee_est_final = leg_fee_est(entry, exit_price, contracts, cs)
     fees_est_total = realized_fees_est + fee_est_final
@@ -1132,7 +1135,7 @@ def finalize_trade(ex, sym, reason_hint=None):
     else:
         total = realized + gross_final - fee_est_final
         fees_total, fees_src = fees_est_total, "est"
-    final_leg = total - realized     # بحيث يتطابق الربح اليومي مع الصافي الفعلي
+    final_leg = total - realized
 
     margin = pos_data.get("margin") or POSITION_SIZE_USDT
     reason = reason_hint or detect_reason(pos_data, exit_price)
@@ -1141,8 +1144,6 @@ def finalize_trade(ex, sym, reason_hint=None):
     r_mult = (total / risk_usd) if risk_usd > 0 else 0.0
     duration = int((time.time() - (pos_data.get("opened_ts") or time.time())) / 60)
 
-    # --- الانزلاق (القيمة الموجبة = تكلفة عليك) ---
-    # ملاحظة: يُحتسب انزلاق الوقف فقط عندما يُصنَّف الخروج كوقف (سعر الخروج ضمن 0.35% من الوقف).
     stop_slip_usd = stop_slip_r = None
     if reason in ("Stop Loss", "Trailing Stop", "Breakeven Hit") and pos_data.get("sl"):
         adverse = (pos_data["sl"] - exit_price) if side == "LONG" else (exit_price - pos_data["sl"])
@@ -1247,7 +1248,6 @@ def detect_regime(df_15m, df_1h, df_4h):
 
 
 def relative_atr(df):
-    """نسبة ATR% الحالي إلى وسيط ATR% لنفس العملة خلال ~100 شمعة مغلقة سابقة. None إذا لا تكفي البيانات."""
     try:
         series = (df["atr"] / df["close"]).iloc[-102:-2].dropna()
         if len(series) < 60:
@@ -1260,7 +1260,6 @@ def relative_atr(df):
 
 
 def build_context(df_15m, df_1h, df_4h):
-    """الشروط العامة المشتركة بين الاستراتيجيتين. يرجع (ctx, None) أو (None, reason)."""
     if len(df_15m) < 70 or len(df_1h) < 60 or len(df_4h) < 60:
         return None, "insufficient_data"
     last = df_15m.iloc[-2]
@@ -1316,7 +1315,6 @@ def _make_signal(side, ctx, strategy):
 
 
 def pullback_signal(ctx):
-    """استراتيجية الارتداد: دخول مع الاتجاه بعد تراجع نحو EMA. يرجع (signal, None) أو (None, reason)."""
     last, prev, last_1h = ctx["last"], ctx["prev"], ctx["last_1h"]
     price, ema21, ema50, rsi_val = ctx["price"], ctx["ema21"], ctx["ema50"], ctx["rsi"]
     if not (last["volume"] > MIN_VOL_MULT * last["vol_ma"]):
@@ -1347,9 +1345,8 @@ def pullback_signal(ctx):
 
 
 def breakout_signal(ctx, df_15m):
-    """استراتيجية الاختراق: إغلاق شمعة خلف قمة/قاع آخر N شمعة بحجم مرتفع وبدعم اتجاه الساعة."""
     last, last_1h = ctx["last"], ctx["last_1h"]
-    window = df_15m.iloc[-(BO_LOOKBACK + 2):-2]          # الشموع قبل آخر شمعة مغلقة
+    window = df_15m.iloc[-(BO_LOOKBACK + 2):-2]
     hh, ll = float(window["high"].max()), float(window["low"].min())
     close, high, low = float(last["close"]), float(last["high"]), float(last["low"])
     rng = high - low
@@ -1384,28 +1381,23 @@ def breakout_signal(ctx, df_15m):
 
 
 def score_signal(signal, ctx, df_15m):
-    """درجة جودة 0-100 مبنية على بيانات الشموع والمؤشرات المتاحة فقط؛ لا تدّعي قراءة الحيتان أو OI."""
     last, h1, h4 = ctx["last"], ctx["last_1h"], ctx["last_4h"]
     side = signal["side"]
     score, factors = 0, {}
 
-    # توافق الاتجاه متعدد الأطر (0-25)
     aligned = ((side == "LONG" and h1["ema9"] > h1["ema21"] and h4["close"] > h4["ema50"])
                or (side == "SHORT" and h1["ema9"] < h1["ema21"] and h4["close"] < h4["ema50"]))
     factors["trend"] = 20 if aligned else 6
     score += factors["trend"]
 
-    # الحجم النسبي (0-20)
     vol_ratio = float(last["volume"] / last["vol_ma"]) if last["vol_ma"] else 0.0
     factors["volume"] = min(15, max(0, int(7.5 * vol_ratio)))
     score += factors["volume"]
 
-    # قوة الاتجاه ADX (0-15)
     adx_value = float(last["adx"])
     factors["adx"] = min(15, max(0, int((adx_value - 12) * 0.75)))
     score += factors["adx"]
 
-    # الزخم RSI (0-15): نتجنب التشبع الشديد
     r = float(last["rsi"])
     if side == "LONG":
         momentum = 15 if 52 <= r <= 66 else (10 if 47 <= r < 52 or 66 < r <= 70 else 4)
@@ -1414,20 +1406,21 @@ def score_signal(signal, ctx, df_15m):
     factors["momentum"] = momentum
     score += momentum
 
-    # جودة شمعة الإشارة (0-10)
     rng = max(float(last["high"] - last["low"]), 1e-12)
     body = abs(float(last["close"] - last["open"])) / rng
     factors["candle"] = min(10, int(body * 10))
     score += factors["candle"]
 
-    # طبيعة الاستراتيجية (0-15)
     factors["setup"] = 15 if signal.get("strategy") == "breakout" else 12
     score += factors["setup"]
 
-    # تمدد السعر عن EMA21 (0-10)
     extension = abs(float(last["close"]) - float(last["ema21"])) / max(float(last["atr"]), 1e-12)
     factors["entry_quality"] = 10 if extension <= 0.8 else (7 if extension <= 1.4 else 3)
     score += factors["entry_quality"]
+
+    # خصم النقاط إذا كان السوق ضعيف الاتجاه
+    if ctx["regime"] == "weak_trend":
+        score -= 10
 
     signal["score"] = min(100, int(score))
     signal["score_factors"] = factors
@@ -1436,7 +1429,6 @@ def score_signal(signal, ctx, df_15m):
 
 
 def evaluate_signal(df_15m, df_1h, df_4h):
-    """يرجع (signal, {}) أو (None, reasons) حيث reasons = {'common': r} أو {'pullback': r, 'breakout': r}."""
     ctx, reason = build_context(df_15m, df_1h, df_4h)
     if ctx is None:
         return None, {"common": reason}
@@ -1454,7 +1446,6 @@ def evaluate_signal(df_15m, df_1h, df_4h):
 
 
 def market_filters_ok(ex, sym, side):
-    """يرجع (ok, reason_code). السبريد المجهول يمنع الدخول، التمويل المجهول لا يمنع (فلتر مساعد)."""
     try:
         t = ex.fetch_ticker(sym)
         bid, ask, last = t.get('bid'), t.get('ask'), t.get('last')
@@ -1632,7 +1623,6 @@ def manage_position(ex, sym, st):
 # السماح بالدخول
 # ==========================================
 def floating_pnl_cached(ex):
-    """الربح/الخسارة العائمة من كاش الأسعار (بدون طلبات شبكة)."""
     total = 0.0
     for sym, v in open_positions_snapshot().items():
         c = _price_cache.get(sym)
@@ -1643,7 +1633,6 @@ def floating_pnl_cached(ex):
 
 
 def entries_allowed(ex):
-    """يرجع (ok, reason)."""
     if meta.get("paused"):
         return False, "paused"
     snap = daily_snapshot()
@@ -1671,6 +1660,11 @@ def entries_allowed(ex):
 # ==========================================
 def process_symbol(ex, sym):
     try:
+        # فلتر أوقات السوق للأسهم
+        if not is_market_open(sym):
+            set_last_reason(sym, "market_closed")
+            return
+
         with trade_lock:
             with state_lock:
                 st = state.setdefault(sym, new_sym_state())
@@ -1806,7 +1800,6 @@ def adopt_sl_pct(ex, sym):
 
 
 def sync_positions(ex, active_symbols):
-    """تُستدعى عند الإقلاع فقط. جلب المراكز داخل trade_lock لتفادي لقطة قديمة."""
     with trade_lock:
         try:
             exch = {}
@@ -2030,10 +2023,10 @@ def risk_text(ex):
         f"💼 الرصيد: <b>{equity:,.2f} USDT</b>",
         f"📊 الحالة: {status}", "",
         f"🎯 المخاطرة المستهدفة: <b>{RISK_PCT_PER_TRADE}%</b> | سقف الهامش {MAX_MARGIN_USDT:.0f} USDT",
-        f"📐 الفعلية عند وقف 0.8% / 1.5% / 2.5%: "
-        f"<b>{effective_risk_pct(equity, 0.008):.2f}% / {effective_risk_pct(equity, 0.015):.2f}% / {effective_risk_pct(equity, 0.025):.2f}%</b>",
+        f"📐 الفعلية عند وقف 1.5% / 2.5% / 4.0%: "
+        f"<b>{effective_risk_pct(equity, 0.015):.2f}% / {effective_risk_pct(equity, 0.025):.2f}% / {effective_risk_pct(equity, 0.040):.2f}%</b>",
         *(["⚠️ السقف يحدّ المخاطرة كثيراً — ارفع MAX_MARGIN_USDT أو خفّض RISK_PCT_PER_TRADE لتتطابقا"]
-          if equity > 0 and effective_risk_pct(equity, 0.015) < RISK_PCT_PER_TRADE * 0.5 else []),
+          if equity > 0 and effective_risk_pct(equity, 0.025) < RISK_PCT_PER_TRADE * 0.5 else []),
         f"📉 حد الخسارة اليومي: {DAILY_LOSS_LIMIT_PCT}% ({loss_limit:.1f} USDT) — يشمل العائم السالب",
         f"📈 هدف الربح اليومي: {DAILY_PROFIT_TARGET_PCT}% ({profit_target:.1f} USDT)", "",
         f"🔢 المفتوحة: {len(opens)} / {MAX_OPEN_POSITIONS}",
@@ -2169,7 +2162,6 @@ def telegram_listener(active_symbols):
 
 
 def watchdog():
-    """ينبهك إذا توقفت الحلقة الرئيسية (وهي مستقلة عن خيط تيليجرام)."""
     while True:
         time.sleep(60)
         last = loop_info["last_cycle_ts"]
@@ -2215,7 +2207,6 @@ def maybe_send_heartbeat(ex):
 # ماسح السوق الديناميكي (الأعلى سيولة + الأسواق الحديثة)
 # ==========================================
 def discover_universe(ex):
-    """يبني قائمة محدودة من عقود USDT النشطة لتفادي إغراق OKX بطلبات REST."""
     now_ms = ex.milliseconds()
     candidates = []
     for sym, market in ex.markets.items():
@@ -2251,7 +2242,6 @@ def discover_universe(ex):
         except (TypeError, ValueError):
             continue
     result = list(dict.fromkeys(liquid + fresh))[:MAX_UNIVERSE_SYMBOLS]
-    # حافظ على الأزواج الأساسية المعروفة إذا كانت متاحة، دون تجاوز سقف الكون.
     for sym in FUTURES_SYMBOLS:
         if sym in ex.markets and sym not in result and len(result) < MAX_UNIVERSE_SYMBOLS:
             result.append(sym)
@@ -2302,7 +2292,6 @@ def trading_loop():
             if time.time() - universe_refresh_ts >= UNIVERSE_REFRESH_SEC:
                 refreshed = discover_universe(ex)
                 if refreshed:
-                    # أضف أي رمز لديه مركز مفتوح حتى لا يتوقف عن إدارته عند خروجه من قائمة السيولة.
                     with state_lock:
                         held = [sym for sym, st in state.items() if st.get("position")]
                     active_symbols = list(dict.fromkeys(refreshed + held))
