@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V48.2 (AI + KER + Backup)
+OKX Futures Trading Bot - V48.3 (AI + KER + Volume Delta + Spoofing)
 """
 import os
 import sys
@@ -24,7 +24,7 @@ log = logging.getLogger("bot")
 # ==========================================
 # الإعدادات
 # ==========================================
-VERSION = "V48.2 AI"
+VERSION = "V48.3 AI"
 KSA_TZ = timezone(timedelta(hours=3))
 
 def env_float(name, default):
@@ -120,24 +120,21 @@ PROFILES = {
         "regime_adx4_strong": 28, "regime_adx1_strong": 24, "regime_adx4_weak": 20,
         "rsi_long_min": 40, "rsi_long_max": 61, "rsi_short_min": 39, "rsi_short_max": 60,
         "near_ema21_pct": 0.011, "near_ema50_pct": 0.016, "max_spread_pct": 0.0011,
-        "rel_atr_ratio": 99, "atr_hard_floor": 0.003,
-        "bo_vol_mult": 1.8, "bo_max_ext_atr": 2.0,
+        "rel_atr_ratio": 99, "atr_hard_floor": 0.003, "bo_vol_mult": 1.8, "bo_max_ext_atr": 2.0,
     },
     "balanced": {
         "min_atr_pct": 0.003, "min_adx": 20, "min_vol_mult": 1.0,
         "regime_adx4_strong": 26, "regime_adx1_strong": 22, "regime_adx4_weak": 18,
         "rsi_long_min": 38, "rsi_long_max": 64, "rsi_short_min": 36, "rsi_short_max": 62,
         "near_ema21_pct": 0.013, "near_ema50_pct": 0.019, "max_spread_pct": 0.0015,
-        "rel_atr_ratio": 1.15, "atr_hard_floor": 0.0018,
-        "bo_vol_mult": 1.5, "bo_max_ext_atr": 2.5,
+        "rel_atr_ratio": 1.15, "atr_hard_floor": 0.0018, "bo_vol_mult": 1.5, "bo_max_ext_atr": 2.5,
     },
     "active": {
         "min_atr_pct": 0.0022, "min_adx": 18, "min_vol_mult": 0.8,
         "regime_adx4_strong": 24, "regime_adx1_strong": 20, "regime_adx4_weak": 15,
         "rsi_long_min": 35, "rsi_long_max": 67, "rsi_short_min": 33, "rsi_short_max": 65,
         "near_ema21_pct": 0.016, "near_ema50_pct": 0.024, "max_spread_pct": 0.003,
-        "rel_atr_ratio": 0.9, "atr_hard_floor": 0.0015,
-        "bo_vol_mult": 1.2, "bo_max_ext_atr": 3.0,
+        "rel_atr_ratio": 0.9, "atr_hard_floor": 0.0015, "bo_vol_mult": 1.2, "bo_max_ext_atr": 3.0,
     },
 }
 _default_profile = "active" if USE_SANDBOX else "conservative"
@@ -185,6 +182,13 @@ BO_RSI_SHORT_MAX = env_float("BO_RSI_SHORT_MAX", 48)
 ENABLE_KER_FILTER = env_flag("ENABLE_KER_FILTER", True)
 MIN_KER = env_float("MIN_KER", 0.25)
 KER_LOOKBACK = int(env_float("KER_LOOKBACK", 10))
+
+# ---------- فلاتر التدفق والسيولة (جديد V48.3) ----------
+ENABLE_VOLUME_DELTA = env_flag("ENABLE_VOLUME_DELTA", True)
+VOLUME_DELTA_LOOKBACK = int(env_float("VOLUME_DELTA_LOOKBACK", 3))
+ENABLE_SPOOFING_CHECK = env_flag("ENABLE_SPOOFING_CHECK", True)
+SPOOFING_RATIO = env_float("SPOOFING_RATIO", 3.0)
+SPOOFING_BOOK_LIMIT = 20
 
 # ---------- AI Gateway & Backup ----------
 AI_GATEWAY_URL = os.getenv("AI_GATEWAY_URL", "https://api.openai.com/v1/chat/completions")
@@ -267,6 +271,9 @@ REASON_LABELS = {
     "bo_extended": "السعر بعيد عن EMA21 (مطاردة)",
     "score_low": "درجة الفرصة أقل من الحد المطلوب",
     "low_efficiency": "كفاءة اتجاه ضعيفة (تذبذب عالي)",
+    "negative_delta": "تدفق بيعي (يتعارض مع LONG)",
+    "positive_delta": "تدفق شرائي (يتعارض مع SHORT)",
+    "spoofing_detected": "كشف سبوفينج (جدار وهمي)",
 }
 
 def label(r):
@@ -603,14 +610,12 @@ def ai_analyze_trades(chat_id):
         return send(f"خطأ في قراءة السجل: {e}", chat_id)
 
     send("⏳ جاري تحليل سجل الصفقات واستخراج الأنماط...", chat_id)
-    
     if not AI_API_KEY:
         return send(local_ai_analysis(df), chat_id)
 
     total_pnl = df["pnl"].sum()
     wr = (df["pnl"] > 0).mean() * 100
     recent = df.tail(15)[["symbol", "side", "strategy", "pnl", "r_multiple", "reason"]].to_csv(index=False)
-    
     prompt = f"""أنت محلل أداء تداول كمي خبير. حلل سجل بوت التداول التالي:
 1. استخرج 3 أنماط (Patterns) واضحة (مثلاً: هل البوت يخسر في استراتيجية معينة؟ في وقت معين؟).
 2. قيّم مؤشرات المخاطر (R/R، سلاسل الخسائر).
@@ -651,7 +656,6 @@ def handle_document_restore(msg, chat_id):
     file_name = doc.get("file_name", "")
     if file_name not in ("trades_journal.csv", "bot_state.json"):
         return send("❌ الملف غير معروف. أرسل ملف السجل أو الحالة فقط.", chat_id)
-    
     file_id = doc.get("file_id")
     try:
         r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}").json()
@@ -801,8 +805,21 @@ def adx(high, low, close, p=14):
 def efficiency_ratio(close_series, period=10):
     change = abs(close_series - close_series.shift(period))
     volatility = abs(close_series - close_series.diff()).rolling(window=period).sum()
-    er = change / (volatility + 1e-9)
-    return er
+    return change / (volatility + 1e-9)
+
+def calculate_volume_delta(df, lookback=3):
+    if len(df) < lookback + 2:
+        return 0.0
+    deltas = []
+    for i in range(1, lookback + 1):
+        c = df.iloc[-1 - i]
+        if c["close"] > c["open"]:
+            deltas.append(c["volume"])
+        elif c["close"] < c["open"]:
+            deltas.append(-c["volume"])
+        else:
+            deltas.append(0.0)
+    return sum(deltas)
 
 def add_indicators(df):
     if len(df) < 60:
@@ -1060,7 +1077,7 @@ def open_position(ex, sym, side, price, sl, tp, margin):
             if pos:
                 break
         if not pos:
-            return False, "لم يتأكد تنفيذ الأمر (لا مركز على المنصة) — لم تُوضع حماية", price, 0.0
+            return False, "لم يتأكد تنفيذ الأمر (لا مركز على المنصة)", price, 0.0
         entry = pos["entry"] or price
         contracts = pos["contracts"]
         sl_ok, tp_ok = protect_position(ex, sym, close_side, contracts, sl, tp)
@@ -1075,8 +1092,7 @@ def open_position(ex, sym, side, price, sl, tp, margin):
     except Exception as e:
         log.error(f"[OPEN ERR] {sym}: {e}")
         return False, str(e)[:150], price, 0.0
-
-# ==========================================
+        # ==========================================
 # الربح وإنهاء الصفقة
 # ==========================================
 def leg_fee_est(entry, exit_price, contracts, cs):
@@ -1231,7 +1247,8 @@ def emergency_close(ex, sym, why):
         if now - _last_emergency_msg.get((sym, "fail"), 0) > 120:
             _last_emergency_msg[(sym, "fail")] = now
             send(f"🆘 فشل الإغلاق الطارئ لـ <code>{short(sym)}</code> — يُعاد المحاولة تلقائياً.")
-            # ==========================================
+
+# ==========================================
 # البيانات والاستراتيجية
 # ==========================================
 def fetch_data(ex, sym, tf, limit=130):
@@ -1332,12 +1349,19 @@ def build_context(df_15m, df_1h, df_4h):
         current_ker = float(er_series.iloc[-2]) if not pd.isna(er_series.iloc[-2]) else 0.0
         if current_ker < MIN_KER:
             return None, "low_efficiency"
-    # --------------------------------
 
     long_dir = regime in ("strong_trend_up", "weak_trend") and last_4h["close"] > last_4h["ema50"]
     short_dir = regime in ("strong_trend_down", "weak_trend") and last_4h["close"] < last_4h["ema50"]
     if not long_dir and not short_dir:
         return None, "direction_mismatch"
+
+    # --- فلتر التدفق (Volume Delta) ---
+    if ENABLE_VOLUME_DELTA:
+        delta = calculate_volume_delta(df_15m, VOLUME_DELTA_LOOKBACK)
+        if long_dir and delta < 0:
+            return None, "negative_delta"
+        if short_dir and delta > 0:
+            return None, "positive_delta"
 
     sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * atr_val / price))
     return {
@@ -1490,6 +1514,25 @@ def sector_limit_reached(sym, side):
     with state_lock:
         n = sum(1 for s, v in state.items() if v.get("position") == side and sector_of(s) == sec)
     return n >= MAX_PER_SECTOR_SAME_DIR
+
+def check_spoofing(ex, sym, side):
+    if not ENABLE_SPOOFING_CHECK:
+        return False
+    try:
+        ob = ex.fetch_order_book(sym, limit=SPOOFING_BOOK_LIMIT)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        if not bids or not asks:
+            return False
+        bid_vol = sum(float(b[1]) for b in bids[:5])
+        ask_vol = sum(float(a[1]) for a in asks[:5])
+        if side == "LONG" and bid_vol > ask_vol * SPOOFING_RATIO:
+            return True
+        if side == "SHORT" and ask_vol > bid_vol * SPOOFING_RATIO:
+            return True
+    except Exception as e:
+        log.debug(f"[SPOOFING] {sym}: {e}")
+    return False
 
 # ==========================================
 # إدارة الصفقة
@@ -1748,6 +1791,13 @@ def process_symbol(ex, sym):
                 sl = actual_price * (1 + sl_pct)
                 tp = actual_price * (1 - sl_pct * RR_RATIO)
 
+            # --- فلتر السبوفينج (الجدران الوهمية) ---
+            if ENABLE_SPOOFING_CHECK:
+                if check_spoofing(ex, sym, side):
+                    note_block(sym, "spoofing_detected")
+                    log.info(f"[SPOOFING] {sym}: كشف جدار وهمي لصالح {side}، تم رفض الصفقة.")
+                    return
+
             equity_now = get_equity(ex)
             margin = compute_margin(equity_now, sl_pct)
             if margin <= 0:
@@ -1975,7 +2025,7 @@ def why_text(arg, active_symbols):
     lines = [f"🔎 <b>لماذا لا توجد صفقات؟</b> — {d['date']}", "━━━━━━━━━━━━━━━",
              f"📊 تقييمات (رمز×شمعة): {ev}",
              f"✅ إشارات: {d['signals']} ({sig_txt}) | 🟢 فُتحت: {d['opened']}",
-             f"⚙️ البروفايل: <b>{PROFILE_NAME}</b> | الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'} | KER: {'مفعّل' if ENABLE_KER_FILTER else 'معطّل'} (/config)"]
+             f"⚙️ البروفايل: <b>{PROFILE_NAME}</b> | الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'} | KER: {'مفعّل' if ENABLE_KER_FILTER else 'معطّل'} | Delta: {'مفعّل' if ENABLE_VOLUME_DELTA else 'معطّل'} (/config)"]
     if meta.get("paused"):
         lines.append("⏸️ <b>البوت موقوف (/resume)</b>")
     if ev:
@@ -2006,13 +2056,15 @@ def config_text():
         f"ATR الأدنى المطلق (15د): {MIN_ATR_PCT * 100:.2f}%",
         f"ADX الأدنى (15د): {MIN_ADX:g}",
         f"فلتر كفاءة الاتجاه (KER): {'مفعّل' if ENABLE_KER_FILTER else 'معطّل'} | الحد: {MIN_KER:g} | الفترة: {KER_LOOKBACK}",
+        f"تدفق الأوامر (Volume Delta): {'مفعّل' if ENABLE_VOLUME_DELTA else 'معطّل'} | فترة {VOLUME_DELTA_LOOKBACK} شموع",
+        f"كشف السبوفينج: {'مفعّل' if ENABLE_SPOOFING_CHECK else 'معطّل'} | النسبة {SPOOFING_RATIO:g}×",
         f"الارتداد — الحجم ≥ {MIN_VOL_MULT:g}× | RSI LONG {RSI_LONG_MIN:g}–{RSI_LONG_MAX:g} | SHORT {RSI_SHORT_MIN:g}–{RSI_SHORT_MAX:g}",
         f"الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'} | نافذة {BO_LOOKBACK} شمعة | حجم ≥ {BO_VOL_MULT:g}×",
         f"أقصى سبريد: {MAX_SPREAD_PCT * 100:.2f}%",
         f"المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة {LEVERAGE}x | سقف الهامش {MAX_MARGIN_USDT:.0f}",
         f"حد درجة الفرصة: {MIN_SIGNAL_SCORE}/100 | العملات: {UNIVERSE_MODE} (حتى {MAX_UNIVERSE_SYMBOLS})",
         "━━━━━━━━━━━━━━━",
-        "للتعديل: متغيرات البيئة في Render (PROFILE, MIN_KER, ENABLE_BREAKOUT...)"])
+        "للتعديل: متغيرات البيئة في Render (PROFILE, MIN_KER, ENABLE_VOLUME_DELTA...)"])
 
 def positions_text(ex):
     opens = open_positions_snapshot()
@@ -2138,7 +2190,6 @@ def telegram_listener(active_symbols):
                 text, chat_id = msg.get("text", ""), str(msg.get("chat", {}).get("id", ""))
                 if chat_id not in AUTHORIZED_CHATS: continue
                 
-                # استقبال الملفات للاستعادة
                 if "document" in msg:
                     handle_document_restore(msg, chat_id)
                     continue
@@ -2236,6 +2287,7 @@ def trading_loop():
     send(f"🚀 <b>تم تشغيل البوت {VERSION}</b>\n━━━━━━━━━━━━━━━\n"
          f"⚙️ الوضع: {'Sandbox' if USE_SANDBOX else 'حقيقي'}\n🪙 العملات: {len(active_symbols)}\n"
          f"🎚️ البروفايل: {PROFILE_NAME} | KER: {'مفعّل' if ENABLE_KER_FILTER else 'معطّل'}\n"
+         f"📊 Delta: {'مفعّل' if ENABLE_VOLUME_DELTA else 'معطّل'} | Spoofing: {'مفعّل' if ENABLE_SPOOFING_CHECK else 'معطّل'}\n"
          f"🧠 AI: {'مفعّل' if AI_API_KEY else 'محلي'} | 📁 النسخ الاحتياطي التلقائي: مفعّل")
     if PROFILE_WARNING: send(f"⚠️ {PROFILE_WARNING}")
 
