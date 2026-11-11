@@ -1,8 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V48.2 (Crypto-only Universe + Execution Safety + KER Filter)
+OKX Futures Trading Bot - V48.4
 
-التعديلات عن V48.1:
+التعديلات عن V48.3:
+1) نقطة التعادل تغطي رسوم الدخول والخروج فعلاً (BE_FEE_BUFFER = 0.12% بدل 0.08%).
+2) العملات خارج القطاعات المعروفة لا تُجمَّع في قطاع "other" واحد يحجبها؛ وتوسيع قائمة القطاعات.
+
+التعديلات عن V48.2 (V48.3):
+1) تيليجرام: تجاهل الأوامر القديمة المتراكمة عند إعادة التشغيل (كان /closeall القديم يُنفَّذ من جديد).
+2) تيليجرام: الإرسال في الخلفية (لا يوقف حلقة التداول)، مع معالجة 429 وأخطاء HTML.
+3) الصفقات المفتوحة تُدار أولاً في كل دورة، وتُضاف للقائمة عند التشغيل حتى لو خرجت من قائمة العملات.
+4) منع فتح أمر جديد إذا كان هناك مركز قائم على المنصة لنفس العملة (وضع net).
+5) عدم حذف أمر TP القديم إذا لم يُوضع TP جديد فعلياً.
+6) سعر الإغلاق الجزئي من سعر التنفيذ الفعلي بدل آخر سعر.
+7) حجم الصفقة يحسب الرسوم ضمن المخاطرة (RISK_INCLUDES_FEES).
+8) حد الخسارة اليومي يُحسب من رصيد بداية اليوم.
+9) توحيد منطق تبنّي المراكز اليتيمة + فحص الوقف والهدف معاً.
+10) Watchdog يعيد تشغيل البوت تلقائياً إذا علقت الحلقة طويلاً.
+11) حماية /diag برمز اختياري DIAG_TOKEN + تحذير إذا لم يكن هناك قرص دائم.
+
+التعديلات عن V48.1 (V48.2):
 1) إصلاح حساب Kaufman Efficiency Ratio (KER) — كان الحساب خاطئاً.
 2) تحسين الإغلاق الجزئي: إغلاق الكمية المتبقية تلقائياً إذا أصبحت أقل من الحد الأدنى.
 3) تحسينات طفيفة في تبني المراكز اليتيمة.
@@ -12,6 +29,8 @@ import sys
 import csv
 import json
 import time
+import html
+import queue
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -19,8 +38,9 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 import ccxt
+import re
 import requests
-from flask import Flask
+from flask import Flask, request
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -29,7 +49,7 @@ log = logging.getLogger("bot")
 # ==========================================
 # الإعدادات
 # ==========================================
-VERSION = "V48.2 KER"
+VERSION = "V48.4"
 KSA_TZ = timezone(timedelta(hours=3))
 
 def env_float(name, default):
@@ -64,13 +84,20 @@ FUTURES_SYMBOLS = [
 
 SECTORS = {
     "major": {"BTC", "ETH", "BNB"},
-    "l1": {"SOL", "AVAX", "NEAR", "APT", "SUI", "ADA", "DOT", "ATOM", "SEI", "TIA", "INJ"},
-    "l2": {"ARB", "OP", "STX", "IMX"},
-    "meme": {"DOGE", "PEPE", "WIF"},
-    "ai": {"FET", "WLD"},
-    "legacy": {"XRP", "LTC", "BCH", "FIL", "LINK", "RUNE", "ORDI"},
+    "l1": {"SOL", "AVAX", "NEAR", "APT", "SUI", "ADA", "DOT", "ATOM", "SEI", "TIA", "INJ",
+           "TON", "TRX", "HBAR", "ALGO", "ICP", "EGLD", "KAS", "XLM", "ETC", "BERA", "S", "HYPE"},
+    "l2": {"ARB", "OP", "STX", "IMX", "POL", "MATIC", "STRK", "ZK", "MNT", "METIS", "BLAST"},
+    "meme": {"DOGE", "PEPE", "WIF", "SHIB", "BONK", "FLOKI", "TRUMP", "PENGU", "POPCAT", "BOME",
+             "MEME", "NEIRO", "PNUT", "MOODENG", "TURBO", "FARTCOIN", "DOGS", "BRETT"},
+    "ai": {"FET", "WLD", "RENDER", "TAO", "AI16Z", "VIRTUAL", "GRT", "AR", "IO", "ARKM"},
+    "defi": {"UNI", "AAVE", "CRV", "LDO", "MKR", "COMP", "SUSHI", "DYDX", "JUP", "PENDLE",
+             "ENA", "ONDO", "ETHFI", "RAY", "CAKE", "GMX", "SNX", "1INCH"},
+    "gaming": {"SAND", "MANA", "AXS", "GALA", "APE", "ENJ", "MAGIC", "PIXEL", "NOT", "YGG"},
+    "legacy": {"XRP", "LTC", "BCH", "FIL", "LINK", "RUNE", "ORDI", "EOS", "XMR", "ZEC", "DASH", "NEO"},
 }
 MAX_PER_SECTOR_SAME_DIR = 2
+# العملات غير المصنّفة: كل عملة قطاع مستقل (تبقى محكومة بحدود الاتجاه والعدد الكلي)
+UNKNOWN_SECTOR_SHARED = env_flag("UNKNOWN_SECTOR_SHARED", False)
 
 SCAN_INTERVAL = int(env_float("SCAN_INTERVAL", 15))
 UNIVERSE_REFRESH_SEC = int(env_float("UNIVERSE_REFRESH_SEC", 1800))
@@ -102,7 +129,8 @@ RR_RATIO = 2.3
 MIN_SL_PCT = 0.0065
 MAX_SL_PCT = 0.032
 TRAIL_ATR_MULT = 1.05
-BE_FEE_BUFFER = 0.0008
+# يجب أن يغطي رسوم الدخول والخروج (2 × FEE_RATE = 0.10%) + هامش انزلاق صغير
+BE_FEE_BUFFER = env_float("BE_FEE_BUFFER", 0.0012)
 BE_TRIGGER_R = 0.9
 FALLBACK_SL_PCT = 0.017
 
@@ -117,6 +145,9 @@ MAX_SAME_DIRECTION = 3
 MAX_FUNDING_RATE = 0.00045
 MAX_ENTRY_SLIPPAGE_PCT = 0.004
 USE_BTC_FILTER = True
+RISK_INCLUDES_FEES = env_flag("RISK_INCLUDES_FEES", True)
+WATCHDOG_RESTART = env_flag("WATCHDOG_RESTART", True)
+DIAG_TOKEN = os.getenv("DIAG_TOKEN", "").strip()
 
 # ---------- بروفايلات الاستراتيجية ----------
 PROFILES = {
@@ -206,7 +237,7 @@ diag_lock = threading.Lock()
 
 state = {}
 meta = {"paused": False, "last_report": "", "loss_alert": "", "profit_alert": "", "last_heartbeat": ""}
-daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_TZ).date())}
+daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "start_equity": 0.0, "date": str(datetime.now(KSA_TZ).date())}
 
 _data_cache = {}
 _price_cache = {}
@@ -330,6 +361,8 @@ def health_check():
 
 @app.route("/diag")
 def diag_endpoint():
+    if DIAG_TOKEN and request.args.get("token") != DIAG_TOKEN:
+        return {"error": "unauthorized"}, 401
     with diag_lock:
         d = json.loads(json.dumps(diag))
     last = loop_info["last_cycle_ts"]
@@ -411,7 +444,7 @@ def roll_daily():
     today = str(datetime.now(KSA_TZ).date())
     with state_lock:
         if daily_pnl.get("date") != today:
-            daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": today}
+            daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "start_equity": 0.0, "date": today}
 
 def add_daily_pnl(pnl_usdt):
     roll_daily()
@@ -438,6 +471,20 @@ def daily_snapshot():
     roll_daily()
     with state_lock:
         return dict(daily_pnl)
+
+def day_base_equity(equity):
+    """رصيد بداية اليوم — أساس حساب حدود الربح/الخسارة اليومية."""
+    roll_daily()
+    with state_lock:
+        base = float(daily_pnl.get("start_equity") or 0.0)
+        if base <= 0 and equity > 0:
+            daily_pnl["start_equity"] = base = float(equity)
+            changed = True
+        else:
+            changed = False
+    if changed:
+        save_state()
+    return base if base > 0 else equity
 
 # ==========================================
 # سجل الصفقات
@@ -562,16 +609,57 @@ def stats_text():
 # ==========================================
 # تيليجرام والرسائل
 # ==========================================
+_send_q = queue.Queue(maxsize=500)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+def esc(x):
+    """تهريب نص خارجي (رسائل خطأ...) قبل وضعه داخل رسالة HTML."""
+    return html.escape(str(x), quote=False)
+
+def _tg_post(cid, msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    text = msg[:4000]
+    for attempt in range(3):
+        try:
+            r = requests.post(url, json={"chat_id": cid, "text": text, "parse_mode": "HTML"}, timeout=10)
+            if r.status_code == 429:
+                try:
+                    wait = float((r.json().get("parameters") or {}).get("retry_after", 3))
+                except Exception:
+                    wait = 3.0
+                time.sleep(min(wait, 30))
+                continue
+            if r.status_code == 400:
+                # غالباً خطأ في تنسيق HTML — أرسل نصاً عادياً بدل أن تضيع الرسالة
+                plain = html.unescape(_TAG_RE.sub("", text))
+                requests.post(url, json={"chat_id": cid, "text": plain}, timeout=10)
+            return
+        except Exception as e:
+            log.warning(f"[TG SEND] {e}")
+            time.sleep(2)
+
+def _sender_worker():
+    while True:
+        cid, msg = _send_q.get()
+        try:
+            _tg_post(cid, msg)
+        finally:
+            _send_q.task_done()
+
+def flush_send(timeout=10):
+    end = time.time() + timeout
+    while _send_q.unfinished_tasks and time.time() < end:
+        time.sleep(0.2)
+
 def send(msg, chat_id=None):
     if not TELEGRAM_BOT_TOKEN:
         return
     targets = [chat_id] if chat_id else list(AUTHORIZED_CHATS)
     for cid in targets:
         try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                          json={"chat_id": cid, "text": msg, "parse_mode": "HTML"}, timeout=10)
-        except Exception as e:
-            log.warning(f"[TG SEND] {e}")
+            _send_q.put_nowait((cid, msg))
+        except queue.Full:
+            log.warning("[TG SEND] طابور الرسائل ممتلئ — أُسقطت رسالة")
 
 def fmt(p):
     if p is None or (isinstance(p, float) and np.isnan(p)):
@@ -589,23 +677,29 @@ REASONS = {
     "Manual": "إغلاق يدوي 🖐️",
     "Emergency": "إغلاق طارئ 🚨",
     "Manual/External": "إغلاق من المنصة ⚡",
+    "Partial Final": "إغلاق المتبقي عند هدف جزئي 💰",
 }
+
+def loss_per_margin(sl_pct):
+    """الخسارة لكل 1 USDT هامش عند ضرب الوقف (مع رسوم الدخول والخروج إن فُعّل)."""
+    fee_part = 2 * FEE_RATE if RISK_INCLUDES_FEES else 0.0
+    return (sl_pct + fee_part) * LEVERAGE
 
 def effective_risk_pct(equity, sl_pct):
     if equity <= 0 or sl_pct <= 0:
         return 0.0
     risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
-    margin = risk_usd / (sl_pct * LEVERAGE)
+    margin = risk_usd / loss_per_margin(sl_pct)
     cap = min(MAX_MARGIN_USDT, equity * MAX_MARGIN_PCT_EQUITY)
     margin = min(cap, margin)
-    return margin * sl_pct * LEVERAGE / equity * 100.0
+    return margin * loss_per_margin(sl_pct) / equity * 100.0
 
 def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy="", equity=None):
     title = "🟢 <b>توصية شراء (LONG)</b>" if side == "LONG" else "🔴 <b>توصية بيع (SHORT)</b>"
     status = "✅ <b>تم فتح الصفقة آلياً</b>" if real_order else "⚠️ <b>إشارة فقط</b>"
     sl_pct = abs(price - sl) / price * 100
     tp_pct = abs(tp - price) / price * 100
-    risk_usd = margin * (sl_pct / 100) * LEVERAGE
+    risk_usd = margin * loss_per_margin(sl_pct / 100)
     reward_usd = margin * (tp_pct / 100) * LEVERAGE
     risk_pct_txt = ""
     if equity and equity > 0:
@@ -788,7 +882,7 @@ def compute_margin(equity, sl_pct):
     if not USE_RISK_SIZING:
         return float(POSITION_SIZE_USDT)
     risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
-    margin = risk_usd / (sl_pct * LEVERAGE)
+    margin = risk_usd / loss_per_margin(sl_pct)
     cap = min(MAX_MARGIN_USDT, equity * MAX_MARGIN_PCT_EQUITY)
     sized = min(cap, margin)
     return sized if sized >= MIN_MARGIN_USDT else 0.0
@@ -861,7 +955,8 @@ def place_sl_tp(ex, sym, side, contracts, trigger, is_sl):
     return res
 
 def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
-    sl_ok = tp_ok = False
+    """يعيد (sl_ok, tp_ok, tp_placed). tp_ok=True أيضاً إذا رفضت المنصة TP لأن السعر تجاوزه."""
+    sl_ok = tp_ok = tp_placed = False
     if sl is not None:
         for i in range(retries):
             try:
@@ -875,7 +970,7 @@ def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
         for i in range(retries):
             try:
                 place_sl_tp(ex, sym, close_side, contracts, tp, False)
-                tp_ok = True
+                tp_ok = tp_placed = True
                 break
             except Exception as e:
                 if "51277" in str(e) or "51276" in str(e):
@@ -883,7 +978,7 @@ def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
                     break
                 log.error(f"[TP ERR] {sym} try {i + 1}: {e}")
                 time.sleep(0.8)
-    return sl_ok, tp_ok
+    return sl_ok, tp_ok, tp_placed
 
 def replace_protection(ex, sym, close_side, contracts, sl, tp=None):
     try:
@@ -891,10 +986,11 @@ def replace_protection(ex, sym, close_side, contracts, sl, tp=None):
     except Exception as e:
         log.warning(f"[REPLACE] list failed {sym}: {e}")
         return False
-    sl_ok, tp_ok = protect_position(ex, sym, close_side, contracts, sl, tp)
+    sl_ok, _tp_ok, tp_placed = protect_position(ex, sym, close_side, contracts, sl, tp)
     if not sl_ok:
         return False
-    ids = [a["id"] for a in old if a["is_sl"] or (tp is not None and tp_ok and a["is_tp"])]
+    # لا نحذف TP القديم إلا إذا وُضع TP جديد فعلاً
+    ids = [a["id"] for a in old if a["is_sl"] or (tp is not None and tp_placed and a["is_tp"])]
     cancel_algo_ids(ex, sym, ids)
     return True
 
@@ -933,6 +1029,9 @@ def open_position(ex, sym, side, price, sl, tp, margin):
         amount = calculate_contracts(ex, sym, margin, price, LEVERAGE)
         if amount <= 0:
             return False, "كمية غير صالحة", price, 0.0
+        # وضع net: أمر جديد فوق مركز قائم يدمجه أو يعكسه — لا نفتح أبداً فوق مركز موجود
+        if get_open_position(ex, sym) is not None:
+            return False, "يوجد مركز قائم على المنصة لهذه العملة — لم يُفتح أمر جديد", price, 0.0
         cancel_pending(ex, sym)
         ok, err = set_leverage_checked(ex, sym)
         if not ok:
@@ -953,7 +1052,7 @@ def open_position(ex, sym, side, price, sl, tp, margin):
             return False, "لم يتأكد تنفيذ الأمر (لا مركز على المنصة) — لم تُوضع حماية", price, 0.0
         entry = pos["entry"] or price
         contracts = pos["contracts"]
-        sl_ok, tp_ok = protect_position(ex, sym, close_side, contracts, sl, tp)
+        sl_ok, tp_ok, _ = protect_position(ex, sym, close_side, contracts, sl, tp)
         if not sl_ok:
             send(f"🚨 فشل وضع وقف الخسارة لـ <code>{short(sym)}</code> — جاري الإغلاق.")
             if not close_full(ex, sym):
@@ -1374,7 +1473,7 @@ def sector_of(sym):
     base = sym.split("/")[0]
     for name, members in SECTORS.items():
         if base in members: return name
-    return "other"
+    return "other" if UNKNOWN_SECTOR_SHARED else f"other:{base}"
 
 def sector_limit_reached(sym, side):
     sec = sector_of(sym)
@@ -1420,7 +1519,7 @@ def do_partial(ex, sym, st, which):
     if remaining < mn:
         log.info(f"[PARTIAL] {sym}: الكمية المتبقية صغيرة جداً ({remaining}) — إغلاق كامل")
         if close_full(ex, sym):
-            finalize_trade(ex, sym, reason_hint="Manual")
+            finalize_trade(ex, sym, reason_hint="Partial Final")
         return True
 
     if amt < mn:
@@ -1430,14 +1529,24 @@ def do_partial(ex, sym, st, which):
         return False
 
     try:
-        ex.create_order(sym, 'market', close_side, amt, None, {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
+        order = ex.create_order(sym, 'market', close_side, amt, None, {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
     except Exception as e:
         log.error(f"[PARTIAL ORDER] {sym}: {e}")
         return False
 
     time.sleep(0.8)
     fill_ts = time.time()
-    exit_price = get_current_price(ex, sym, 0) or entry
+    exit_price = None
+    try:
+        oid = (order or {}).get("id")
+        if oid:
+            o = ex.fetch_order(oid, sym)
+            avg = o.get("average") or o.get("price")
+            if avg:
+                exit_price = float(avg)
+    except Exception as e:
+        log.warning(f"[PARTIAL FILL PRICE] {sym}: {e}")
+    exit_price = exit_price or get_current_price(ex, sym, 0) or entry
     cs_leg = contract_size(ex, sym)
     pnl = leg_pnl(side, entry, exit_price, amt, cs_leg)
     fee_est_leg = leg_fee_est(entry, exit_price, amt, cs_leg)
@@ -1545,15 +1654,16 @@ def entries_allowed(ex):
     equity = get_equity(ex)
     if equity <= 0:
         return False, "equity_unavailable"
+    base = day_base_equity(equity)
     loss_now = snap["value"]
     if INCLUDE_FLOATING_IN_LOSS_LIMIT:
         loss_now += min(floating_pnl_cached(ex), 0.0)
-    if loss_now <= -equity * DAILY_LOSS_LIMIT_PCT / 100.0:
+    if loss_now <= -base * DAILY_LOSS_LIMIT_PCT / 100.0:
         if meta.get("loss_alert") != snap["date"]:
             set_meta("loss_alert", snap["date"])
             send("⛔ <b>وصلنا حد الخسارة اليومي</b>\nتم إيقاف الصفقات الجديدة")
         return False, "daily_loss_limit"
-    if DAILY_PROFIT_TARGET_PCT > 0 and snap["value"] >= equity * DAILY_PROFIT_TARGET_PCT / 100.0:
+    if DAILY_PROFIT_TARGET_PCT > 0 and snap["value"] >= base * DAILY_PROFIT_TARGET_PCT / 100.0:
         if meta.get("profit_alert") != snap["date"]:
             set_meta("profit_alert", snap["date"])
             send("✅ <b>تحقق الهدف اليومي للربح</b>\nتم إيقاف الدخول لحماية الأرباح")
@@ -1579,6 +1689,11 @@ def process_symbol(ex, sym):
                     if missing < MISSING_CONFIRMATIONS:
                         return
                     finalize_trade(ex, sym)
+                    return
+                if exch_pos["side"] != pos_data["position"]:
+                    log.warning(f"[SIDE MISMATCH] {sym}: البوت {pos_data['position']} / المنصة {exch_pos['side']}")
+                    send(f"⚠️ اتجاه مركز <code>{short(sym)}</code> على المنصة يختلف عن البوت — سيُسجَّل إغلاق الصفقة القديمة ويُتبنّى المركز الجديد.")
+                    finalize_trade(ex, sym, reason_hint="Manual/External")
                     return
                 with state_lock:
                     state[sym]["missing_checks"] = 0
@@ -1681,7 +1796,7 @@ def process_symbol(ex, sym):
                                 signal.get("strategy", ""), equity_now)
             caption += f"\n🧠 تقييم الفرصة: <b>{signal.get('score', 0)}/100</b> | حجم التداول: {signal.get('volume_ratio', 0):.2f}×"
             if not success:
-                caption += f"\n❌ {info}"
+                caption += f"\n❌ {esc(info)}"
             send(caption)
     except Exception as e:
         loop_info["last_error"] = f"{sym}: {str(e)[:150]}"
@@ -1702,14 +1817,59 @@ def adopt_sl_pct(ex, sym):
         pass
     return FALLBACK_SL_PCT
 
+def adopt_position(ex, sym, p, title="♻️ تم تبنّي مركز"):
+    """تبنّي مركز موجود على المنصة بلا حالة في البوت: وقف وهدف من ATR، أو إغلاق إذا تجاوزهما."""
+    side = "LONG" if p.get('side') == 'long' else "SHORT"
+    entry = float(p.get('entryPrice') or 0)
+    contracts = abs(float(p.get('contracts') or 0))
+    if entry <= 0 or contracts <= 0:
+        return False
+    sl_pct = adopt_sl_pct(ex, sym)
+    if side == "LONG":
+        sl, tp = entry * (1 - sl_pct), entry * (1 + sl_pct * RR_RATIO)
+    else:
+        sl, tp = entry * (1 + sl_pct), entry * (1 - sl_pct * RR_RATIO)
+    cur = get_current_price(ex, sym)
+    if cur:
+        if (side == "LONG" and cur <= sl) or (side == "SHORT" and cur >= sl):
+            send(f"🚨 مركز <code>{short(sym)}</code> تجاوز الوقف المحسوب — إغلاق فوري")
+            close_full(ex, sym)
+            return False
+        if (side == "LONG" and cur >= tp) or (side == "SHORT" and cur <= tp):
+            send(f"🎯 مركز <code>{short(sym)}</code> تجاوز الهدف المحسوب — إغلاق وجني الربح")
+            close_full(ex, sym)
+            return False
+    close_side = 'sell' if side == "LONG" else 'buy'
+    cancel_pending(ex, sym)
+    if protect_position(ex, sym, close_side, contracts, sl, tp)[0]:
+        now = time.time()
+        with state_lock:
+            state[sym] = new_sym_state()
+            state[sym].update({
+                "position": side, "entry": entry, "sl": sl, "tp": tp,
+                "initial_sl": sl, "initial_risk": abs(entry - sl),
+                "contracts": contracts, "initial_contracts": contracts,
+                "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
+                "opened_ts": now, "leg_ts": now, "regime": "adopted", "strategy": "adopted"})
+        save_state()
+        send(f"{title} <code>{short(sym)}</code> ({side}) — SL {sl_pct * 100:.2f}% (ATR)")
+        return True
+    send(f"🚨 مركز <code>{short(sym)}</code> بدون حالة وتعذر وضع الحماية — جاري الإغلاق")
+    close_full(ex, sym)
+    return False
+
+def _exchange_positions(ex, active_symbols):
+    exch = {}
+    for p in ex.fetch_positions():
+        c = abs(float(p.get('contracts') or 0))
+        if c > 0 and p.get('symbol') in active_symbols:
+            exch[p['symbol']] = p
+    return exch
+
 def sync_positions(ex, active_symbols):
     with trade_lock:
         try:
-            exch = {}
-            for p in ex.fetch_positions():
-                c = abs(float(p.get('contracts') or 0))
-                if c > 0 and p.get('symbol') in active_symbols:
-                    exch[p['symbol']] = p
+            exch = _exchange_positions(ex, active_symbols)
         except Exception as e:
             log.error(f"[SYNC] {e}")
             return
@@ -1727,43 +1887,16 @@ def sync_positions(ex, active_symbols):
                     close_side = 'sell' if st["position"] == "LONG" else 'buy'
                     replace_protection(ex, sym, close_side, contracts, st["sl"], st.get("tp"))
             elif not st.get("position") and sym in exch:
-                p = exch[sym]
-                side = "LONG" if p.get('side') == 'long' else "SHORT"
-                entry = float(p.get('entryPrice') or 0)
-                contracts = abs(float(p.get('contracts')))
-                sl_pct = adopt_sl_pct(ex, sym)
-                if side == "LONG":
-                    sl, tp = entry * (1 - sl_pct), entry * (1 + sl_pct * RR_RATIO)
-                else:
-                    sl, tp = entry * (1 + sl_pct), entry * (1 - sl_pct * RR_RATIO)
-                current_price = get_current_price(ex, sym)
-                if current_price and ((side == "LONG" and current_price >= tp) or (side == "SHORT" and current_price <= tp)):
-                    close_full(ex, sym)
+                if not ADOPT_ORPHANS:
+                    log.warning(f"[SYNC] {sym}: مركز بلا حالة و ADOPT_ORPHANS معطّل — تُرك يدوياً")
                     continue
-                close_side = 'sell' if side == "LONG" else 'buy'
-                cancel_pending(ex, sym)
-                if protect_position(ex, sym, close_side, contracts, sl, tp)[0]:
-                    now = time.time()
-                    with state_lock:
-                        state[sym] = new_sym_state()
-                        state[sym].update({
-                            "position": side, "entry": entry, "sl": sl, "tp": tp,
-                            "initial_sl": sl, "initial_risk": abs(entry - sl),
-                            "contracts": contracts, "initial_contracts": contracts,
-                            "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
-                            "opened_ts": now, "leg_ts": now, "regime": "adopted",
-                            "strategy": "adopted"})
-                    send(f"♻️ تم تبني مركز <code>{short(sym)}</code> ({side}) — SL {sl_pct * 100:.2f}% (ATR)")
+                adopt_position(ex, sym, exch[sym])
         save_state()
 
 def adopt_orphans(ex, active_symbols):
     with trade_lock:
         try:
-            exch = {}
-            for p in ex.fetch_positions():
-                c = abs(float(p.get('contracts') or 0))
-                if c > 0 and p.get('symbol') in active_symbols:
-                    exch[p['symbol']] = p
+            exch = _exchange_positions(ex, active_symbols)
         except Exception as e:
             log.warning(f"[ORPHAN] {e}")
             return
@@ -1772,39 +1905,10 @@ def adopt_orphans(ex, active_symbols):
                 st = state.get(sym) or new_sym_state()
             if st.get("position"):
                 continue
-            side = "LONG" if p.get('side') == 'long' else "SHORT"
-            entry = float(p.get('entryPrice') or 0)
-            contracts = abs(float(p.get('contracts')))
-            log.warning(f"[ORPHAN] {sym} {side} {contracts} @ {entry} بلا حالة في البوت")
+            log.warning(f"[ORPHAN] {sym} {p.get('side')} {p.get('contracts')} @ {p.get('entryPrice')} بلا حالة في البوت")
             if not ADOPT_ORPHANS:
                 continue
-            sl_pct = adopt_sl_pct(ex, sym)
-            if side == "LONG":
-                sl, tp = entry * (1 - sl_pct), entry * (1 + sl_pct * RR_RATIO)
-            else:
-                sl, tp = entry * (1 + sl_pct), entry * (1 - sl_pct * RR_RATIO)
-            cur = get_current_price(ex, sym)
-            if cur and ((side == "LONG" and cur <= sl) or (side == "SHORT" and cur >= sl)):
-                send(f"🚨 مركز يتيم <code>{short(sym)}</code> تجاوز الوقف المحسوب — إغلاق فوري")
-                close_full(ex, sym)
-                continue
-            close_side = 'sell' if side == "LONG" else 'buy'
-            cancel_pending(ex, sym)
-            if protect_position(ex, sym, close_side, contracts, sl, tp)[0]:
-                now = time.time()
-                with state_lock:
-                    state[sym] = new_sym_state()
-                    state[sym].update({
-                        "position": side, "entry": entry, "sl": sl, "tp": tp,
-                        "initial_sl": sl, "initial_risk": abs(entry - sl),
-                        "contracts": contracts, "initial_contracts": contracts,
-                        "margin": float(p.get('initialMargin') or POSITION_SIZE_USDT),
-                        "opened_ts": now, "leg_ts": now, "regime": "adopted", "strategy": "adopted"})
-                save_state()
-                send(f"♻️ تم تبنّي مركز يتيم <code>{short(sym)}</code> ({side}) — SL {sl_pct * 100:.2f}% (ATR)")
-            else:
-                send(f"🚨 مركز يتيم <code>{short(sym)}</code> وتعذر وضع الحماية — جاري الإغلاق")
-                close_full(ex, sym)
+            adopt_position(ex, sym, p, title="♻️ تم تبنّي مركز يتيم")
 
 # ==========================================
 # التقارير وأوامر تيليجرام
@@ -1949,7 +2053,7 @@ def risk_text(ex):
     opens = open_positions_snapshot()
     longs = sum(1 for v in opens.values() if v["position"] == "LONG")
     shorts = sum(1 for v in opens.values() if v["position"] == "SHORT")
-    loss_limit = equity * DAILY_LOSS_LIMIT_PCT / 100.0
+    loss_limit = day_base_equity(equity) * DAILY_LOSS_LIMIT_PCT / 100.0
     floating = floating_pnl_cached(ex)
     return "\n".join([
         "🛡️ <b>ملخص إدارة المخاطر</b>", "━━━━━━━━━━━━━━━",
@@ -2025,6 +2129,16 @@ def telegram_listener(active_symbols):
         log.error(f"[TG INIT] {e}")
         return
     offset = None
+    # تجاهل الأوامر المتراكمة أثناء توقف البوت (حتى لا يُنفَّذ /closeall قديم بعد إعادة التشغيل)
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                         params={"offset": -1, "timeout": 0}, timeout=15).json()
+        pending = r.get("result", [])
+        if pending:
+            offset = pending[-1]["update_id"] + 1
+            log.info("[TG] تم تجاهل الأوامر القديمة المتراكمة")
+    except Exception as e:
+        log.warning(f"[TG SKIP BACKLOG] {e}")
     while True:
         try:
             r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
@@ -2035,7 +2149,7 @@ def telegram_listener(active_symbols):
                 text, chat_id = msg.get("text", ""), str(msg.get("chat", {}).get("id", ""))
                 if chat_id not in AUTHORIZED_CHATS or not text.startswith("/"): continue
                 try: handle_command(ex2, text, chat_id, active_symbols)
-                except Exception as e: send(f"خطأ: {e}", chat_id)
+                except Exception as e: send(f"خطأ: {esc(e)}", chat_id)
         except Exception as e:
             log.warning(f"[TG POLL] {e}")
             time.sleep(5)
@@ -2046,9 +2160,15 @@ def watchdog():
         last = loop_info["last_cycle_ts"]
         if not last: continue
         age = time.time() - last
+        if WATCHDOG_RESTART and age > WATCHDOG_SEC * 3:
+            log.error(f"[WATCHDOG] الحلقة عالقة منذ {int(age)}ث — إعادة تشغيل")
+            send(f"♻️ <b>إعادة تشغيل تلقائية</b>: حلقة الفحص عالقة منذ {int(age)} ثانية.\n"
+                 f"الصفقات المفتوحة محمية بأوامر الوقف على المنصة.")
+            flush_send(10)
+            os._exit(1)
         if age > WATCHDOG_SEC and not loop_info["alerted"]:
             loop_info["alerted"] = True
-            send(f"🚨 <b>تحذير:</b> حلقة الفحص متوقفة منذ {int(age)} ثانية.\nآخر خطأ: {loop_info['last_error'] or '—'}")
+            send(f"🚨 <b>تحذير:</b> حلقة الفحص متوقفة منذ {int(age)} ثانية.\nآخر خطأ: {esc(loop_info['last_error'] or '—')}")
         elif age <= WATCHDOG_SEC and loop_info["alerted"]:
             loop_info["alerted"] = False
             send("✅ عادت حلقة الفحص للعمل.")
@@ -2114,10 +2234,14 @@ def trading_loop():
         migrate_journal()
         balance = get_equity(ex, force=True)
     except Exception as e:
-        send(f"❌ فشل الاتصال: {e}")
+        send(f"❌ فشل الاتصال: {esc(e)}")
         return
 
     active_symbols = discover_universe(ex)
+    with state_lock:
+        held_start = [s for s, st in state.items() if st.get("position") and s in ex.markets]
+    # الصفقات المحفوظة تبقى تحت الإدارة حتى لو خرجت العملة من قائمة الأعلى سيولة
+    active_symbols = list(dict.fromkeys(active_symbols + held_start))
     universe_refresh_ts = time.time()
     sync_positions(ex, active_symbols)
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
@@ -2127,6 +2251,8 @@ def trading_loop():
          f"⚙️ الوضع: {'Sandbox' if USE_SANDBOX else 'حقيقي'}\n🪙 العملات: {len(active_symbols)}\n"
          f"🎚️ البروفايل: {PROFILE_NAME} | KER: {'مفعّل' if ENABLE_KER_FILTER else 'معطّل'}")
     if PROFILE_WARNING: send(f"⚠️ {PROFILE_WARNING}")
+    if DATA_DIR == ".":
+        send("⚠️ <b>لا يوجد قرص دائم (/data)</b> — سجل الصفقات وحالة البوت قد تُمسح مع كل نشر جديد.")
 
     loop_info["last_cycle_ts"] = time.time()
     last_orphan_check = time.time()
@@ -2144,7 +2270,11 @@ def trading_loop():
                     universe_refresh_ts = time.time()
             refresh_prices(ex, active_symbols)
             if USE_BTC_FILTER: btc_bias(ex)
-            for sym in active_symbols:
+            with state_lock:
+                held_now = {s for s, st in state.items() if st.get("position")}
+            # إدارة الصفقات المفتوحة أولاً ثم البحث عن فرص جديدة
+            ordered = [s for s in active_symbols if s in held_now] + [s for s in active_symbols if s not in held_now]
+            for sym in ordered:
                 try:
                     process_symbol(ex, sym)
                 except Exception as e:
@@ -2194,5 +2324,7 @@ if __name__ == "__main__":
     if not acquire_single_instance():
         log.error("نسخة أخرى من البوت تعمل بالفعل — إيقاف.")
         sys.exit(1)
+    threading.Thread(target=_sender_worker, daemon=True).start()
     threading.Thread(target=run_flask, daemon=True).start()
     trading_loop()
+    flush_send(10)
