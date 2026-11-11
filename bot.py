@@ -1,17 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V48 (Crypto-only Universe + Execution Safety + KER Filter)
+OKX Futures Trading Bot - V48.2 (Crypto-only Universe + Execution Safety + KER Filter)
 
-الجديد عن V47:
-1) الماسح الديناميكي صار لعقود الكريبتو فقط: يعتمد instCategory من OKX (1 = كريبتو).
-2) تأكيد تنفيذ الدخول: لا تُعلن "تم فتح الصفقة" ولا تُوضع الحماية قبل ظهور المركز فعلاً.
-3) عدم إنهاء الصفقة بملاحظة واحدة "المركز غير موجود": تحقق متتالٍ مرتين.
-4) إذا تجاوز السعر الوقف ولم يُنفَّذ أمر الوقف → إغلاق فوري بدل محاولة وقف جديد سيُرفض.
-5) انتظار أطول لتأكيد الإغلاق وتقليل تكرار رسائل الإغلاق الطارئ.
-6) فحص دوري للمراكز اليتيمة على المنصة (بلا حالة في البوت): تنبيه وتبنٍّ بوقف ATR.
-7) قائمة العملات مشتركة مع خيط تيليجرام + أمر /universe.
-8) تسجيل درجة الفرصة في السجل و /stats حسب شريحة الدرجة.
-9) إضافة KER (Kaufman Efficiency Ratio) لفلترة التذبذب العالي.
+التعديلات عن V48.1:
+1) إصلاح حساب Kaufman Efficiency Ratio (KER) — كان الحساب خاطئاً.
+2) تحسين الإغلاق الجزئي: إغلاق الكمية المتبقية تلقائياً إذا أصبحت أقل من الحد الأدنى.
+3) تحسينات طفيفة في تبني المراكز اليتيمة.
 """
 import os
 import sys
@@ -35,7 +29,7 @@ log = logging.getLogger("bot")
 # ==========================================
 # الإعدادات
 # ==========================================
-VERSION = "V48.1 KER"
+VERSION = "V48.2 KER"
 KSA_TZ = timezone(timedelta(hours=3))
 
 def env_float(name, default):
@@ -695,10 +689,10 @@ def adx(high, low, close, p=14):
     return dx.ewm(alpha=1 / p, adjust=False).mean()
 
 def efficiency_ratio(close_series, period=10):
-    change = abs(close_series - close_series.shift(period))
-    volatility = abs(close_series - close_series.diff()).rolling(window=period).sum()
-    er = change / (volatility + 1e-9)
-    return er
+    """Kaufman Efficiency Ratio - corrected version"""
+    change = (close_series - close_series.shift(period)).abs()
+    volatility = close_series.diff().abs().rolling(window=period).sum()
+    return change / (volatility + 1e-9)
 
 def add_indicators(df):
     if len(df) < 60:
@@ -971,6 +965,7 @@ def open_position(ex, sym, side, price, sl, tp, margin):
     except Exception as e:
         log.error(f"[OPEN ERR] {sym}: {e}")
         return False, str(e)[:150], price, 0.0
+
 # ==========================================
 # الربح وإنهاء الصفقة
 # ==========================================
@@ -1420,16 +1415,26 @@ def do_partial(ex, sym, st, which):
     amt = float(ex.amount_to_precision(sym, raw_amt))
     mn = min_amount(ex, sym)
     remaining = contracts - amt
-    if amt < mn or remaining < mn:
+
+    # إذا أصبحت الكمية المتبقية أقل من الحد الأدنى → أغلق الكل
+    if remaining < mn:
+        log.info(f"[PARTIAL] {sym}: الكمية المتبقية صغيرة جداً ({remaining}) — إغلاق كامل")
+        if close_full(ex, sym):
+            finalize_trade(ex, sym, reason_hint="Manual")
+        return True
+
+    if amt < mn:
         with state_lock:
             state[sym][f"partial_{which}_taken"] = True
         save_state()
         return False
+
     try:
         ex.create_order(sym, 'market', close_side, amt, None, {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
     except Exception as e:
         log.error(f"[PARTIAL ORDER] {sym}: {e}")
         return False
+
     time.sleep(0.8)
     fill_ts = time.time()
     exit_price = get_current_price(ex, sym, 0) or entry
@@ -1438,6 +1443,7 @@ def do_partial(ex, sym, st, which):
     fee_est_leg = leg_fee_est(entry, exit_price, amt, cs_leg)
     new_sl = breakeven_price(side, entry) if which == 1 else st["sl"]
     protected = replace_protection(ex, sym, close_side, remaining, new_sl, st.get("tp"))
+
     with state_lock:
         s = state[sym]
         s["contracts"] = remaining
@@ -1450,6 +1456,7 @@ def do_partial(ex, sym, st, which):
             s["breakeven_hit"] = True
     add_daily_pnl(pnl)
     save_state()
+
     pct_txt = f"{int(PARTIAL1_PCT * 100)}% من الكمية" if which == 1 else f"{int(PARTIAL2_PCT * 100)}% من المتبقي"
     extra = "نقل الوقف للتعادل" if (which == 1 and protected) else "قفل أرباح إضافية"
     warn = "" if protected else "\n⚠️ تعذر تحديث الحماية."
