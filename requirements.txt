@@ -1,7 +1,5 @@
-ccxt
-pandas
-numpy
-requests
-Flask
-pillow
-websockets
+ccxt>=4.5,<5
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+Flask>=3.0
