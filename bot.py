@@ -1375,9 +1375,9 @@ def get_exit_price(ex, sym, pos_data):
 
 def detect_reason(pos_data, exit_price):
     side, entry, sl, tp = pos_data["position"], pos_data["entry"], pos_data["sl"], pos_data["tp"]
-    if tp and abs(exit_price - tp) / max(tp, 1e-9) < 0.0035:
+    if tp and abs(exit_price - tp) / max(tp, 1e-9) < 0.005: # زيادة التسامح للهدف
         return "Take Profit"
-    if sl and abs(exit_price - sl) / max(sl, 1e-9) < 0.0035:
+    if sl and abs(exit_price - sl) / max(sl, 1e-9) < 0.015: # زيادة التسامح للوقف (1.5%)
         if pos_data.get("breakeven_hit"):
             profitable = (sl > entry * 1.0015) if side == "LONG" else (sl < entry * 0.9985)
             return "Trailing Stop" if profitable else "Breakeven Hit"
