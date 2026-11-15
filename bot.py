@@ -788,15 +788,28 @@ def backup_to_telegram(chat_id=None):
     targets = [chat_id] if chat_id else list(AUTHORIZED_CHATS)
     for cid in targets:
         for filepath in [JOURNAL_FILE, STATE_FILE, PAPER_FILE]:
+            file_name = os.path.basename(filepath)
             if os.path.exists(filepath):
                 try:
-                    with open(filepath, 'rb') as f:
-                        requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                            data={"chat_id": cid, "caption": f"🔒 {os.path.basename(filepath)}"},
-                            files={"document": f}, timeout=20)
+                    # استخدام القفل لمنع تعارض القراءة/الكتابة
+                    with journal_lock:
+                        with open(filepath, 'rb') as f:
+                            file_data = f.read()
+                    
+                    r = requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                        data={"chat_id": cid, "caption": f"🔒 {file_name}"},
+                        files={"document": (file_name, file_data)},
+                        timeout=30
+                    )
+                    if not r.ok:
+                        log.error(f"[BACKUP] TG Response: {r.text}")
                 except Exception as e:
-                    log.error(f"[BACKUP] {filepath}: {e}")
+                    log.error(f"[BACKUP] فشل إرسال {filepath}: {e}")
+                    send(f"❌ فشل إرسال {file_name}: {e}", cid)
+            else:
+                # إرسال تنبيه إذا كان الملف غير موجود (كما في حالة trades_journal حالياً)
+                send(f"⚠️ الملف <code>{file_name}</code> غير موجود في السيرفر (لم يتم إغلاق صفقات جديدة بعد آخر تحديث).", cid)
 
 
 def handle_document_restore(msg, chat_id):
