@@ -37,7 +37,34 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
 
-VERSION = "V51"
+VERSION = "V52_AI"
+
+# ---------------- بداية إعداد الـ AI ----------------
+import joblib
+import urllib.request
+AI_MODEL_URL = "https://github.com/ahmadhaqawi/haqwibot/releases/download/v1.0/ai_model_mega_v4.pkl"
+
+AI_IS_ACTIVE = False
+ai_model = None
+le_regime = None
+le_strategy = None
+le_side = None
+
+try:
+    if not os.path.exists('ai_model_mega_v4.pkl'):
+        log.info("⏳ [AI] جاري تنزيل ملف العقل (59MB) من GitHub...")
+        urllib.request.urlretrieve(AI_MODEL_URL, 'ai_model_mega_v4.pkl')
+        log.info("✅ [AI] تم تنزيل ملف العقل بنجاح!")
+        
+    ai_model = joblib.load('ai_model_mega_v4.pkl')
+    le_regime = joblib.load('le_regime_mega_v4.pkl')
+    le_strategy = joblib.load('le_strategy_mega_v4.pkl')
+    le_side = joblib.load('le_side_mega_v4.pkl')
+    AI_IS_ACTIVE = True
+    log.info("🧠 [AI] تم تحميل نموذج الذكاء الاصطناعي بنجاح!")
+except Exception as e:
+    log.warning(f"⚠️ [AI] فشل تحميل الـ AI. السبب: {e}")
+# ---------------- نهاية إعداد الـ AI ----------------
 KSA_TZ = timezone(timedelta(hours=3))
 
 
@@ -1109,22 +1136,21 @@ def compute_margin(equity, sl_pct):
     return sized if sized >= MIN_MARGIN_USDT else 0.0
 
 
-def compute_margin_scored(equity, sl_pct, signal_score):
-    """الجديد في V51: حجم الصفقة يتناسب مع جودة الفرصة.
-    يسمح بصفقات أكثر بحجم أصغر للفرص المتوسطة، وحجم كامل للممتازة."""
+def compute_margin_scored(equity, sl_pct, signal_score, ai_prob=0.5):
     base = compute_margin(equity, sl_pct)
-    if base <= 0:
-        return 0.0
-    if signal_score >= 86:
-        mult = 1.00
-    elif signal_score >= 78:
-        mult = 0.85
-    elif signal_score >= 70:
-        mult = 0.70
-    elif signal_score >= 62:
-        mult = 0.55
+    if base <= 0: return 0.0
+    
+    if AI_IS_ACTIVE and ai_prob is not None:
+        if ai_prob >= 0.70: mult = 1.00
+        elif ai_prob >= 0.60: mult = 0.85
+        elif ai_prob >= 0.50: mult = 0.60
+        else: mult = 0.30
     else:
-        mult = 0.40
+        if signal_score >= 86: mult = 1.00
+        elif signal_score >= 78: mult = 0.85
+        elif signal_score >= 70: mult = 0.70
+        elif signal_score >= 62: mult = 0.55
+        else: mult = 0.40
     return base * mult
 
 
@@ -2187,9 +2213,37 @@ def process_symbol(ex, sym):
             else:
                 sl = actual_price * (1 + sl_pct)
                 tp = actual_price * (1 - sl_pct * RR_RATIO)
-
+            # --- فلتر الـ AI ---
+            if AI_IS_ACTIVE:
+                try:
+                    factors = signal.get("score_factors", {})
+                    features = [
+                        signal.get("score", 0), factors.get("trend", 0), factors.get("volume", 0),
+                        factors.get("adx", 0), factors.get("momentum", 0), factors.get("candle", 0),
+                        factors.get("setup", 0), factors.get("entry_quality", 0),
+                        signal.get("volume_ratio", 0), signal.get("ker", 0),
+                        le_regime.transform([signal.get("regime", "unknown")])[0],
+                        le_strategy.transform([signal.get("strategy", "pullback")])[0],
+                        le_side.transform([signal.get("side", "LONG")])[0]
+                    ]
+                    ai_prob = float(ai_model.predict_proba([features])[0][1])
+                    signal["ai_probability"] = ai_prob
+                    log.info(f"[AI] توقع نجاح {sym}: {ai_prob*100:.1f}%")
+                    
+                    if ai_prob < 0.50:
+                        note_block(sym, "ai_rejected")
+                        log_paper_signal(sym, signal, "ai_rejected")
+                        return
+                except Exception as e:
+                    log.warning(f"[AI ERROR] {e}")
+                    ai_prob = 0.5
+            else:
+                ai_prob = 0.5
+            # -------------------
+            
             equity_now = get_equity(ex)
-            margin = compute_margin_scored(equity_now, sl_pct, signal.get("score", 0))
+            margin = compute_margin_scored(equity_now, sl_pct, signal.get("score", 0), ai_prob)
+
             if margin <= 0:
                 log.info(f"[SKIP] {sym}: الهامش غير صالح")
                 note_block(sym, "margin_too_small")
