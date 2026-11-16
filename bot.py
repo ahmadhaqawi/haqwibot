@@ -446,26 +446,19 @@ def load_state():
     global state, daily_pnl
     if not os.path.exists(STATE_FILE):
         return
-    import urllib.request
-import os
-
-# الرابط الخاص بك
-AI_MODEL_URL = "https://github.com/ahmadhaqawi/haqwibot/releases/download/v1.0/ai_model_mega_v4.pkl"
-
-try:
-    if not os.path.exists('ai_model_mega_v4.pkl'):
-        log.info("⏳ [AI] جاري تنزيل ملف العقل (59MB) من GitHub...")
-        urllib.request.urlretrieve(AI_MODEL_URL, 'ai_model_mega_v4.pkl')
-        log.info("✅ [AI] تم تنزيل ملف العقل بنجاح!")
-
-    ai_model = joblib.load('ai_model_mega_v4.pkl')
-    le_regime = joblib.load('le_regime_mega_v4.pkl')
-    le_strategy = joblib.load('le_strategy_mega_v4.pkl')
-    le_side = joblib.load('le_side_mega_v4.pkl')
-    AI_IS_ACTIVE = True
-    log.info("🧠 [AI] تم تحميل نموذج الذكاء الاصطناعي بنجاح!")
-except Exception as e:
-    log.warning(f"⚠️ [AI] لم يتم العثور على ملفات الـ AI. البوت سيعمل بالوضع التقليدي. السبب: {e}")
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        loaded = {}
+        for k, v in data.get("state", {}).items():
+            base = new_sym_state()
+            base.update(v)
+            loaded[k.split("|")[0]] = base
+        with state_lock:
+            state = loaded
+            daily_pnl = data.get("daily_pnl", daily_pnl)
+            meta.update(data.get("meta", {}))
+    except Exception as e:
         log.error(f"[STATE LOAD ERROR] {e}")
 
 
