@@ -181,7 +181,8 @@ AI_GATEWAY_URL = os.getenv("AI_GATEWAY_URL", "https://api.openai.com/v1/chat/com
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 BACKUP_INTERVAL_SEC = int(env_float("BACKUP_INTERVAL_SEC", 6 * 3600))
-
+AI_MIN_PROB = env_float("AI_MIN_PROB", 0.50)   # جرّب 0.40 للاختبار في Sandbox
+VERBOSE_REJECT_LOG = env_flag("VERBOSE_REJECT_LOG", True)
 # ---------- Paper Mode ----------
 ENABLE_PAPER_LOG = env_flag("ENABLE_PAPER_LOG", True)
 
@@ -348,7 +349,7 @@ REASON_LABELS = {
     "bo_extended": "السعر بعيد عن EMA21 (مطاردة)",
     "bo_disabled": "الاختراق معطّل",
     "score_low": "درجة الفرصة أقل من الحد المطلوب",
-}
+    "ai_rejected": "رفض الذكاء الاصطناعي (احتمال منخفض)",
 
 
 def label(r):
@@ -388,6 +389,8 @@ def note_eval(sym, signal, reasons):
                     diag[key][r] = diag[key].get(r, 0) + 1
                     parts.append(f"{STRAT_LABEL[strat]}: {label(r)}")
             text = " | ".join(parts)
+        if VERBOSE_REJECT_LOG:
+            log.info(f"[REJECT] {short(sym)} → {text}")
         _last_reason[sym] = (time.time(), text)
 
 
