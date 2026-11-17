@@ -4,4 +4,4 @@ numpy>=1.26
 requests>=2.31
 Flask>=3.0
 joblib
-scikit-learn
+scikit-learn==1.6.1
