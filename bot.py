@@ -181,8 +181,11 @@ AI_GATEWAY_URL = os.getenv("AI_GATEWAY_URL", "https://api.openai.com/v1/chat/com
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 BACKUP_INTERVAL_SEC = int(env_float("BACKUP_INTERVAL_SEC", 6 * 3600))
-AI_MIN_PROB = env_float("AI_MIN_PROB", 0.50)   # جرّب 0.40 للاختبار في Sandbox
+AI_MIN_PROB = env_float("AI_MIN_PROB", 0.50)
+AI_MIN_PROB_LONG = env_float("AI_MIN_PROB_LONG", AI_MIN_PROB)
+AI_MIN_PROB_SHORT = env_float("AI_MIN_PROB_SHORT", AI_MIN_PROB)
 VERBOSE_REJECT_LOG = env_flag("VERBOSE_REJECT_LOG", True)
+
 # ---------- Paper Mode ----------
 ENABLE_PAPER_LOG = env_flag("ENABLE_PAPER_LOG", True)
 
@@ -2233,9 +2236,12 @@ def process_symbol(ex, sym):
                     signal["ai_probability"] = ai_prob
                     log.info(f"[AI] توقع نجاح {sym}: {ai_prob*100:.1f}%")
                     
-                    if ai_prob < 0.50:
+                    thr = AI_MIN_PROB_LONG if side == "LONG" else AI_MIN_PROB_SHORT
+                    log.info(f"[AI] {short(sym)} {side} score={signal.get('score')} "
+                             f"احتمال={ai_prob*100:.1f}% (الحد {thr*100:.0f}%)")
+                    if ai_prob < thr:
                         note_block(sym, "ai_rejected")
-                        log_paper_signal(sym, signal, "ai_rejected")
+                        log_paper_signal(sym, signal, f"ai_rejected_{ai_prob:.2f}")
                         return
                 except Exception as e:
                     log.warning(f"[AI ERROR] {e}")
