@@ -353,7 +353,7 @@ REASON_LABELS = {
     "bo_disabled": "الاختراق معطّل",
     "score_low": "درجة الفرصة أقل من الحد المطلوب",
     "ai_rejected": "رفض الذكاء الاصطناعي (احتمال منخفض)",
-
+}
 
 def label(r):
     if r.startswith("signal:"):
