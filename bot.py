@@ -235,9 +235,37 @@ if not USE_SANDBOX and PROFILE_NAME == "active":
     PROFILE_WARNING = "البروفايل active ممنوع على الحقيقي — استُخدم opportunist"
     PROFILE_NAME = "opportunist"
 
+SNIPER = {
+    "label": "قناص",
+    "tfs": ("5m", "15m", "1h"),
+    "leverage": int(env_float("SNIPER_LEVERAGE", 5)),
+    "risk_pct": env_float("SNIPER_RISK_PCT", 0.32),
+    "min_score": int(env_float("SNIPER_MIN_SCORE", 83)),
+    "atr_sl_mult": 1.18,
+    "rr": 1.85,
+    "min_sl": 0.0048,
+    "max_sl": 0.0145,
+    "trail_atr": 0.68,
+    "be_r": 0.48,
+    "p1_r": 0.80,
+    "p1_pct": 0.55,
+    "p2_r": 1.40,
+    "p2_pct": 0.45,
+    "max_hold_minutes": int(env_float("SNIPER_MAX_HOLD_MIN", 75)),
+    "cooldown": 420,
+    "max_open": 2,
+    "max_entry_slip": 0.0018,
+    "max_signal_age_sec": 110,
+    "min_ker": 0.29,
+    "min_vol_mult": 1.40,
+    "near_ema_pct": 0.0085,
+}
 
 def _cfg(key):
     return env_float(key.upper(), PROFILES[PROFILE_NAME][key])
+
+
+
 
 
 MIN_ATR_PCT = _cfg("min_atr_pct")
@@ -411,6 +439,75 @@ def note_opened():
 
 
 def set_last_reason(sym, reason):
+    with diag_lock:
+        _last_reason[sym] = (time.time(), reason)
+
+def sniper_filters_ok(df_entry, current_price, signal_price, ker, vol_ratio):
+    """فلاتر صارمة خاصة بوضع القناص"""
+    if ker is None or ker < SNIPER["min_ker"]:
+        return False, "low_ker_sniper"
+
+    if vol_ratio < SNIPER["min_vol_mult"]:
+        return False, "low_volume_sniper"
+
+    try:
+        ema21 = float(df_entry["ema21"].iloc[-2])
+        dist = abs(current_price - ema21) / current_price
+        if dist > SNIPER["near_ema_pct"]:
+            return False, "far_from_ema_sniper"
+    except Exception:
+        return False, "ema_error_sniper"
+
+    slip = abs(current_price - signal_price) / signal_price
+    if slip > SNIPER["max_entry_slip"]:
+        return False, "slippage_sniper"
+
+    return True, ""
+
+def get_trade_params(mode="swing"):
+    """يرجع إعدادات الصفقة حسب الوضع"""
+    if mode == "sniper":
+        return {
+            "partial1_r": SNIPER["p1_r"],
+            "partial1_pct": SNIPER["p1_pct"],
+            "partial2_r": SNIPER["p2_r"],
+            "partial2_pct": SNIPER["p2_pct"],
+            "trail_atr": SNIPER["trail_atr"],
+            "be_r": SNIPER["be_r"],
+            "max_hold_sec": SNIPER["max_hold_minutes"] * 60,
+            "atr_sl_mult": SNIPER["atr_sl_mult"],
+            "rr": SNIPER["rr"],
+            "min_sl": SNIPER["min_sl"],
+            "max_sl": SNIPER["max_sl"],
+        }
+    else:
+        return {
+            "partial1_r": PARTIAL1_R,
+            "partial1_pct": PARTIAL1_PCT,
+            "partial2_r": PARTIAL2_R,
+            "partial2_pct": PARTIAL2_PCT,
+            "trail_atr": TRAIL_ATR_MULT,
+            "be_r": BE_TRIGGER_R,
+            "max_hold_sec": 36 * 3600,
+            "atr_sl_mult": ATR_SL_MULT,
+            "rr": RR_RATIO,
+            "min_sl": MIN_SL_PCT,
+            "max_sl": MAX_SL_PCT,
+        }
+    else:
+        return {
+            "partial1_r": PARTIAL1_R,
+            "partial1_pct": PARTIAL1_PCT,
+            "partial2_r": PARTIAL2_R,
+            "partial2_pct": PARTIAL2_PCT,
+            "trail_atr": TRAIL_ATR_MULT,
+            "be_r": BE_TRIGGER_R,
+            "max_hold_sec": 36 * 3600,
+            "atr_sl_mult": ATR_SL_MULT,
+            "rr": RR_RATIO,
+            "min_sl": MIN_SL_PCT,
+            "max_sl": MAX_SL_PCT,
+        }
     with diag_lock:
         _last_reason[sym] = (time.time(), reason)
 
