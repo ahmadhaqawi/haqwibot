@@ -2409,7 +2409,9 @@ def process_symbol(ex, sym):
                     thr = AI_MIN_PROB_LONG if side == "LONG" else AI_MIN_PROB_SHORT
                     log.info(f"[AI] {short(sym)} {side} score={signal.get('score')} "
                              f"احتمال={ai_prob*100:.1f}% (الحد {thr*100:.0f}%)")
-                    if ai_prob < thr:
+                    if mode == "sniper":
+                        log.info(f"[AI SNIPER] {short(sym)} مستثنى من حجب الـ AI")
+                    elif ai_prob < thr:
                         note_block(sym, "ai_rejected")
                         log_paper_signal(sym, signal, f"ai_rejected_{ai_prob:.2f}")
                         return
@@ -2421,7 +2423,7 @@ def process_symbol(ex, sym):
             # -------------------
             
             equity_now = get_equity(ex)
-            margin = compute_margin_scored(equity_now, sl_pct, signal.get("score", 0), ai_prob)
+            margin = compute_margin_scored(equity_now, sl_pct, signal.get("score", 0), None if mode == "sniper" else ai_prob)
 
             if margin <= 0:
                 log.info(f"[SKIP] {sym}: الهامش غير صالح")
