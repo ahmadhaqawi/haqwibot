@@ -555,7 +555,7 @@ def new_sym_state():
         "partial_1_taken": False, "partial_2_taken": False,
         "last_notified_sl": None, "regime": "unknown", "strategy": "",
         "planned_entry": None, "realized_fees_est": 0.0, "missing_checks": 0,
-        "signal_score": 0, "score_factors": {}, "volume_ratio": 0, "ker": None,
+        "signal_score": 0, "score_factors": {}, "volume_ratio": 0, "ker": None, "mode": "swing",
     }
 
 
@@ -1004,6 +1004,7 @@ REASONS = {
     "Manual": "إغلاق يدوي 🖐️",
     "Emergency": "إغلاق طارئ 🚨",
     "Manual/External": "إغلاق من المنصة ⚡",
+    "Time Exit": "انتهاء مدة القناص ⏱️",
 }
 
 
@@ -2058,8 +2059,11 @@ def do_partial(ex, sym, st, which):
     side = st["position"]
     entry = st["entry"]
     close_side = 'sell' if side == "LONG" else 'buy'
+    params = get_trade_params(st.get("mode", "swing"))
+    p1_pct = params["partial1_pct"]
+    p2_pct = params["partial2_pct"]
     contracts = st["contracts"]
-    raw_amt = st["initial_contracts"] * PARTIAL1_PCT if which == 1 else contracts * PARTIAL2_PCT
+    raw_amt = st["initial_contracts"] * p1_pct if which == 1 else contracts * p2_pct
     amt = float(ex.amount_to_precision(sym, raw_amt))
     mn = min_amount(ex, sym)
     remaining = contracts - amt
@@ -2111,7 +2115,7 @@ def do_partial(ex, sym, st, which):
             s["breakeven_hit"] = True
     add_daily_pnl(pnl)
     save_state()
-    pct_txt = f"{int(PARTIAL1_PCT * 100)}% من الكمية" if which == 1 else f"{int(PARTIAL2_PCT * 100)}% من المتبقي"
+    pct_txt = f"{int(p1_pct * 100)}% من الكمية" if which == 1 else f"{int(p2_pct * 100)}% من المتبقي"
     extra = "نقل الوقف للتعادل" if (which == 1 and protected) else "قفل أرباح إضافية"
     warn = "" if protected else "\n⚠️ تعذر تحديث الحماية."
     send(f"💰 <b>إغلاق جزئي {which} ({pct_txt})</b> — <code>{short(sym)}</code>\n"
@@ -2143,30 +2147,40 @@ def manage_position(ex, sym, st):
             emergency_close(ex, sym, "الصفقة بدون وقف خسارة")
             return
 
+    mode = st.get("mode", "swing")
+    params = get_trade_params(mode)
+
+    if mode == "sniper" and st.get("opened_ts") and (time.time() - st["opened_ts"]) >= params["max_hold_sec"]:
+        log.info(f"[SNIPER TIME EXIT] {sym}: تجاوز {SNIPER['max_hold_minutes']} دقيقة")
+        if close_full(ex, sym):
+            finalize_trade(ex, sym, reason_hint="Time Exit")
+        return
+
     risk = st.get("initial_risk") or abs(entry - (st.get("initial_sl") or st["sl"]))
     if risk <= 0:
         return
     r_now = (price - entry) * d / risk
 
-    if not st.get("partial_1_taken") and r_now >= PARTIAL1_R:
+    if not st.get("partial_1_taken") and r_now >= params["partial1_r"]:
         if do_partial(ex, sym, st, 1):
             return
-    elif st.get("partial_1_taken") and not st.get("partial_2_taken") and r_now >= PARTIAL2_R:
+    elif st.get("partial_1_taken") and not st.get("partial_2_taken") and r_now >= params["partial2_r"]:
         if do_partial(ex, sym, st, 2):
             return
 
     if not st.get("breakeven_hit"):
-        if r_now >= BE_TRIGGER_R:
+        if r_now >= params["be_r"]:
             move_sl(ex, sym, st, breakeven_price(side, entry), "🛡️ تأمين الصفقة (Breakeven)")
         return
 
-    raw = fetch_data(ex, sym, "15m")
+    trail_tf = "5m" if mode == "sniper" else "15m"
+    raw = fetch_data(ex, sym, trail_tf)
     if len(raw) < 50:
         return
     atr_val = to_df(raw).iloc[-2].get("atr")
     if atr_val is None or pd.isna(atr_val):
         return
-    mult = TRAIL_ATR_MULT
+    mult = params["trail_atr"]
     if st.get("partial_2_taken"):
         mult *= 0.82
     elif st.get("partial_1_taken"):
@@ -2305,10 +2319,15 @@ def process_symbol(ex, sym):
                         )
 
                         if ok_sniper:
-                            signal = signal_s
-                            reasons = reasons_s
-                            mode = "sniper"
-                            log.info(f"[SNIPER] {sym} {signal['side']} score={signal.get('score')} ✓")
+                            with state_lock:
+                                sniper_open = sum(1 for v in state.values() if v.get("position") and v.get("mode") == "sniper")
+                            if sniper_open >= SNIPER["max_open"]:
+                                log.info(f"[SNIPER REJECT] {sym} → max_open ({sniper_open}/{SNIPER['max_open']})")
+                            else:
+                                signal = signal_s
+                                reasons = reasons_s
+                                mode = "sniper"
+                                log.info(f"[SNIPER] {sym} {signal['side']} score={signal.get('score')} ✓")
                         else:
                             log.info(f"[SNIPER REJECT] {sym} → {reason_sniper}")
                 except Exception as e:
@@ -2361,8 +2380,9 @@ def process_symbol(ex, sym):
                 log_paper_signal(sym, signal, "slippage")
                 return
 
-            sl_pct = signal["sl_pct"]
-            tp_rr = SNIPER["rr"] if mode == "sniper" else RR_RATIO
+            t_params = get_trade_params(mode)
+            sl_pct = max(t_params["min_sl"], min(t_params["max_sl"], signal["sl_pct"]))
+            tp_rr = t_params["rr"]
             if side == "LONG":
                 sl = actual_price * (1 - sl_pct)
                 tp = actual_price * (1 + sl_pct * tp_rr)
@@ -2425,6 +2445,7 @@ def process_symbol(ex, sym):
                         "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False,
                         "regime": signal.get("regime", ""),
                         "strategy": signal.get("strategy", ""),
+                        "mode": mode,
                         "signal_score": signal.get("score", 0),
                         "score_factors": signal.get("score_factors", {}),
                         "volume_ratio": signal.get("volume_ratio", 0),
@@ -2715,6 +2736,7 @@ def config_text():
         f"المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة {LEVERAGE}x | سقف الهامش {MAX_MARGIN_USDT:.0f}",
         f"حد الدرجة: {MIN_SIGNAL_SCORE}/100 | عملات: {UNIVERSE_MODE} (حتى {MAX_UNIVERSE_SYMBOLS})",
         f"أقصى صفقات: {MAX_OPEN_POSITIONS} | نفس الاتجاه: {MAX_SAME_DIRECTION}",
+        f"القناص: {'مفعّل' if ENABLE_SNIPER else 'معطّل'} | حد الدرجة {SNIPER['min_score']} | أقصى مدة {SNIPER['max_hold_minutes']}د | أقصى صفقات {SNIPER['max_open']}",
         "━━━━━━━━━━━━━━━",
         "للتعديل: متغيرات البيئة في Render ثم Redeploy."])
 
