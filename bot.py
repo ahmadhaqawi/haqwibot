@@ -494,20 +494,7 @@ def get_trade_params(mode="swing"):
             "min_sl": MIN_SL_PCT,
             "max_sl": MAX_SL_PCT,
         }
-    else:
-        return {
-            "partial1_r": PARTIAL1_R,
-            "partial1_pct": PARTIAL1_PCT,
-            "partial2_r": PARTIAL2_R,
-            "partial2_pct": PARTIAL2_PCT,
-            "trail_atr": TRAIL_ATR_MULT,
-            "be_r": BE_TRIGGER_R,
-            "max_hold_sec": 36 * 3600,
-            "atr_sl_mult": ATR_SL_MULT,
-            "rr": RR_RATIO,
-            "min_sl": MIN_SL_PCT,
-            "max_sl": MAX_SL_PCT,
-        }
+
     with diag_lock:
         _last_reason[sym] = (time.time(), reason)
 
