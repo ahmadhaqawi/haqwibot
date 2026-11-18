@@ -2279,60 +2279,46 @@ def process_symbol(ex, sym):
             if len(raw_1h) < 60 or len(raw_4h) < 60:
                 set_last_reason(sym, "no_data")
                 return
-            _last_eval[sym] = closed_ts
+_last_eval[sym] = closed_ts
 
-            signal, reasons = evaluate_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
-            note_eval(sym, signal, reasons)
-            if not signal:
-                # Paper logging لـ score_low
-                if reasons.get("common") == "score_low":
-                    ctx, _ = build_context(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
-                    if ctx:
-                        cand = []
-                        sp, _ = pullback_signal(ctx)
-                        if sp:
-                            cand.append(sp)
-                        if ENABLE_BREAKOUT:
-                            sb, _ = breakout_signal(ctx, to_df(raw_15m))
-                            if sb:
-                                cand.append(sb)
-                        for c in cand:
-                            score_signal(c, ctx, to_df(raw_15m))
-                        if cand:
-                            best = max(cand, key=lambda x: x.get("score", 0))
-                            log_paper_signal(sym, best, "score_low")
-                return
+# ===================== محاولة القناص أولاً =====================
+signal = None
+reasons = {}
+mode = "swing"
 
-            side = signal["side"]
-            log.info(f"[SIGNAL] {sym} {side} score={signal.get('score', 0)} strategy={signal['strategy']} regime={signal['regime']}")
+if ENABLE_SNIPER and len(raw_5m) >= 70:
+    try:
+        df_5m = to_df(raw_5m)
+        df_15m = to_df(raw_15m)
+        df_1h = to_df(raw_1h)
 
-            with state_lock:
-                same_dir = sum(1 for v in state.values() if v.get("position") == side)
-            if same_dir >= MAX_SAME_DIRECTION:
-                note_block(sym, "max_same_direction")
-                log_paper_signal(sym, signal, "max_same_direction")
-                return
-            if sector_limit_reached(sym, side):
-                note_block(sym, "sector_limit")
-                log_paper_signal(sym, signal, "sector_limit")
-                return
-            if USE_BTC_FILTER and not sym.startswith("BTC/"):
-                bias = btc_bias(ex)
-                if (side == "LONG" and bias == "down") or (side == "SHORT" and bias == "up"):
-                    note_block(sym, "btc_filter")
-                    log_paper_signal(sym, signal, "btc_filter")
-                    return
-            ok, code = market_filters_ok(ex, sym, side)
-            if not ok:
-                note_block(sym, code)
-                log_paper_signal(sym, signal, code)
-                return
+        signal_s, reasons_s = evaluate_signal(df_5m, df_15m, df_1h)
 
-            actual_price = get_current_price(ex, sym, 0) or signal["price"]
-            sl_pct_signal = signal["sl_pct"]
-            max_slip = max(MAX_ENTRY_SLIPPAGE_PCT, 0.18 * sl_pct_signal)
-            if abs(actual_price - signal["price"]) / signal["price"] > max_slip:
-                note_block(sym, "slippage")
+        if signal_s and signal_s.get("score", 0) >= SNIPER["min_score"]:
+            current_price = get_current_price(ex, sym) or signal_s["price"]
+            ker = signal_s.get("ker")
+            vol_ratio = signal_s.get("volume_ratio", 0)
+
+            ok_sniper, reason_sniper = sniper_filters_ok(
+                df_5m, current_price, signal_s["price"], ker, vol_ratio
+            )
+
+            if ok_sniper:
+                signal = signal_s
+                reasons = reasons_s
+                mode = "sniper"
+                log.info(f"[SNIPER] {sym} {signal['side']} score={signal.get('score')} ✓")
+            else:
+                log.info(f"[SNIPER REJECT] {sym} → {reason_sniper}")
+    except Exception as e:
+        log.warning(f"[SNIPER ERROR] {sym}: {e}")
+
+# إذا ما نجح القناص → نستخدم النظام العادي
+if signal is None and not SNIPER_ONLY:
+    signal, reasons = evaluate_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
+    mode = "swing"
+
+note_eval(sym, signal, reasons)
                 log_paper_signal(sym, signal, "slippage")
                 return
 
