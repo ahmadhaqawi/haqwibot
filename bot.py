@@ -1629,7 +1629,37 @@ def kaufman_efficiency_ratio(close, period=10):
         return net / noise if noise > 0 else 1.0
     except Exception:
         return None
-
+def calculate_range_filter(df, period=100, mult=3.0):
+    try:
+        src = df['close']
+        wper = period * 2 - 1
+        avrng = (src - src.shift(1)).abs().ewm(span=period, adjust=False).mean()
+        smrng = avrng.ewm(span=wper, adjust=False).mean() * mult
+        
+        filt = pd.Series(index=df.index, dtype=float)
+        filt.iloc[0] = src.iloc[0]
+        
+        for i in range(1, len(df)):
+            prev_filt = filt.iloc[i-1]
+            curr_src = src.iloc[i]
+            curr_r = smrng.iloc[i]
+            
+            if curr_src > prev_filt:
+                filt.iloc[i] = max(prev_filt, curr_src - curr_r)
+            else:
+                filt.iloc[i] = min(prev_filt, curr_src + curr_r)
+                
+        upward = (filt > filt.shift(1)).astype(int)
+        downward = (filt < filt.shift(1)).astype(int)
+        
+        last_idx = -2
+        if upward.iloc[last_idx] > 0 or (src.iloc[last_idx] > filt.iloc[last_idx] and src.iloc[last_idx] > src.iloc[last_idx-1]):
+            return 1
+        elif downward.iloc[last_idx] > 0 or (src.iloc[last_idx] < filt.iloc[last_idx] and src.iloc[last_idx] < src.iloc[last_idx-1]):
+            return -1
+        return 0
+    except Exception:
+        return 0
 
 def build_context(df_15m, df_1h, df_4h):
     """الشروط العامة المشتركة. KER متكيف في V51 (median + regime-aware)."""
@@ -1677,8 +1707,18 @@ def build_context(df_15m, df_1h, df_4h):
         v = er_series.iloc[-2] if len(er_series) >= 2 else None
         ker_value = float(v) if (v is not None and not pd.isna(v)) else None
 
+        # --- فلتر Range Filter الجديد ---
+    rf_direction = calculate_range_filter(df_15m)
+    
     long_dir = regime in ("strong_trend_up", "weak_trend") and last_4h["close"] > last_4h["ema50"]
     short_dir = regime in ("strong_trend_down", "weak_trend") and last_4h["close"] < last_4h["ema50"]
+    
+    # Range Filter يفرض رأيه!
+    if rf_direction == -1:
+        long_dir = False # يمنع اللونق
+    if rf_direction == 1:
+        short_dir = False # يمنع الشورت
+        
     if not long_dir and not short_dir:
         return None, "direction_mismatch"
 
