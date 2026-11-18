@@ -1710,7 +1710,7 @@ def build_context(df_15m, df_1h, df_4h):
         # --- فلتر Range Filter الجديد ---
     rf_direction = calculate_range_filter(df_15m)
     
-    long_dir = regime in ("strong_trend_up", "weak_trend") and last_4h["close"] > last_4h["ema50"]
+    long_dir = regime in ("strong_trend_up", "weak_trend")
     short_dir = regime in ("strong_trend_down", "weak_trend") and last_4h["close"] < last_4h["ema50"]
     
     # Range Filter يفرض رأيه!
