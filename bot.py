@@ -235,6 +235,9 @@ if not USE_SANDBOX and PROFILE_NAME == "active":
     PROFILE_WARNING = "البروفايل active ممنوع على الحقيقي — استُخدم opportunist"
     PROFILE_NAME = "opportunist"
 
+ENABLE_SNIPER = env_flag("ENABLE_SNIPER", True)
+SNIPER_ONLY = env_flag("SNIPER_ONLY", False)
+
 SNIPER = {
     "label": "قناص",
     "tfs": ("5m", "15m", "1h"),
@@ -298,7 +301,7 @@ BO_RSI_SHORT_MAX = env_float("BO_RSI_SHORT_MAX", 48)
 ENABLE_KER_FILTER = env_flag("ENABLE_KER_FILTER", True)
 
 WATCHDOG_SEC = 300
-TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
+TF_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 
 DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
@@ -494,9 +497,6 @@ def get_trade_params(mode="swing"):
             "min_sl": MIN_SL_PCT,
             "max_sl": MAX_SL_PCT,
         }
-
-    with diag_lock:
-        _last_reason[sym] = (time.time(), reason)
 
 
 # ==========================================
@@ -2279,56 +2279,96 @@ def process_symbol(ex, sym):
             if len(raw_1h) < 60 or len(raw_4h) < 60:
                 set_last_reason(sym, "no_data")
                 return
-_last_eval[sym] = closed_ts
+            _last_eval[sym] = closed_ts
+            raw_5m = fetch_data(ex, sym, "5m") if ENABLE_SNIPER else []
 
-# ===================== محاولة القناص أولاً =====================
-signal = None
-reasons = {}
-mode = "swing"
+            # ===================== محاولة القناص أولاً =====================
+            signal = None
+            reasons = {}
+            mode = "swing"
 
-if ENABLE_SNIPER and len(raw_5m) >= 70:
-    try:
-        df_5m = to_df(raw_5m)
-        df_15m = to_df(raw_15m)
-        df_1h = to_df(raw_1h)
+            if ENABLE_SNIPER and len(raw_5m) >= 70:
+                try:
+                    df_5m = to_df(raw_5m)
+                    df_15m = to_df(raw_15m)
+                    df_1h = to_df(raw_1h)
 
-        signal_s, reasons_s = evaluate_signal(df_5m, df_15m, df_1h)
+                    signal_s, reasons_s = evaluate_signal(df_5m, df_15m, df_1h)
 
-        if signal_s and signal_s.get("score", 0) >= SNIPER["min_score"]:
-            current_price = get_current_price(ex, sym) or signal_s["price"]
-            ker = signal_s.get("ker")
-            vol_ratio = signal_s.get("volume_ratio", 0)
+                    if signal_s and signal_s.get("score", 0) >= SNIPER["min_score"]:
+                        current_price = get_current_price(ex, sym) or signal_s["price"]
+                        ker = signal_s.get("ker")
+                        vol_ratio = signal_s.get("volume_ratio", 0)
 
-            ok_sniper, reason_sniper = sniper_filters_ok(
-                df_5m, current_price, signal_s["price"], ker, vol_ratio
-            )
+                        ok_sniper, reason_sniper = sniper_filters_ok(
+                            df_5m, current_price, signal_s["price"], ker, vol_ratio
+                        )
 
-            if ok_sniper:
-                signal = signal_s
-                reasons = reasons_s
-                mode = "sniper"
-                log.info(f"[SNIPER] {sym} {signal['side']} score={signal.get('score')} ✓")
-            else:
-                log.info(f"[SNIPER REJECT] {sym} → {reason_sniper}")
-    except Exception as e:
-        log.warning(f"[SNIPER ERROR] {sym}: {e}")
+                        if ok_sniper:
+                            signal = signal_s
+                            reasons = reasons_s
+                            mode = "sniper"
+                            log.info(f"[SNIPER] {sym} {signal['side']} score={signal.get('score')} ✓")
+                        else:
+                            log.info(f"[SNIPER REJECT] {sym} → {reason_sniper}")
+                except Exception as e:
+                    log.warning(f"[SNIPER ERROR] {sym}: {e}")
 
-# إذا ما نجح القناص → نستخدم النظام العادي
-if signal is None and not SNIPER_ONLY:
-    signal, reasons = evaluate_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
-    mode = "swing"
+            # إذا ما نجح القناص → نستخدم النظام العادي
+            if signal is None and not SNIPER_ONLY:
+                signal, reasons = evaluate_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
+                mode = "swing"
 
-note_eval(sym, signal, reasons)
+            note_eval(sym, signal, reasons)
+            if not signal:
+                return
+
+            side = signal["side"]
+            with state_lock:
+                same_dir = sum(1 for v in state.values() if v.get("position") == side)
+            if same_dir >= MAX_SAME_DIRECTION:
+                note_block(sym, "max_same_direction")
+                log_paper_signal(sym, signal, "max_same_direction")
+                return
+
+            if sector_limit_reached(sym, side):
+                note_block(sym, "sector_limit")
+                log_paper_signal(sym, signal, "sector_limit")
+                return
+
+            if USE_BTC_FILTER:
+                bias = btc_bias(ex)
+                if (side == "LONG" and bias == "down") or (side == "SHORT" and bias == "up"):
+                    note_block(sym, "btc_filter")
+                    log_paper_signal(sym, signal, "btc_filter")
+                    return
+
+            m_ok, m_reason = market_filters_ok(ex, sym, side)
+            if not m_ok:
+                note_block(sym, m_reason)
+                log_paper_signal(sym, signal, m_reason)
+                return
+
+            actual_price = get_current_price(ex, sym, 0)
+            if not actual_price:
+                note_block(sym, "ticker_unavailable")
+                log_paper_signal(sym, signal, "ticker_unavailable")
+                return
+
+            max_slip = SNIPER["max_entry_slip"] if mode == "sniper" else max(MAX_ENTRY_SLIPPAGE_PCT, 0.18 * signal["sl_pct"])
+            if abs(actual_price - signal["price"]) / signal["price"] > max_slip:
+                note_block(sym, "slippage")
                 log_paper_signal(sym, signal, "slippage")
                 return
 
             sl_pct = signal["sl_pct"]
+            tp_rr = SNIPER["rr"] if mode == "sniper" else RR_RATIO
             if side == "LONG":
                 sl = actual_price * (1 - sl_pct)
-                tp = actual_price * (1 + sl_pct * RR_RATIO)
+                tp = actual_price * (1 + sl_pct * tp_rr)
             else:
                 sl = actual_price * (1 + sl_pct)
-                tp = actual_price * (1 - sl_pct * RR_RATIO)
+                tp = actual_price * (1 - sl_pct * tp_rr)
             # --- فلتر الـ AI ---
             if AI_IS_ACTIVE:
                 try:
@@ -2337,7 +2377,7 @@ note_eval(sym, signal, reasons)
                         signal.get("score", 0), factors.get("trend", 0), factors.get("volume", 0),
                         factors.get("adx", 0), factors.get("momentum", 0), factors.get("candle", 0),
                         factors.get("setup", 0), factors.get("entry_quality", 0),
-                        signal.get("volume_ratio", 0), signal.get("ker", 0),
+                        signal.get("volume_ratio") or 0, signal.get("ker") or 0,
                         le_regime.transform([signal.get("regime", "unknown")])[0],
                         le_strategy.transform([signal.get("strategy", "pullback")])[0],
                         le_side.transform([signal.get("side", "LONG")])[0]
