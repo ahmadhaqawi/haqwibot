@@ -622,10 +622,11 @@ def register_trade_result(total_pnl):
     save_state()
 
 
-def reset_sym_state(sym, cooldown=True):
+def reset_sym_state(sym, cooldown=True, mode=None):
     with state_lock:
         s = new_sym_state()
         s["last_exit_ts"] = time.time() if cooldown else 0
+        s["last_exit_mode"] = mode
         state[sym] = s
     save_state()
 
@@ -1214,21 +1215,23 @@ def calculate_contracts(ex, sym, margin, price, lev):
         return 0.0
 
 
-def compute_margin(equity, sl_pct):
-    """الهامش الأساسي حسب المخاطرة. يرجع 0.0 إذا تعذر تحديد حجم آمن."""
-    if equity <= 0:
+ddef compute_margin(equity, sl_pct, risk_pct=None, leverage=None):
+    rp = risk_pct if risk_pct is not None else RISK_PCT_PER_TRADE
+    lev = leverage if leverage is not None else LEVERAGE
+    if equity <= 0 or lev <= 0:
         return 0.0
     if not USE_RISK_SIZING:
         return float(POSITION_SIZE_USDT)
-    risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
-    margin = risk_usd / (sl_pct * LEVERAGE)
+    risk_usd = equity * rp / 100.0
+    margin = risk_usd / (sl_pct * lev)
     cap = min(MAX_MARGIN_USDT, equity * MAX_MARGIN_PCT_EQUITY)
     sized = min(cap, margin)
     return sized if sized >= MIN_MARGIN_USDT else 0.0
 
 
-def compute_margin_scored(equity, sl_pct, signal_score, ai_prob=0.5):
-    base = compute_margin(equity, sl_pct)
+def compute_margin_scored(equity, sl_pct, signal_score, ai_prob=0.5, risk_pct=None, leverage=None):
+    base = compute_margin(equity, sl_pct, risk_pct, leverage)
+    ...
     if base <= 0: return 0.0
     
     if AI_IS_ACTIVE and ai_prob is not None:
@@ -1391,11 +1394,12 @@ def close_full(ex, sym):
         return False
 
 
-def set_leverage_checked(ex, sym):
+def set_leverage_checked(ex, sym, leverage=None):
+    lev = leverage if leverage is not None else LEVERAGE
     last_err = None
     for _ in range(2):
         try:
-            ex.set_leverage(LEVERAGE, sym, params={'mgnMode': MARGIN_MODE})
+            ex.set_leverage(lev, sym, params={'mgnMode': MARGIN_MODE})
             return True, ""
         except Exception as e:
             last_err = e
@@ -1403,13 +1407,12 @@ def set_leverage_checked(ex, sym):
     return False, str(last_err)
 
 
-def open_position(ex, sym, side, price, sl, tp, margin):
+def open_position(ex, sym, side, price, sl, tp, margin, leverage=None):
     try:
-        amount = calculate_contracts(ex, sym, margin, price, LEVERAGE)
-        if amount <= 0:
-            return False, "كمية غير صالحة", price, 0.0
-        cancel_pending(ex, sym)
-        ok, err = set_leverage_checked(ex, sym)
+        lev = leverage if leverage is not None else LEVERAGE
+        amount = calculate_contracts(ex, sym, margin, price, lev)
+        ...
+        ok, err = set_leverage_checked(ex, sym, lev)
         if not ok:
             log.error(f"[LEVERAGE] {sym}: {err}")
             return False, f"تعذر ضبط الرافعة: {err[:120]}", price, 0.0
@@ -1530,7 +1533,7 @@ def finalize_trade(ex, sym, reason_hint=None):
             fills = ex.fetch_my_trades(sym, since=int(pos_data["opened_ts"] * 1000) - 30000, limit=50)
             if fills is not None and len(fills) == 0:
                 log.error(f"[GHOST] {sym}: لا تنفيذات ({age:.0f}ث) — صفقة وهمية، أُهملت")
-                reset_sym_state(sym, cooldown=True)
+                reset_sym_state(sym, cooldown=True, mode=pos_data.get("mode", "swing"))
                 cancel_pending(ex, sym)
                 send(f"⚠️ <b>صفقة وهمية مُهملة</b> <code>{short(sym)}</code>\n"
                      f"لا تنفيذات خلال {age:.0f}ث — لم تُحتسب.")
@@ -1669,7 +1672,7 @@ def btc_bias(ex):
 # ==========================================
 # الاستراتيجية
 # ==========================================
-def detect_regime(df_15m, df_1h, df_4h):
+def detect_regime(df_15m, df_1h, df_4h, timeframe="15m"):
     if len(df_4h) < 50 or len(df_1h) < 50:
         return "unknown"
     last_4h = df_4h.iloc[-2]
@@ -1679,12 +1682,24 @@ def detect_regime(df_15m, df_1h, df_4h):
     ema50_4 = last_4h.get("ema50", last_4h["close"])
     up_4h = last_4h["close"] > ema50_4 and last_4h["ema9"] > last_4h["ema21"]
     down_4h = last_4h["close"] < ema50_4 and last_4h["ema9"] < last_4h["ema21"]
-    if adx4 > REGIME_ADX4_STRONG and adx1 > REGIME_ADX1_STRONG:
+    
+    # --- معايرة ADX للفريم ---
+    if timeframe == "5m":
+        # القناص: 1h مكان 4h → عتبات أقل بـ 15%
+        adx4_strong_eff = REGIME_ADX4_STRONG * 0.85
+        adx4_weak_eff = REGIME_ADX4_WEAK * 0.85
+        adx1_strong_eff = REGIME_ADX1_STRONG * 0.90
+    else:
+        adx4_strong_eff = REGIME_ADX4_STRONG
+        adx4_weak_eff = REGIME_ADX4_WEAK
+        adx1_strong_eff = REGIME_ADX1_STRONG
+    
+    if adx4 > adx4_strong_eff and adx1 > adx1_strong_eff:
         if up_4h:
             return "strong_trend_up"
         if down_4h:
             return "strong_trend_down"
-    if adx4 > REGIME_ADX4_WEAK and (up_4h or down_4h):
+    if adx4 > adx4_weak_eff and (up_4h or down_4h):
         return "weak_trend"
     return "range"
 
@@ -1746,8 +1761,8 @@ def calculate_range_filter(df, period=100, mult=3.0):
     except Exception:
         return 0
 
-def build_context(df_15m, df_1h, df_4h):
-    """الشروط العامة المشتركة. KER متكيف في V51 (median + regime-aware)."""
+def build_context(df_15m, df_1h, df_4h, timeframe="15m"):
+    """الشروط العامة. timeframe='5m' للقناص — يعاير العتبات تلقائياً."""
     if len(df_15m) < 70 or len(df_1h) < 60 or len(df_4h) < 60:
         return None, "insufficient_data"
     last = df_15m.iloc[-2]
@@ -1761,7 +1776,26 @@ def build_context(df_15m, df_1h, df_4h):
     atr_val = float(last["atr"])
     adx_val = float(last["adx"])
 
-    regime = detect_regime(df_15m, df_1h, df_4h)
+    # --- معايرة العتبات حسب الفريم ---
+    if timeframe == "5m":
+        # القناص: 5m ATR أصغر بـ ~35% من 15m، ADX أصغر بـ ~10%
+        atr_mult_eff = SNIPER["atr_sl_mult"]        # 1.18
+        min_atr_eff = MIN_ATR_PCT * 0.65            # 0.00195
+        min_adx_eff = MIN_ADX * 0.90                # 18
+        min_sl_eff = SNIPER["min_sl"]               # 0.0048
+        max_sl_eff = SNIPER["max_sl"]               # 0.0145
+        rr_eff = SNIPER["rr"]                       # 1.85
+        rel_atr_ratio_eff = REL_ATR_RATIO * 1.0     # نسبي، لا يحتاج تغيير
+    else:
+        atr_mult_eff = ATR_SL_MULT                  # 1.55
+        min_atr_eff = MIN_ATR_PCT                   # 0.003
+        min_adx_eff = MIN_ADX                       # 20
+        min_sl_eff = MIN_SL_PCT                     # 0.0065
+        max_sl_eff = MAX_SL_PCT                     # 0.032
+        rr_eff = RR_RATIO                           # 2.30
+        rel_atr_ratio_eff = REL_ATR_RATIO
+
+    regime = detect_regime(df_15m, df_1h, df_4h, timeframe)
     if regime == "unknown":
         return None, "insufficient_data"
     if regime == "range":
@@ -1770,20 +1804,22 @@ def build_context(df_15m, df_1h, df_4h):
     if atr_pct > MAX_ATR_PCT:
         return None, "atr_high"
     rel = relative_atr(df_15m)
-    atr_ok = atr_pct >= MIN_ATR_PCT or (
-        rel is not None and atr_pct >= ATR_HARD_FLOOR and rel >= REL_ATR_RATIO)
+    atr_ok = atr_pct >= min_atr_eff or (
+        rel is not None and atr_pct >= ATR_HARD_FLOOR and rel >= rel_atr_ratio_eff)
     if not atr_ok:
         return None, "atr_low"
-    if adx_val < MIN_ADX:
+    if adx_val < min_adx_eff:
         return None, "low_adx"
 
-    # KER متكيف (median لآخر 3 شموع + عتبة أدنى في الترند القوي)
+    # KER متكيف — يبقى كما هو (مقياس نسبي)
     ker_value = None
     if ENABLE_KER_FILTER:
         er_series = efficiency_ratio(df_15m["close"], KER_PERIOD)
         ker_recent = er_series.iloc[-4:-1].dropna()
         ker_smoothed = float(ker_recent.median()) if len(ker_recent) >= 2 else 0.0
         min_ker_eff = MIN_KER * 0.55 if regime in ("strong_trend_up", "strong_trend_down") else MIN_KER
+        if timeframe == "5m":
+            min_ker_eff = max(min_ker_eff, SNIPER["min_ker"])  # 0.29 للقناص
         if ker_smoothed < min_ker_eff:
             return None, "low_ker"
         ker_value = ker_smoothed
@@ -1792,28 +1828,27 @@ def build_context(df_15m, df_1h, df_4h):
         v = er_series.iloc[-2] if len(er_series) >= 2 else None
         ker_value = float(v) if (v is not None and not pd.isna(v)) else None
 
-        # --- فلتر Range Filter الجديد ---
     rf_direction = calculate_range_filter(df_15m)
     
     long_dir = regime in ("strong_trend_up", "weak_trend")
     short_dir = regime in ("strong_trend_down", "weak_trend") and last_4h["close"] < last_4h["ema50"]
     
-    # Range Filter يفرض رأيه!
     if rf_direction == -1:
-        long_dir = False # يمنع اللونق
+        long_dir = False
     if rf_direction == 1:
-        short_dir = False # يمنع الشورت
+        short_dir = False
         
     if not long_dir and not short_dir:
         return None, "direction_mismatch"
 
-    sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * atr_val / price))
+    # --- SL/TP معايرة للفريم ---
+    sl_pct = max(min_sl_eff, min(max_sl_eff, atr_mult_eff * atr_val / price))
     return {
         "last": last, "prev": prev, "last_1h": last_1h, "last_4h": last_4h,
         "price": price, "atr_val": atr_val, "ema21": float(last["ema21"]),
         "ema50": float(last["ema50"]), "rsi": float(last["rsi"]),
         "regime": regime, "long_dir": long_dir, "short_dir": short_dir,
-        "ker": ker_value, "sl_pct": sl_pct, "tp_pct": sl_pct * RR_RATIO,
+        "ker": ker_value, "sl_pct": sl_pct, "tp_pct": sl_pct * rr_eff,
     }, None
 
 
@@ -1946,9 +1981,9 @@ def score_signal(signal, ctx, df_15m):
     return signal
 
 
-def evaluate_signal(df_15m, df_1h, df_4h):
-    """V51: تقييم الاستراتيجيتين معاً واختيار الأعلى score بدل if/elif."""
-    ctx, reason = build_context(df_15m, df_1h, df_4h)
+def evaluate_signal(df_15m, df_1h, df_4h, timeframe="15m"):
+    """تقييم الاستراتيجيتين. timeframe='5m' للقناص."""
+    ctx, reason = build_context(df_15m, df_1h, df_4h, timeframe)
     if ctx is None:
         return None, {"common": reason}
 
@@ -2268,7 +2303,9 @@ def process_symbol(ex, sym):
                 manage_position(ex, sym, cur)
                 return
 
-            if time.time() - pos_data.get("last_exit_ts", 0) < REENTRY_COOLDOWN_SEC:
+            last_exit_mode = pos_data.get("last_exit_mode") or "swing"
+            effective_cooldown = SNIPER["cooldown"] if last_exit_mode == "sniper" else REENTRY_COOLDOWN_SEC
+            if time.time() - pos_data.get("last_exit_ts", 0) < effective_cooldown:
                 set_last_reason(sym, "cooldown")
                 return
             ok, gate = entries_allowed(ex)
@@ -2307,7 +2344,7 @@ def process_symbol(ex, sym):
                     df_15m = to_df(raw_15m)
                     df_1h = to_df(raw_1h)
 
-                    signal_s, reasons_s = evaluate_signal(df_5m, df_15m, df_1h)
+                    signal_s, reasons_s = evaluate_signal(df_5m, df_15m, df_1h, timeframe="5m")
 
                     if signal_s and signal_s.get("score", 0) >= SNIPER["min_score"]:
                         current_price = get_current_price(ex, sym) or signal_s["price"]
