@@ -1,31 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-OKX Futures Trading Bot - V51 (Adaptive + AI Analysis + Paper Mode + Execution Safety)
-
-التغييرات عن V50:
-1) send() غير محجوب عبر queue + worker thread (تيليجرام لا يوقف التداول).
-2) KER متكيف: median لآخر 3 شموع + عتبة أدنى في الترند القوي.
-3) إصلاح score: الارتداد المثالي يحصل على 15 في setup بدل 12.
-4) تقييم pullback و breakout معاً واختيار الأعلى score بدل if/elif.
-5) سقف انزلاق ديناميكي: max(0.4%, 0.18*sl_pct).
-6) حجم الصفقة يتناسب مع درجة الفرصة (compute_margin_scored).
-7) بروفايل opportunist جديد (بين balanced و active، آمن للحقيقي).
-8) Paper mode: كل إشارة تُرفض تُسجَّل في paper_signals.csv.
-9) تسجيل عوامل score كلها + volume_ratio + ker في الـ journal.
-10) إصلاح bucket 74-79 في /stats.
-11) /ai (AI Gateway + fallback محلي), /export, /restore, /paper, نسخ احتياطي تلقائي.
-12) تنظيف دوري للذاكرة.
-13) signal_score مضاف لـ new_sym_state.
+OKX Futures Trading Bot - V54 (Unified Sniper + Swing + Secure AI + Execution Safety)
 """
 import os
 import sys
 import csv
+import hashlib
+import io
 import json
+import math
+import re
+import shutil
+import tempfile
 import time
 import logging
 import threading
 import queue
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit
 
 import numpy as np
 import pandas as pd
@@ -37,12 +29,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
 
-VERSION = "V52_AI"
-
-# ---------------- بداية إعداد الـ AI ----------------
-import joblib
-import urllib.request
-AI_MODEL_URL = "https://github.com/ahmadhaqawi/haqwibot/releases/download/v1.0/ai_model_mega_v4.pkl"
+VERSION = "V54"
 
 AI_IS_ACTIVE = False
 ai_model = None
@@ -50,27 +37,13 @@ le_regime = None
 le_strategy = None
 le_side = None
 
-try:
-    if not os.path.exists('ai_model_mega_v4.pkl'):
-        log.info("⏳ [AI] جاري تنزيل ملف العقل (59MB) من GitHub...")
-        urllib.request.urlretrieve(AI_MODEL_URL, 'ai_model_mega_v4.pkl')
-        log.info("✅ [AI] تم تنزيل ملف العقل بنجاح!")
-        
-    ai_model = joblib.load('ai_model_mega_v4.pkl')
-    le_regime = joblib.load('le_regime_mega_v4.pkl')
-    le_strategy = joblib.load('le_strategy_mega_v4.pkl')
-    le_side = joblib.load('le_side_mega_v4.pkl')
-    AI_IS_ACTIVE = True
-    log.info("🧠 [AI] تم تحميل نموذج الذكاء الاصطناعي بنجاح!")
-except Exception as e:
-    log.warning(f"⚠️ [AI] فشل تحميل الـ AI. السبب: {e}")
-# ---------------- نهاية إعداد الـ AI ----------------
 KSA_TZ = timezone(timedelta(hours=3))
 
 
 def env_float(name, default):
     try:
-        return float(os.getenv(name, default))
+        value = float(os.getenv(name, default))
+        return value if math.isfinite(value) else float(default)
     except ValueError:
         return float(default)
 
@@ -89,6 +62,7 @@ OKX_API_KEY = os.getenv("OKX_API_KEY", "")
 OKX_SECRET = os.getenv("OKX_SECRET", "")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", os.getenv("OKX_PASSWORD", ""))
 USE_SANDBOX = os.getenv("USE_SANDBOX", "true").lower() in ("true", "1", "yes")
+ALLOW_LIVE_TRADING = env_flag("ALLOW_LIVE_TRADING", False)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -153,14 +127,13 @@ RISK_PCT_PER_TRADE = env_float("RISK_PCT_PER_TRADE", 0.65)
 POSITION_SIZE_USDT = 50
 MIN_MARGIN_USDT = 10
 MAX_MARGIN_USDT = env_float("MAX_MARGIN_USDT", 130)
-MAX_MARGIN_PCT_EQUITY = 0.30
+MAX_MARGIN_PCT_EQUITY = min(1.0, max(0.0, env_float("MAX_MARGIN_PCT_EQUITY", 0.30)))
 
 ATR_SL_MULT = 1.55
 RR_RATIO = 2.3
 MIN_SL_PCT = 0.0065
 MAX_SL_PCT = 0.032
 TRAIL_ATR_MULT = 1.05
-BE_FEE_BUFFER = 0.0008
 BE_TRIGGER_R = 0.9
 FALLBACK_SL_PCT = 0.017
 
@@ -168,6 +141,8 @@ PARTIAL1_R, PARTIAL1_PCT = 1.3, 0.40
 PARTIAL2_R, PARTIAL2_PCT = 2.1, 0.50
 
 FEE_RATE = 0.0005
+BE_FEE_BUFFER = min(0.05, max(2 * FEE_RATE, env_float("BE_FEE_BUFFER", 0.0012)))
+FLOATING_FUNDING_BUFFER_PCT = max(0.0, env_float("FLOATING_FUNDING_BUFFER_PCT", 0.0))
 DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", 4.0)
 DAILY_PROFIT_TARGET_PCT = env_float("DAILY_PROFIT_TARGET_PCT", 6.0)
 INCLUDE_FLOATING_IN_LOSS_LIMIT = True
@@ -176,15 +151,84 @@ MAX_FUNDING_RATE = 0.00045
 MAX_ENTRY_SLIPPAGE_PCT = env_float("MAX_ENTRY_SLIPPAGE_PCT", 0.004)
 USE_BTC_FILTER = True
 
-# ---------- AI Gateway (تحليل فقط) ----------
+# ---------- AI Gateway & Local AI ----------
 AI_GATEWAY_URL = os.getenv("AI_GATEWAY_URL", "https://api.openai.com/v1/chat/completions")
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+ENABLE_EXTERNAL_AI = env_flag("ENABLE_EXTERNAL_AI", False)
+ENABLE_LOCAL_AI = env_flag("ENABLE_LOCAL_AI", False)
+USE_AI_ENTRY_FILTER = env_flag("USE_AI_ENTRY_FILTER", False)
 BACKUP_INTERVAL_SEC = int(env_float("BACKUP_INTERVAL_SEC", 6 * 3600))
 AI_MIN_PROB = env_float("AI_MIN_PROB", 0.50)
 AI_MIN_PROB_LONG = env_float("AI_MIN_PROB_LONG", AI_MIN_PROB)
 AI_MIN_PROB_SHORT = env_float("AI_MIN_PROB_SHORT", AI_MIN_PROB)
 VERBOSE_REJECT_LOG = env_flag("VERBOSE_REJECT_LOG", True)
+
+
+def _verified_bytes(path, expected, size_limit):
+    with open(path, "rb") as f:
+        payload = f.read(size_limit + 1)
+    if len(payload) > size_limit or hashlib.sha256(payload).hexdigest() != expected:
+        raise ValueError(f"حجم أو بصمة غير صالحة: {os.path.basename(path)}")
+    return payload
+
+
+def _download_model(url, path, expected, size_limit):
+    if urlsplit(url).scheme != "https":
+        raise ValueError("AI_MODEL_URL must use HTTPS")
+    with tempfile.NamedTemporaryFile(dir=os.path.dirname(os.path.abspath(path)), delete=False) as tmp:
+        staging = tmp.name
+    try:
+        with requests.get(url, timeout=(5, 20), stream=True) as response, open(staging, "wb") as out:
+            response.raise_for_status()
+            if any(urlsplit(item.url).scheme != "https" for item in [*response.history, response]):
+                raise ValueError("AI model redirect must use HTTPS")
+            size = 0
+            deadline = time.monotonic() + 120
+            for chunk in response.iter_content(64 * 1024):
+                size += len(chunk)
+                if size > size_limit or time.monotonic() > deadline:
+                    raise ValueError("AI model download exceeded its size or time budget")
+                out.write(chunk)
+        _verified_bytes(staging, expected, size_limit)
+        os.replace(staging, path)
+    finally:
+        if os.path.exists(staging):
+            os.unlink(staging)
+
+
+def load_local_ai():
+    """لا يُحمّل pickle إلا بعد مطابقة بصمات SHA-256 موثوقة لكل الملفات الأربعة."""
+    global AI_IS_ACTIVE, ai_model, le_regime, le_strategy, le_side
+    AI_IS_ACTIVE = False
+    ai_model = le_regime = le_strategy = le_side = None
+    if not ENABLE_LOCAL_AI:
+        return
+    specs = (
+        ("ai_model_mega_v4.pkl", "AI_MODEL_SHA256", 128 * 1024**2),
+        ("le_regime_mega_v4.pkl", "AI_REGIME_SHA256", 4 * 1024**2),
+        ("le_strategy_mega_v4.pkl", "AI_STRATEGY_SHA256", 4 * 1024**2),
+        ("le_side_mega_v4.pkl", "AI_SIDE_SHA256", 4 * 1024**2),
+    )
+    try:
+        import joblib
+        folder = os.getenv("AI_MODEL_DIR", ".")
+        pins = [os.getenv(env, "").strip().lower() for _, env, _ in specs]
+        if not all(re.fullmatch(r"[0-9a-f]{64}", pin) for pin in pins):
+            raise ValueError("تجب تهيئة بصمات SHA-256 الأربع من مصدر موثوق")
+        verified = []
+        for (name, _, limit), pin in zip(specs, pins):
+            path = os.path.join(folder, name)
+            url = os.getenv("AI_MODEL_URL", "").strip() if name == specs[0][0] else ""
+            if not os.path.exists(path) and url:
+                _download_model(url, path, pin, limit)
+            verified.append(_verified_bytes(path, pin, limit))
+        ai_model, le_regime, le_strategy, le_side = [joblib.load(io.BytesIO(blob)) for blob in verified]
+        AI_IS_ACTIVE = True
+        log.info("[AI] تم تحميل النموذج المحلي من ملفات مطابقة للبصمات")
+    except Exception as e:
+        log.warning("[AI] لم يُحمّل النموذج المحلي: %s", type(e).__name__)
+
 
 # ---------- Paper Mode ----------
 ENABLE_PAPER_LOG = env_flag("ENABLE_PAPER_LOG", True)
@@ -264,11 +308,9 @@ SNIPER = {
     "near_ema_pct": 0.0085,
 }
 
+
 def _cfg(key):
     return env_float(key.upper(), PROFILES[PROFILE_NAME][key])
-
-
-
 
 
 MIN_ATR_PCT = _cfg("min_atr_pct")
@@ -303,7 +345,8 @@ ENABLE_KER_FILTER = env_flag("ENABLE_KER_FILTER", True)
 WATCHDOG_SEC = 300
 TF_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 
-DATA_DIR = "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
+DATA_DIR = os.getenv("BOT_DATA_DIR") or (
+    "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else ".")
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
 JOURNAL_FILE = os.path.join(DATA_DIR, "trades_journal.csv")
 PAPER_FILE = os.path.join(DATA_DIR, "paper_signals.csv")
@@ -320,7 +363,9 @@ daily_pnl = {"value": 0.0, "trades": 0, "wins": 0, "date": str(datetime.now(KSA_
 
 _data_cache = {}
 _price_cache = {}
-_equity_cache = {"ts": 0, "value": 0.0}
+_funding_cache = {}
+_balance_cache = {}
+_balance_lock = threading.Lock()
 _btc_bias_cache = {"ts": 0, "value": "neutral"}
 _last_eval = {}
 _last_spread = {}
@@ -365,6 +410,7 @@ REASON_LABELS = {
     "funding_negative": "فندنغ سلبي (SHORT)",
     "ticker_unavailable": "تعذر قراءة السعر/السبريد",
     "slippage": "ابتعاد السعر عن الإشارة",
+    "signal_expired": "انتهت صلاحية الإشارة الزمنية",
     "margin_too_small": "الهامش أقل من الحد الأدنى",
     "open_failed": "فشل فتح الصفقة",
     "cooldown": "فترة الانتظار بعد الإغلاق",
@@ -385,6 +431,7 @@ REASON_LABELS = {
     "score_low": "درجة الفرصة أقل من الحد المطلوب",
     "ai_rejected": "رفض الذكاء الاصطناعي (احتمال منخفض)",
 }
+
 
 def label(r):
     if r.startswith("signal:"):
@@ -445,6 +492,7 @@ def set_last_reason(sym, reason):
     with diag_lock:
         _last_reason[sym] = (time.time(), reason)
 
+
 def sniper_filters_ok(df_entry, current_price, signal_price, ker, vol_ratio):
     """فلاتر صارمة خاصة بوضع القناص"""
     if ker is None or ker < SNIPER["min_ker"]:
@@ -467,6 +515,7 @@ def sniper_filters_ok(df_entry, current_price, signal_price, ker, vol_ratio):
 
     return True, ""
 
+
 def get_trade_params(mode="swing"):
     """يرجع إعدادات الصفقة حسب الوضع"""
     if mode == "sniper":
@@ -482,6 +531,8 @@ def get_trade_params(mode="swing"):
             "rr": SNIPER["rr"],
             "min_sl": SNIPER["min_sl"],
             "max_sl": SNIPER["max_sl"],
+            "leverage": SNIPER["leverage"],
+            "risk_pct": SNIPER["risk_pct"],
         }
     else:
         return {
@@ -496,6 +547,8 @@ def get_trade_params(mode="swing"):
             "rr": RR_RATIO,
             "min_sl": MIN_SL_PCT,
             "max_sl": MAX_SL_PCT,
+            "leverage": LEVERAGE,
+            "risk_pct": RISK_PCT_PER_TRADE,
         }
 
 
@@ -550,12 +603,13 @@ def new_sym_state():
         "position": None, "entry": None, "sl": None, "tp": None,
         "initial_sl": None, "initial_risk": 0.0,
         "contracts": 0.0, "initial_contracts": 0.0, "margin": 0.0,
-        "opened_ts": 0, "leg_ts": 0, "last_exit_ts": 0,
+        "opened_ts": 0, "leg_ts": 0, "last_exit_ts": 0, "last_exit_mode": "swing",
         "realized_pnl": 0.0, "breakeven_hit": False,
         "partial_1_taken": False, "partial_2_taken": False,
         "last_notified_sl": None, "regime": "unknown", "strategy": "",
         "planned_entry": None, "realized_fees_est": 0.0, "missing_checks": 0,
         "signal_score": 0, "score_factors": {}, "volume_ratio": 0, "ker": None, "mode": "swing",
+        "pending_protection_sl": None, "partial_order_pending": None,
     }
 
 
@@ -579,15 +633,30 @@ def load_state():
         log.error(f"[STATE LOAD ERROR] {e}")
 
 
+def _atomic_write(path, payload):
+    with tempfile.NamedTemporaryFile(dir=os.path.dirname(os.path.abspath(path)), delete=False) as f:
+        tmp = f.name
+    try:
+        with open(tmp, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def save_state():
     try:
         with state_lock:
-            txt = json.dumps({"state": state, "daily_pnl": daily_pnl, "meta": meta},
+            compact_state = {
+                k: v for k, v in state.items()
+                if v.get("position") is not None or (v.get("last_exit_ts") or 0) > 0
+            }
+            txt = json.dumps({"state": compact_state, "daily_pnl": daily_pnl, "meta": meta},
                              ensure_ascii=False, indent=2)
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(txt)
-        os.replace(tmp, STATE_FILE)
+            _atomic_write(STATE_FILE, txt.encode("utf-8"))
     except Exception as e:
         log.error(f"[STATE SAVE ERROR] {e}")
 
@@ -622,11 +691,11 @@ def register_trade_result(total_pnl):
     save_state()
 
 
-def reset_sym_state(sym, cooldown=True, mode=None):
+def reset_sym_state(sym, cooldown=True, mode="swing"):
     with state_lock:
         s = new_sym_state()
         s["last_exit_ts"] = time.time() if cooldown else 0
-        s["last_exit_mode"] = mode
+        s["last_exit_mode"] = mode or "swing"
         state[sym] = s
     save_state()
 
@@ -667,7 +736,7 @@ def migrate_journal():
                 w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS, extrasaction="ignore", restval="")
                 w.writeheader()
                 w.writerows(rows)
-            log.info(f"[JOURNAL] تم ترحيل {len(rows)} صفقة إلى صيغة V51")
+            log.info(f"[JOURNAL] تم ترحيل {len(rows)} صفقة إلى صيغة {VERSION}")
     except Exception as e:
         log.error(f"[JOURNAL MIGRATE] {e}")
 
@@ -693,8 +762,8 @@ def log_paper_signal(sym, sig, blocked_by):
     if not ENABLE_PAPER_LOG:
         return
     try:
-        new = not os.path.exists(PAPER_FILE)
         with journal_lock:
+            new = not os.path.exists(PAPER_FILE)
             with open(PAPER_FILE, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=PAPER_FIELDS)
                 if new:
@@ -730,7 +799,7 @@ def paper_stats_text():
     try:
         bins = pd.cut(df["score"], bins=[0, 50, 60, 65, 70, 75, 80, 100])
         lines += ["", "<b>توزيع الدرجات:</b>"]
-        for interval, cnt in df.groupby(bins).size().items():
+        for interval, cnt in df.groupby(bins, observed=False).size().items():
             if cnt:
                 lines.append(f"• {interval}: {cnt}")
     except Exception:
@@ -795,7 +864,6 @@ def stats_text():
     score = _num(df, "score")
     if score.notna().any():
         lines += ["", "<b>حسب درجة الفرصة:</b>"]
-        # إصلاح bucket 74-79 (كان 0-79 خطأ في V50)
         for lo, hi, name in ((60, 67, "60–67"), (68, 73, "68–73"),
                              (74, 79, "74–79"), (80, 89, "80–89"), (90, 100, "90+")):
             g = df[(score >= lo) & (score <= hi)]
@@ -871,7 +939,7 @@ def ai_analyze_trades(chat_id):
 
     send("⏳ جاري تحليل السجل...", chat_id)
 
-    if not AI_API_KEY:
+    if not ENABLE_EXTERNAL_AI or not AI_API_KEY or urlsplit(AI_GATEWAY_URL).scheme != "https":
         return send(local_ai_analysis(df), chat_id)
 
     total_pnl = df["pnl"].sum()
@@ -891,7 +959,8 @@ def ai_analyze_trades(chat_id):
         headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
         payload = {"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}],
                    "temperature": 0.3}
-        r = requests.post(AI_GATEWAY_URL, json=payload, headers=headers, timeout=45)
+        r = requests.post(AI_GATEWAY_URL, json=payload, headers=headers, timeout=45,
+                          allow_redirects=False)
         r.raise_for_status()
         ai_text = r.json()["choices"][0]["message"]["content"]
         send(f"🧠 <b>تحليل AI:</b>\n\n{ai_text}", chat_id)
@@ -909,11 +978,11 @@ def backup_to_telegram(chat_id=None):
             file_name = os.path.basename(filepath)
             if os.path.exists(filepath):
                 try:
-                    # استخدام القفل لمنع تعارض القراءة/الكتابة
-                    with journal_lock:
+                    lock = state_lock if filepath == STATE_FILE else journal_lock
+                    with lock:
                         with open(filepath, 'rb') as f:
                             file_data = f.read()
-                    
+
                     r = requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
                         data={"chat_id": cid, "caption": f"🔒 {file_name}"},
@@ -926,34 +995,101 @@ def backup_to_telegram(chat_id=None):
                     log.error(f"[BACKUP] فشل إرسال {filepath}: {e}")
                     send(f"❌ فشل إرسال {file_name}: {e}", cid)
             else:
-                # إرسال تنبيه إذا كان الملف غير موجود (كما في حالة trades_journal حالياً)
-                send(f"⚠️ الملف <code>{file_name}</code> غير موجود في السيرفر (لم يتم إغلاق صفقات جديدة بعد آخر تحديث).", cid)
+                send(f"⚠️ الملف <code>{file_name}</code> غير موجود في السيرفر حالياً.", cid)
 
 
-def handle_document_restore(msg, chat_id):
+RESTORE_LIMIT = 10 * 1024**2
+
+
+def _validated_restore(file_name, raw):
+    text = raw.decode("utf-8-sig")
+    if file_name == "bot_state.json":
+        data = json.loads(text)
+        if not isinstance(data, dict) or not all(
+            isinstance(data.get(k), dict) for k in ("state", "daily_pnl", "meta")
+        ):
+            raise ValueError("صيغة حالة غير صالحة")
+        flat = {}
+        for sym, row in data["state"].items():
+            if (not re.fullmatch(r"[A-Za-z0-9_.-]+/USDT:USDT", sym)
+                    or not isinstance(row, dict) or row.get("position") is not None):
+                raise ValueError("نسخة الحالة يجب ألا تحتوي على مراكز مفتوحة")
+            last_exit = row.get("last_exit_ts", 0)
+            if type(last_exit) not in (int, float) or not math.isfinite(last_exit) or last_exit < 0:
+                raise ValueError("وقت إغلاق غير صالح")
+            flat[sym] = {**new_sym_state(), "last_exit_ts": last_exit,
+                         "last_exit_mode": row.get("last_exit_mode", "swing")}
+        day = data["daily_pnl"]
+        value, trades, wins = day["value"], day["trades"], day["wins"]
+        datetime.strptime(day["date"], "%Y-%m-%d")
+        if (type(value) not in (int, float) or not math.isfinite(value) or type(trades) is not int
+                or type(wins) is not int or not 0 <= wins <= trades):
+            raise ValueError("قيم الإحصاء اليومي غير صالحة")
+        safe_day = {"value": value, "trades": trades, "wins": wins, "date": day["date"]}
+        return json.dumps({"state": flat, "daily_pnl": safe_day, "meta": {"paused": True}},
+                          ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+    fields = JOURNAL_FIELDS if file_name == "trades_journal.csv" else PAPER_FIELDS
+    reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+    if reader.fieldnames != fields:
+        raise ValueError("رأس CSV لا يطابق بنية الإصدار الحالي")
+    numeric = ("entry", "exit", "pnl", "r_multiple") if fields is JOURNAL_FIELDS else ("score", "price", "sl", "tp")
+    for row in reader:
+        if (None in row or None in row.values() or row["side"] not in ("LONG", "SHORT")
+                or not row["symbol"] or not all(math.isfinite(float(row[k])) for k in numeric)):
+            raise ValueError("صف CSV غير صالح")
+    return text.encode("utf-8")
+
+
+def handle_document_restore(msg, chat_id, ex):
     doc = msg.get("document")
-    if not doc:
+    if not doc or chat_id not in AUTHORIZED_CHATS:
         return
+    if (msg.get("chat") or {}).get("type") != "private":
+        return send("الاستعادة متاحة في محادثة خاصة مصرح بها فقط.", chat_id)
+    if (msg.get("caption") or "").strip().lower() != "/restore confirm":
+        return send("أضف /restore confirm في تعليق الملف إذا أردت استبدال النسخة الحالية.", chat_id)
     file_name = doc.get("file_name", "")
     if file_name not in ("trades_journal.csv", "bot_state.json", "paper_signals.csv"):
         return send("❌ الملف غير معروف.", chat_id)
-    file_id = doc.get("file_id")
     try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}").json()
-        file_path = r["result"]["file_path"]
+        if doc.get("file_size", 0) > RESTORE_LIMIT:
+            raise ValueError("restore file too large")
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+                         params={"file_id": doc["file_id"]}, timeout=(5, 15), allow_redirects=False)
+        r.raise_for_status()
+        file_path = r.json()["result"]["file_path"]
+        if not re.fullmatch(r"[A-Za-z0-9_/-]+(?:\.[A-Za-z0-9]+)?", file_path):
+            raise ValueError("invalid remote file path")
         dl_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
         target = {"trades_journal.csv": JOURNAL_FILE,
                   "bot_state.json": STATE_FILE,
                   "paper_signals.csv": PAPER_FILE}[file_name]
-        with requests.get(dl_url, stream=True) as r_dl:
-            with open(target, 'wb') as f:
-                for chunk in r_dl.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        send(f"✅ تم استعادة {file_name}.", chat_id)
-        if file_name == "bot_state.json":
-            load_state()
+        raw = bytearray()
+        with requests.get(dl_url, stream=True, timeout=(5, 15), allow_redirects=False) as r_dl:
+            r_dl.raise_for_status()
+            deadline = time.monotonic() + 60
+            for chunk in r_dl.iter_content(chunk_size=8192):
+                raw.extend(chunk)
+                if len(raw) > RESTORE_LIMIT or time.monotonic() > deadline:
+                    raise ValueError("restore download exceeded its budget")
+        payload = _validated_restore(file_name, raw)
+        with trade_lock:
+            if not meta.get("paused") or open_positions_snapshot():
+                return send("أوقف الدخول بـ /pause وأغلق المراكز قبل الاستعادة.", chat_id)
+            if any(abs(float(p.get("contracts") or 0)) > 0 for p in ex.fetch_positions()):
+                return send("توجد مراكز على OKX. أوقف الاستعادة حتى تُغلق.", chat_id)
+            with (state_lock if file_name == "bot_state.json" else journal_lock):
+                if os.path.exists(target):
+                    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                    shutil.copy2(target, f"{target}.{stamp}.bak")
+                _atomic_write(target, payload)
+                if file_name == "bot_state.json":
+                    load_state()
+        send(f"✅ تم استعادة {file_name}. لا يزال فتح الصفقات متوقفًا حتى /resume.", chat_id)
     except Exception as e:
-        send(f"❌ فشل: {e}", chat_id)
+        log.warning("[RESTORE] %s: %s", file_name, type(e).__name__)
+        send("❌ تعذرت الاستعادة. تأكد من صيغة الملف وحجمه وحالة الاتصال.", chat_id)
 
 
 # ==========================================
@@ -1006,26 +1142,33 @@ REASONS = {
     "Emergency": "إغلاق طارئ 🚨",
     "Manual/External": "إغلاق من المنصة ⚡",
     "Time Exit": "انتهاء مدة القناص ⏱️",
+    "Unconfirmed Exit": "سبب الإغلاق غير مؤكد",
+    "Estimated Take Profit": "تحقق الهدف (تقديري)",
+    "Estimated Stop Loss": "وقف الخسارة (تقديري)",
+    "Estimated Trailing Stop": "وقف متحرك (تقديري)",
+    "Estimated Breakeven Hit": "تعادل (تقديري)",
 }
 
 
-def effective_risk_pct(equity, sl_pct):
+def effective_risk_pct(equity, sl_pct, lev=LEVERAGE, risk_pct=RISK_PCT_PER_TRADE):
     if equity <= 0 or sl_pct <= 0:
         return 0.0
-    risk_usd = equity * RISK_PCT_PER_TRADE / 100.0
-    margin = risk_usd / (sl_pct * LEVERAGE)
+    risk_usd = equity * risk_pct / 100.0
+    margin = risk_usd / (sl_pct * lev)
     cap = min(MAX_MARGIN_USDT, equity * MAX_MARGIN_PCT_EQUITY)
     margin = min(cap, margin)
-    return margin * sl_pct * LEVERAGE / equity * 100.0
+    return margin * sl_pct * lev / equity * 100.0
 
 
-def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy="", equity=None, score=0):
+def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy="", equity=None, score=0, lev=LEVERAGE, mode="swing"):
     title = "🟢 <b>شراء (LONG)</b>" if side == "LONG" else "🔴 <b>بيع (SHORT)</b>"
+    if mode == "sniper":
+        title += " 🎯 [قناص]"
     status = "✅ <b>تم الفتح</b>" if real_order else "⚠️ <b>إشارة فقط</b>"
     sl_pct = abs(price - sl) / price * 100
     tp_pct = abs(tp - price) / price * 100
-    risk_usd = margin * (sl_pct / 100) * LEVERAGE
-    reward_usd = margin * (tp_pct / 100) * LEVERAGE
+    risk_usd = margin * (sl_pct / 100) * lev
+    reward_usd = margin * (tp_pct / 100) * lev
     risk_pct_txt = ""
     if equity and equity > 0:
         pct = risk_usd / equity * 100
@@ -1038,7 +1181,7 @@ def msg_entry(sym, side, price, sl, tp, margin, real_order, regime="", strategy=
     return (f"{title}\n{status}{regime_txt}{score_txt}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🪙 <code>{short(sym)}</code> | 💵 <code>{fmt(price)}</code>\n"
-            f"⚙️ {LEVERAGE}x | الهامش: {margin:.2f} USDT\n"
+            f"⚙️ {lev}x | الهامش: {margin:.2f} USDT\n"
             f"🛑 SL: <code>{fmt(sl)}</code> ({sl_pct:.2f}%) → مخاطرة {risk_usd:.2f}{risk_pct_txt}\n"
             f"🎯 TP: <code>{fmt(tp)}</code> ({tp_pct:.2f}%) → عائد +{reward_usd:.2f}\n"
             f"⏰ {now_str}")
@@ -1120,14 +1263,7 @@ def add_indicators(df):
     df["atr"] = atr(df["high"], df["low"], df["close"])
     df["vol_ma"] = df["volume"].rolling(20).mean()
     return df
-
-
-# ============================================================
-# ← نهاية الجزء 1/3
-# الجزء 2/3 يبدأ بـ: create_exchange + protection + open_position
-#                  + finalize_trade + البيانات + الاستراتيجية + score
-# ============================================================
-# ============================================================
+    # ============================================================
 # الجزء 2/3 — المنصة والتنفيذ والاستراتيجية
 # ============================================================
 
@@ -1135,6 +1271,8 @@ def add_indicators(df):
 # المنصة (OKX)
 # ==========================================
 def create_exchange():
+    if not USE_SANDBOX and not ALLOW_LIVE_TRADING:
+        raise RuntimeError("Live trading requires ALLOW_LIVE_TRADING=true")
     ex = ccxt.okx({
         'apiKey': OKX_API_KEY, 'secret': OKX_SECRET, 'password': OKX_PASSPHRASE,
         'enableRateLimit': True, 'options': {'defaultType': 'swap'}, 'timeout': 20000,
@@ -1155,39 +1293,60 @@ def refresh_prices(ex, symbols):
         tickers = ex.fetch_tickers(symbols)
         now = time.time()
         for s, t in tickers.items():
-            if t.get('last'):
-                _price_cache[s] = (now, float(t['last']))
+            last = t.get('last')
+            if last:
+                bid = float(t['bid']) if _valid_trigger(t.get('bid')) else None
+                ask = float(t['ask']) if _valid_trigger(t.get('ask')) else None
+                _price_cache[s] = (now, float(last), bid, ask)
     except Exception as e:
         log.warning(f"[PRICES] {e}")
 
 
 def get_current_price(ex, sym, max_age=20):
     c = _price_cache.get(sym)
-    if c and time.time() - c[0] <= max_age:
+    if c and max_age > 0 and time.time() - c[0] <= max_age:
         return c[1]
     try:
-        p = float(ex.fetch_ticker(sym)['last'])
-        _price_cache[sym] = (time.time(), p)
+        t = ex.fetch_ticker(sym)
+        p = float(t['last'])
+        if not _valid_trigger(p):
+            return None
+        bid = float(t['bid']) if _valid_trigger(t.get('bid')) else None
+        ask = float(t['ask']) if _valid_trigger(t.get('ask')) else None
+        _price_cache[sym] = (time.time(), p, bid, ask)
         return p
     except Exception as e:
         log.warning(f"[PRICE] {sym}: {e}")
         return c[1] if c and max_age > 0 and time.time() - c[0] <= max_age else None
 
 
-def get_equity(ex, force=False):
-    """يرجع 0.0 عند تعذر القراءة (لا نستخدم رصيداً قديماً لقرارات جديدة)."""
-    if not force and time.time() - _equity_cache["ts"] < 60 and _equity_cache["value"] > 0:
-        return _equity_cache["value"]
+def get_balances(ex, force=False):
+    """رصيد الحساب الإجمالي للمخاطرة، والمتاح فعلياً كسقف للتنفيذ."""
+    with _balance_lock:
+        cached = _balance_cache.get(ex)
+    if not force and cached and time.monotonic() - cached[0] < 60:
+        return cached[1], cached[2]
     try:
-        bal = ex.fetch_balance().get('USDT', {})
-        val = float(bal.get('total') or bal.get('free') or 0)
-        if val > 0:
-            _equity_cache.update({"ts": time.time(), "value": val})
-            return val
-        return 0.0
+        bal = ex.fetch_balance().get("USDT") or {}
+        free = float(bal.get("free") or 0)
+        equity = float(bal["total"] if bal.get("total") is not None else free)
+        if not all(math.isfinite(v) for v in (free, equity)):
+            raise ValueError("non-finite USDT balance")
+        values = max(0.0, equity), max(0.0, free)
+        with _balance_lock:
+            if len(_balance_cache) >= 8:
+                _balance_cache.clear()
+            _balance_cache[ex] = (time.monotonic(), *values)
+        return values
     except Exception as e:
-        log.warning(f"[EQUITY] {e}")
-        return 0.0
+        with _balance_lock:
+            _balance_cache.pop(ex, None)
+        log.warning("[EQUITY] %s", type(e).__name__)
+        return 0.0, 0.0
+
+
+def get_equity(ex, force=False):
+    return get_balances(ex, force)[0]
 
 
 def contract_size(ex, sym):
@@ -1216,48 +1375,55 @@ def calculate_contracts(ex, sym, margin, price, lev):
 
 
 def compute_margin(equity, sl_pct, risk_pct=None, leverage=None):
+    """الهامش الأساسي حسب المخاطرة والمود (Swing أو Sniper)."""
     rp = risk_pct if risk_pct is not None else RISK_PCT_PER_TRADE
     lev = leverage if leverage is not None else LEVERAGE
-    if equity <= 0 or lev <= 0:
+    if (not math.isfinite(equity) or not math.isfinite(sl_pct)
+            or equity <= 0 or sl_pct <= 0 or lev <= 0):
         return 0.0
-    if not USE_RISK_SIZING:
-        return float(POSITION_SIZE_USDT)
     risk_usd = equity * rp / 100.0
-    margin = risk_usd / (sl_pct * lev)
+    margin = risk_usd / (sl_pct * lev) if USE_RISK_SIZING else POSITION_SIZE_USDT
     cap = min(MAX_MARGIN_USDT, equity * MAX_MARGIN_PCT_EQUITY)
     sized = min(cap, margin)
     return sized if sized >= MIN_MARGIN_USDT else 0.0
 
 
-def compute_margin_scored(equity, sl_pct, signal_score, ai_prob=0.5, risk_pct=None, leverage=None):
+def compute_margin_scored(equity, sl_pct, signal_score, free_margin, ai_prob=None, risk_pct=None, leverage=None):
     base = compute_margin(equity, sl_pct, risk_pct, leverage)
-    ...
-    if base <= 0: return 0.0
-    
+    if base <= 0 or not math.isfinite(free_margin) or free_margin <= 0:
+        return 0.0
     if AI_IS_ACTIVE and ai_prob is not None:
-        if ai_prob >= 0.70: mult = 1.00
-        elif ai_prob >= 0.60: mult = 0.85
-        elif ai_prob >= 0.50: mult = 0.60
-        else: mult = 0.30
+        if ai_prob >= 0.70:
+            mult = 1.00
+        elif ai_prob >= 0.60:
+            mult = 0.85
+        elif ai_prob >= 0.50:
+            mult = 0.65
+        else:
+            mult = 0.40
     else:
-        if signal_score >= 86: mult = 1.00
-        elif signal_score >= 78: mult = 0.85
-        elif signal_score >= 70: mult = 0.70
-        elif signal_score >= 62: mult = 0.55
-        else: mult = 0.40
-    return base * mult
+        mult = next(m for threshold, m in ((86, 1.0), (78, 0.85), (70, 0.70), (62, 0.55), (0, 0.40))
+                    if max(0, signal_score) >= threshold)
+    sized = min(base * mult, free_margin)
+    return sized if sized >= MIN_MARGIN_USDT else 0.0
 
 
 def get_open_position(ex, sym):
     """None فقط إذا لا يوجد مركز. أي خطأ API يرفع Exception."""
+    matches = []
     for p in ex.fetch_positions([sym]):
+        if p.get("symbol") not in (None, sym):
+            continue
         contracts = abs(float(p.get('contracts') or 0))
         if contracts > 0:
-            return {"side": "LONG" if p.get('side') == 'long' else "SHORT",
-                    "contracts": contracts,
-                    "entry": float(p.get('entryPrice') or 0),
-                    "margin": float(p.get('initialMargin') or 0)}
-    return None
+            if p.get("side") not in ("long", "short") or (p.get("info") or {}).get("posSide") in ("long", "short"):
+                raise ValueError("the bot requires OKX net position mode")
+            matches.append({"side": p["side"].upper(), "contracts": contracts,
+                            "entry": float(p.get('entryPrice') or 0),
+                            "margin": float(p.get('initialMargin') or 0)})
+    if len(matches) > 1:
+        raise ValueError("multiple positions for one instrument")
+    return matches[0] if matches else None
 
 
 # ==========================================
@@ -1265,7 +1431,8 @@ def get_open_position(ex, sym):
 # ==========================================
 def _valid_trigger(value):
     try:
-        return float(value or 0) > 0
+        v = float(value or 0)
+        return math.isfinite(v) and v > 0
     except (TypeError, ValueError):
         return False
 
@@ -1274,17 +1441,23 @@ def get_algos(ex, sym):
     out = []
     market = ex.market(sym)
     algo = ex.privateGetTradeOrdersAlgoPending({'instId': market['id'], 'ordType': 'conditional'})
+    if str(algo.get("code")) != "0" or not isinstance(algo.get("data"), list):
+        raise ValueError("invalid OKX pending algo response")
     for o in (algo.get('data') or []):
         out.append({"id": o.get('algoId'),
+                    "side": o.get("side"), "size": o.get("sz"),
+                    "reduce_only": str(o.get("reduceOnly")).lower() == "true",
                     "is_sl": _valid_trigger(o.get('slTriggerPx')),
                     "is_tp": _valid_trigger(o.get('tpTriggerPx'))})
     return out
 
 
-def has_protection(ex, sym):
+def has_protection(ex, sym, close_side, contracts):
     """(has_sl, has_tp) أو (None, None) إذا تعذر الاستعلام."""
     try:
-        algos = get_algos(ex, sym)
+        algos = [a for a in get_algos(ex, sym) if a["id"] and a["side"] == close_side
+                 and a["reduce_only"] and _valid_trigger(a["size"])
+                 and math.isclose(float(a["size"]), contracts, rel_tol=1e-9, abs_tol=1e-12)]
         return any(a["is_sl"] for a in algos), any(a["is_tp"] for a in algos)
     except Exception as e:
         log.warning(f"[PROTECTION UNKNOWN] {sym}: {e}")
@@ -1324,7 +1497,7 @@ def place_sl_tp(ex, sym, side, contracts, trigger, is_sl):
         req.update({'tpTriggerPx': trig_str, 'tpOrdPx': '-1'})
     res = ex.privatePostTradeOrderAlgo(req)
     data = (res.get('data') or [{}])[0]
-    if str(data.get('sCode', '0')) != '0':
+    if str(res.get("code")) != "0" or str(data.get("sCode")) != "0" or not data.get("algoId"):
         raise Exception(f"algo rejected: {data.get('sCode')} {data.get('sMsg')}")
     return res
 
@@ -1350,7 +1523,6 @@ def protect_position(ex, sym, close_side, contracts, sl, tp, retries=3):
             except Exception as e:
                 if "51277" in str(e) or "51276" in str(e):
                     log.warning(f"[TP SKIP] {sym}: target already passed")
-                    tp_ok = True
                     break
                 log.error(f"[TP ERR] {sym} try {i + 1}: {e}")
                 time.sleep(0.8)
@@ -1367,7 +1539,8 @@ def replace_protection(ex, sym, close_side, contracts, sl, tp=None):
     sl_ok, tp_ok = protect_position(ex, sym, close_side, contracts, sl, tp)
     if not sl_ok:
         return False
-    ids = [a["id"] for a in old if a["is_sl"] or (tp is not None and tp_ok and a["is_tp"])]
+    ids = [a["id"] for a in old if a["id"] and a["reduce_only"] and a["side"] == close_side
+           and (a["is_sl"] or a["is_tp"]) and (not a["is_tp"] or (tp is not None and tp_ok))]
     cancel_algo_ids(ex, sym, ids)
     return True
 
@@ -1411,7 +1584,9 @@ def open_position(ex, sym, side, price, sl, tp, margin, leverage=None):
     try:
         lev = leverage if leverage is not None else LEVERAGE
         amount = calculate_contracts(ex, sym, margin, price, lev)
-        ...
+        if amount <= 0:
+            return False, "كمية غير صالحة", price, 0.0
+        cancel_pending(ex, sym)
         ok, err = set_leverage_checked(ex, sym, lev)
         if not ok:
             log.error(f"[LEVERAGE] {sym}: {err}")
@@ -1420,7 +1595,6 @@ def open_position(ex, sym, side, price, sl, tp, margin, leverage=None):
         close_side = 'sell' if side == "LONG" else 'buy'
         order = ex.create_order(sym, 'market', order_side, amount, None,
                                 {'tdMode': MARGIN_MODE, 'posSide': 'net'})
-        # تأكيد ظهور المركز قبل أي حماية أو إعلان
         pos = None
         for _ in range(7):
             time.sleep(0.7)
@@ -1507,15 +1681,21 @@ def get_exit_price(ex, sym, pos_data):
 
 
 def detect_reason(pos_data, exit_price):
-    side, entry, sl, tp = pos_data["position"], pos_data["entry"], pos_data["sl"], pos_data["tp"]
-    if tp and abs(exit_price - tp) / max(tp, 1e-9) < 0.005: # زيادة التسامح للهدف
-        return "Take Profit"
-    if sl and abs(exit_price - sl) / max(sl, 1e-9) < 0.015: # زيادة التسامح للوقف (1.5%)
-        if pos_data.get("breakeven_hit"):
-            profitable = (sl > entry * 1.0015) if side == "LONG" else (sl < entry * 0.9985)
-            return "Trailing Stop" if profitable else "Breakeven Hit"
-        return "Stop Loss"
-    return "Manual/External"
+    """قرينة سعرية فقط؛ لا تُسجّل باعتبارها سبباً مؤكداً."""
+    if exit_price is None:
+        return "Unconfirmed Exit"
+    side, sl, tp = pos_data["position"], pos_data["sl"], pos_data["tp"]
+    d = 1 if side == "LONG" else -1
+    near_tp = bool(tp and -0.0005 <= d * (exit_price - tp) / tp <= 0.002)
+    near_sl = bool(sl and -0.002 <= d * (exit_price - sl) / sl <= 0.0005)
+    if near_tp == near_sl:
+        return "Unconfirmed Exit"
+    if near_tp:
+        return "Estimated Take Profit"
+    if pos_data.get("breakeven_hit"):
+        be = breakeven_price(side, pos_data["entry"])
+        return "Estimated Trailing Stop" if d * (sl - be) > 1e-8 else "Estimated Breakeven Hit"
+    return "Estimated Stop Loss"
 
 
 def finalize_trade(ex, sym, reason_hint=None):
@@ -1524,16 +1704,16 @@ def finalize_trade(ex, sym, reason_hint=None):
     if not pos_data.get("position"):
         return
     side, entry = pos_data["position"], pos_data["entry"]
+    mode = pos_data.get("mode", "swing")
     d = 1 if side == "LONG" else -1
 
-    # كشف الصفقة الوهمية: لا تنفيذات إطلاقاً وعمرها قصير
     age = time.time() - (pos_data.get("opened_ts") or time.time())
     if age < GHOST_MAX_AGE_SEC and (pos_data.get("strategy") or "") != "adopted":
         try:
             fills = ex.fetch_my_trades(sym, since=int(pos_data["opened_ts"] * 1000) - 30000, limit=50)
             if fills is not None and len(fills) == 0:
                 log.error(f"[GHOST] {sym}: لا تنفيذات ({age:.0f}ث) — صفقة وهمية، أُهملت")
-                reset_sym_state(sym, cooldown=True, mode=pos_data.get("mode", "swing"))
+                reset_sym_state(sym, cooldown=True, mode=mode)
                 cancel_pending(ex, sym)
                 send(f"⚠️ <b>صفقة وهمية مُهملة</b> <code>{short(sym)}</code>\n"
                      f"لا تنفيذات خلال {age:.0f}ث — لم تُحتسب.")
@@ -1541,7 +1721,8 @@ def finalize_trade(ex, sym, reason_hint=None):
         except Exception as e:
             log.warning(f"[GHOST CHECK] {sym}: {e}")
 
-    exit_price = get_exit_price(ex, sym, pos_data) or get_current_price(ex, sym, 0) or entry
+    fill_price = get_exit_price(ex, sym, pos_data)
+    exit_price = fill_price or get_current_price(ex, sym, 0) or entry
     cs = contract_size(ex, sym)
     contracts = pos_data.get("contracts", 0.0)
     realized = pos_data.get("realized_pnl", 0.0)
@@ -1564,14 +1745,14 @@ def finalize_trade(ex, sym, reason_hint=None):
     final_leg = total - realized
 
     margin = pos_data.get("margin") or POSITION_SIZE_USDT
-    reason = reason_hint or detect_reason(pos_data, exit_price)
+    reason = reason_hint or detect_reason(pos_data, fill_price)
     init_risk = pos_data.get("initial_risk", 0.0)
     risk_usd = init_risk * pos_data.get("initial_contracts", 0.0) * cs
     r_mult = (total / risk_usd) if risk_usd > 0 else 0.0
     duration = int((time.time() - (pos_data.get("opened_ts") or time.time())) / 60)
 
     stop_slip_usd = stop_slip_r = None
-    if reason in ("Stop Loss", "Trailing Stop", "Breakeven Hit") and pos_data.get("sl"):
+    if reason in ("Estimated Stop Loss", "Estimated Trailing Stop", "Estimated Breakeven Hit") and pos_data.get("sl"):
         adverse = (pos_data["sl"] - exit_price) if side == "LONG" else (exit_price - pos_data["sl"])
         stop_slip_usd = adverse * contracts * cs
         stop_slip_r = (adverse / init_risk) if init_risk else 0.0
@@ -1608,7 +1789,7 @@ def finalize_trade(ex, sym, reason_hint=None):
         "volume_ratio": pos_data.get("volume_ratio", ""),
         "ker": pos_data.get("ker", ""),
     })
-    reset_sym_state(sym, cooldown=True)
+    reset_sym_state(sym, cooldown=True, mode=mode)
     cancel_pending(ex, sym)
     send(msg_exit(sym, side, exit_price, entry, total, final_leg, margin, r_mult, reason,
                   pos_data.get("strategy", ""), fees_total, fees_src, stop_slip_usd, stop_slip_r))
@@ -1632,19 +1813,30 @@ def emergency_close(ex, sym, why):
 # البيانات
 # ==========================================
 def fetch_data(ex, sym, tf, limit=130):
-    key = (sym, tf)
+    """يعيد مؤشرات محسوبة مرة لكل شمعة مغلقة، مع حذف FIFO عند امتلاء الكاش."""
+    key = (sym, tf, limit)
+    tf_ms = TF_MS[tf]
     cached = _data_cache.get(key)
-    if cached and cached[1] and time.time() * 1000 < cached[1][-1][0] + TF_MS.get(tf, 60_000) + 1500:
+    current = int(time.time() * 1000 // tf_ms) * tf_ms
+    if cached and cached[0] == current:
         return cached[1]
-    for _ in range(3):
-        try:
-            data = ex.fetch_ohlcv(sym, tf, limit=limit)
-            _data_cache[key] = (time.time(), data)
-            return data
-        except Exception as e:
-            log.warning(f"[OHLCV] {sym} {tf}: {e}")
-            time.sleep(1.3)
-    return cached[1] if cached else []
+    try:
+        data = ex.fetch_ohlcv(sym, tf, limit=limit)
+        current = int(time.time() * 1000 // tf_ms) * tf_ms
+        if len(data) < 2 or data[-1][0] != current or data[-2][0] != current - tf_ms:
+            return pd.DataFrame()
+        df = to_df(data)
+        if tf in ("5m", "15m") and len(df) >= 70:
+            df.attrs["range_filter"] = calculate_range_filter(df)
+            df["ker_indicator"] = efficiency_ratio(df["close"], KER_PERIOD)
+        if len(_data_cache) >= 1024 and key not in _data_cache:
+            for _ in range(150):
+                _data_cache.pop(next(iter(_data_cache)), None)
+        _data_cache[key] = (current, df)
+        return df
+    except Exception as e:
+        log.warning(f"[OHLCV] {sym} {tf}: {e}")
+        return pd.DataFrame()
 
 
 def to_df(raw):
@@ -1656,9 +1848,9 @@ def btc_bias(ex):
         return _btc_bias_cache["value"]
     val = "neutral"
     try:
-        raw = fetch_data(ex, "BTC/USDT:USDT", "1h")
-        if len(raw) >= 60:
-            r = to_df(raw).iloc[-2]
+        df = fetch_data(ex, "BTC/USDT:USDT", "1h")
+        if len(df) >= 60:
+            r = df.iloc[-2]
             if r["close"] > r["ema50"] and r["ema21"] > r["ema50"] and r["ema9"] > r["ema21"]:
                 val = "up"
             elif r["close"] < r["ema50"] and r["ema21"] < r["ema50"] and r["ema9"] < r["ema21"]:
@@ -1682,10 +1874,8 @@ def detect_regime(df_15m, df_1h, df_4h, timeframe="15m"):
     ema50_4 = last_4h.get("ema50", last_4h["close"])
     up_4h = last_4h["close"] > ema50_4 and last_4h["ema9"] > last_4h["ema21"]
     down_4h = last_4h["close"] < ema50_4 and last_4h["ema9"] < last_4h["ema21"]
-    
-    # --- معايرة ADX للفريم ---
+
     if timeframe == "5m":
-        # القناص: 1h مكان 4h → عتبات أقل بـ 15%
         adx4_strong_eff = REGIME_ADX4_STRONG * 0.85
         adx4_weak_eff = REGIME_ADX4_WEAK * 0.85
         adx1_strong_eff = REGIME_ADX1_STRONG * 0.90
@@ -1693,7 +1883,7 @@ def detect_regime(df_15m, df_1h, df_4h, timeframe="15m"):
         adx4_strong_eff = REGIME_ADX4_STRONG
         adx4_weak_eff = REGIME_ADX4_WEAK
         adx1_strong_eff = REGIME_ADX1_STRONG
-    
+
     if adx4 > adx4_strong_eff and adx1 > adx1_strong_eff:
         if up_4h:
             return "strong_trend_up"
@@ -1717,52 +1907,27 @@ def relative_atr(df):
         return None
 
 
-def kaufman_efficiency_ratio(close, period=10):
-    """KER: صافي الحركة ÷ مجموع الحركة خلال الفترة."""
-    try:
-        s = pd.to_numeric(close, errors="coerce").dropna()
-        if len(s) < period + 1 or period <= 0:
-            return None
-        window = s.iloc[-(period + 1):]
-        net = abs(float(window.iloc[-1]) - float(window.iloc[0]))
-        noise = float(window.diff().abs().iloc[1:].sum())
-        return net / noise if noise > 0 else 1.0
-    except Exception:
-        return None
 def calculate_range_filter(df, period=100, mult=3.0):
-    try:
-        src = df['close']
-        wper = period * 2 - 1
-        avrng = (src - src.shift(1)).abs().ewm(span=period, adjust=False).mean()
-        smrng = avrng.ewm(span=wper, adjust=False).mean() * mult
-        
-        filt = pd.Series(index=df.index, dtype=float)
-        filt.iloc[0] = src.iloc[0]
-        
-        for i in range(1, len(df)):
-            prev_filt = filt.iloc[i-1]
-            curr_src = src.iloc[i]
-            curr_r = smrng.iloc[i]
-            
-            if curr_src > prev_filt:
-                filt.iloc[i] = max(prev_filt, curr_src - curr_r)
-            else:
-                filt.iloc[i] = min(prev_filt, curr_src + curr_r)
-                
-        upward = (filt > filt.shift(1)).astype(int)
-        downward = (filt < filt.shift(1)).astype(int)
-        
-        last_idx = -2
-        if upward.iloc[last_idx] > 0 or (src.iloc[last_idx] > filt.iloc[last_idx] and src.iloc[last_idx] > src.iloc[last_idx-1]):
-            return 1
-        elif downward.iloc[last_idx] > 0 or (src.iloc[last_idx] < filt.iloc[last_idx] and src.iloc[last_idx] < src.iloc[last_idx-1]):
-            return -1
+    if len(df) < 3:
         return 0
-    except Exception:
-        return 0
+    src = df["close"].iloc[:-1]
+    smooth = (src.diff().abs().ewm(span=period, adjust=False).mean()
+              .ewm(span=2 * period - 1, adjust=False).mean() * mult)
+    values, widths = src.to_numpy(), smooth.to_numpy()
+    current = values[0]
+    previous = current
+    for price, width in zip(values[1:], widths[1:]):
+        previous = current
+        current = max(previous, price - width) if price > previous else min(previous, price + width)
+    if current > previous and values[-1] > current:
+        return 1
+    if current < previous and values[-1] < current:
+        return -1
+    return 0
+
 
 def build_context(df_15m, df_1h, df_4h, timeframe="15m"):
-    """الشروط العامة. timeframe='5m' للقناص — يعاير العتبات تلقائياً."""
+    """الشروط العامة المشتركة مع معايرة تلقائية لوضع القناص (5m)."""
     if len(df_15m) < 70 or len(df_1h) < 60 or len(df_4h) < 60:
         return None, "insufficient_data"
     last = df_15m.iloc[-2]
@@ -1775,25 +1940,23 @@ def build_context(df_15m, df_1h, df_4h, timeframe="15m"):
     price = float(last["close"])
     atr_val = float(last["atr"])
     adx_val = float(last["adx"])
+    if not _valid_trigger(price) or not _valid_trigger(atr_val):
+        return None, "indicators_nan"
 
-    # --- معايرة العتبات حسب الفريم ---
     if timeframe == "5m":
-        # القناص: 5m ATR أصغر بـ ~35% من 15m، ADX أصغر بـ ~10%
-        atr_mult_eff = SNIPER["atr_sl_mult"]        # 1.18
-        min_atr_eff = MIN_ATR_PCT * 0.65            # 0.00195
-        min_adx_eff = MIN_ADX * 0.90                # 18
-        min_sl_eff = SNIPER["min_sl"]               # 0.0048
-        max_sl_eff = SNIPER["max_sl"]               # 0.0145
-        rr_eff = SNIPER["rr"]                       # 1.85
-        rel_atr_ratio_eff = REL_ATR_RATIO * 1.0     # نسبي، لا يحتاج تغيير
+        atr_mult_eff = SNIPER["atr_sl_mult"]
+        min_atr_eff = MIN_ATR_PCT * 0.65
+        min_adx_eff = MIN_ADX * 0.90
+        min_sl_eff = SNIPER["min_sl"]
+        max_sl_eff = SNIPER["max_sl"]
+        rr_eff = SNIPER["rr"]
     else:
-        atr_mult_eff = ATR_SL_MULT                  # 1.55
-        min_atr_eff = MIN_ATR_PCT                   # 0.003
-        min_adx_eff = MIN_ADX                       # 20
-        min_sl_eff = MIN_SL_PCT                     # 0.0065
-        max_sl_eff = MAX_SL_PCT                     # 0.032
-        rr_eff = RR_RATIO                           # 2.30
-        rel_atr_ratio_eff = REL_ATR_RATIO
+        atr_mult_eff = ATR_SL_MULT
+        min_atr_eff = MIN_ATR_PCT
+        min_adx_eff = MIN_ADX
+        min_sl_eff = MIN_SL_PCT
+        max_sl_eff = MAX_SL_PCT
+        rr_eff = RR_RATIO
 
     regime = detect_regime(df_15m, df_1h, df_4h, timeframe)
     if regime == "unknown":
@@ -1805,43 +1968,42 @@ def build_context(df_15m, df_1h, df_4h, timeframe="15m"):
         return None, "atr_high"
     rel = relative_atr(df_15m)
     atr_ok = atr_pct >= min_atr_eff or (
-        rel is not None and atr_pct >= ATR_HARD_FLOOR and rel >= rel_atr_ratio_eff)
+        rel is not None and atr_pct >= ATR_HARD_FLOOR and rel >= REL_ATR_RATIO)
     if not atr_ok:
         return None, "atr_low"
     if adx_val < min_adx_eff:
         return None, "low_adx"
 
-    # KER متكيف — يبقى كما هو (مقياس نسبي)
     ker_value = None
+    er_series = (df_15m["ker_indicator"] if "ker_indicator" in df_15m
+                 else efficiency_ratio(df_15m["close"], KER_PERIOD))
     if ENABLE_KER_FILTER:
-        er_series = efficiency_ratio(df_15m["close"], KER_PERIOD)
         ker_recent = er_series.iloc[-4:-1].dropna()
         ker_smoothed = float(ker_recent.median()) if len(ker_recent) >= 2 else 0.0
         min_ker_eff = MIN_KER * 0.55 if regime in ("strong_trend_up", "strong_trend_down") else MIN_KER
         if timeframe == "5m":
-            min_ker_eff = max(min_ker_eff, SNIPER["min_ker"])  # 0.29 للقناص
+            min_ker_eff = max(min_ker_eff, SNIPER["min_ker"])
         if ker_smoothed < min_ker_eff:
             return None, "low_ker"
         ker_value = ker_smoothed
     else:
-        er_series = efficiency_ratio(df_15m["close"], KER_PERIOD)
         v = er_series.iloc[-2] if len(er_series) >= 2 else None
         ker_value = float(v) if (v is not None and not pd.isna(v)) else None
 
-    rf_direction = calculate_range_filter(df_15m)
-    
-    long_dir = regime in ("strong_trend_up", "weak_trend")
+    rf_direction = (df_15m.attrs["range_filter"] if "range_filter" in df_15m.attrs
+                    else calculate_range_filter(df_15m))
+
+    long_dir = regime in ("strong_trend_up", "weak_trend") and last_4h["close"] > last_4h["ema50"]
     short_dir = regime in ("strong_trend_down", "weak_trend") and last_4h["close"] < last_4h["ema50"]
-    
+
     if rf_direction == -1:
         long_dir = False
     if rf_direction == 1:
         short_dir = False
-        
+
     if not long_dir and not short_dir:
         return None, "direction_mismatch"
 
-    # --- SL/TP معايرة للفريم ---
     sl_pct = max(min_sl_eff, min(max_sl_eff, atr_mult_eff * atr_val / price))
     return {
         "last": last, "prev": prev, "last_1h": last_1h, "last_4h": last_4h,
@@ -1849,6 +2011,7 @@ def build_context(df_15m, df_1h, df_4h, timeframe="15m"):
         "ema50": float(last["ema50"]), "rsi": float(last["rsi"]),
         "regime": regime, "long_dir": long_dir, "short_dir": short_dir,
         "ker": ker_value, "sl_pct": sl_pct, "tp_pct": sl_pct * rr_eff,
+        "candle_ts": int(last["timestamp"]),
     }, None
 
 
@@ -1859,7 +2022,8 @@ def _make_signal(side, ctx, strategy):
     else:
         sl, tp = p * (1 + sp), p * (1 - tp_pct)
     return {"side": side, "price": p, "sl_pct": sp, "sl": sl, "tp": tp,
-            "regime": ctx["regime"], "strategy": strategy, "ker": ctx.get("ker")}
+            "regime": ctx["regime"], "strategy": strategy, "ker": ctx.get("ker"),
+            "candle_ts": ctx.get("candle_ts", 0)}
 
 
 def pullback_signal(ctx):
@@ -1880,6 +2044,8 @@ def pullback_signal(ctx):
         if not bullish_reject:
             return None, "no_pullback_candle"
         return _make_signal("LONG", ctx, "pullback"), None
+    if not ctx["short_dir"]:
+        return None, "direction_mismatch"
     bearish_reject = last["close"] < last["open"] and (last["high"] > ema21 or prev["high"] > ema21)
     if not (last["ema9"] < last["ema21"] and last_1h["ema9"] < last_1h["ema21"]):
         return None, "ema_misaligned"
@@ -1913,6 +2079,8 @@ def breakout_signal(ctx, df_15m):
         if close - ctx["ema21"] > BO_MAX_EXT_ATR * ctx["atr_val"]:
             return None, "bo_extended"
         return _make_signal("LONG", ctx, "breakout"), None
+    if not ctx["short_dir"]:
+        return None, "direction_mismatch"
     if not close < ll:
         return None, "bo_no_breakout"
     if not (last_1h["ema9"] < last_1h["ema21"] and last_1h["close"] < last_1h["ema50"]):
@@ -1929,7 +2097,7 @@ def breakout_signal(ctx, df_15m):
 
 
 def score_signal(signal, ctx, df_15m):
-    """V51: setup=15 للارتداد المثالي (كان 12 في V50)."""
+    """تقييم جودة الفرصة من 100 نقطة."""
     last, h1, h4 = ctx["last"], ctx["last_1h"], ctx["last_4h"]
     side = signal["side"]
     score, factors = 0, {}
@@ -1960,9 +2128,8 @@ def score_signal(signal, ctx, df_15m):
     factors["candle"] = min(10, int(body * 10))
     score += factors["candle"]
 
-    # V51: إصلاح setup — الارتداد المثالي يحصل على 15
     if signal.get("strategy") == "breakout":
-        factors["setup"] = 15
+        factors["setup"] = 15 if vol_ratio >= 2.0 else 13
     elif signal.get("strategy") == "pullback":
         ideal_rsi = (52 <= r <= 62) if side == "LONG" else (38 <= r <= 48)
         strong_candle = factors.get("candle", 0) >= 6
@@ -1982,7 +2149,7 @@ def score_signal(signal, ctx, df_15m):
 
 
 def evaluate_signal(df_15m, df_1h, df_4h, timeframe="15m"):
-    """تقييم الاستراتيجيتين. timeframe='5m' للقناص."""
+    """تقييم الاستراتيجيتين معاً واختيار الأعلى درجة."""
     ctx, reason = build_context(df_15m, df_1h, df_4h, timeframe)
     if ctx is None:
         return None, {"common": reason}
@@ -2013,28 +2180,49 @@ def evaluate_signal(df_15m, df_1h, df_4h, timeframe="15m"):
 
 
 def market_filters_ok(ex, sym, side):
-    """(ok, reason_code). السبريد المجهول يمنع، التمويل المجهول لا يمنع."""
-    try:
-        t = ex.fetch_ticker(sym)
-        bid, ask, last = t.get('bid'), t.get('ask'), t.get('last')
-        if bid and ask and last:
-            spread = (ask - bid) / last
-            _last_spread[sym] = (time.time(), spread)
-            if spread > MAX_SPREAD_PCT:
-                log.info(f"[SPREAD] {sym} {spread * 100:.3f}% > {MAX_SPREAD_PCT * 100:.3f}% — حجب")
-                return False, "spread_high"
-    except Exception as e:
-        log.warning(f"[FILTER TICKER] {sym}: {e}")
-        return False, "ticker_unavailable"
-    try:
-        fr = ex.fetch_funding_rate(sym).get('fundingRate')
-        if fr is not None:
-            if side == "LONG" and fr > MAX_FUNDING_RATE:
-                return False, "funding_high"
-            if side == "SHORT" and fr < -MAX_FUNDING_RATE:
-                return False, "funding_negative"
-    except Exception as e:
-        log.warning(f"[FILTER FUNDING] {sym}: {e} (تجاوز)")
+    """فحص السبريد (من الكاش الحديث أو API) ومعدل التمويل (مع كاش 15 دقيقة)."""
+    now = time.time()
+    cached = _price_cache.get(sym)
+    if cached and (now - cached[0]) <= 15 and cached[2] and cached[3]:
+        last, bid, ask = cached[1], cached[2], cached[3]
+        spread = (ask - bid) / last
+        _last_spread[sym] = (now, spread)
+        if spread > MAX_SPREAD_PCT:
+            log.info(f"[SPREAD] {sym} {spread * 100:.3f}% > {MAX_SPREAD_PCT * 100:.3f}% — حجب")
+            return False, "spread_high"
+    else:
+        try:
+            t = ex.fetch_ticker(sym)
+            bid, ask, last = t.get('bid'), t.get('ask'), t.get('last')
+            if all(_valid_trigger(v) for v in (bid, ask, last)) and ask >= bid:
+                _price_cache[sym] = (now, float(last), float(bid), float(ask))
+                spread = (ask - bid) / last
+                _last_spread[sym] = (now, spread)
+                if spread > MAX_SPREAD_PCT:
+                    log.info(f"[SPREAD] {sym} {spread * 100:.3f}% > {MAX_SPREAD_PCT * 100:.3f}% — حجب")
+                    return False, "spread_high"
+            else:
+                return False, "ticker_unavailable"
+        except Exception as e:
+            log.warning(f"[FILTER TICKER] {sym}: {e}")
+            return False, "ticker_unavailable"
+
+    f_cached = _funding_cache.get(sym)
+    if f_cached and (now - f_cached[0]) < 900:
+        fr = f_cached[1]
+    else:
+        try:
+            fr = ex.fetch_funding_rate(sym).get('fundingRate')
+            _funding_cache[sym] = (now, fr)
+        except Exception as e:
+            log.warning(f"[FILTER FUNDING] {sym}: {e} (تجاوز)")
+            fr = None
+
+    if fr is not None:
+        if side == "LONG" and fr > MAX_FUNDING_RATE:
+            return False, "funding_high"
+        if side == "SHORT" and fr < -MAX_FUNDING_RATE:
+            return False, "funding_negative"
     return True, ""
 
 
@@ -2051,16 +2239,7 @@ def sector_limit_reached(sym, side):
     with state_lock:
         n = sum(1 for s, v in state.items() if v.get("position") == side and sector_of(s) == sec)
     return n >= MAX_PER_SECTOR_SAME_DIR
-
-
-# ============================================================
-# ← نهاية الجزء 2/3
-# الجزء 3/3 يبدأ بـ: breakeven_price + move_sl + do_partial
-#                  + manage_position + entries_allowed + process_symbol
-#                  + sync_positions + adopt_orphans + جميع أوامر Telegram
-#                  + trading_loop + __main__
-# ============================================================
-# ============================================================
+    # ============================================================
 # الجزء 3/3 — إدارة المراكز، التنفيذ، Telegram، الحلقة الرئيسية
 # ============================================================
 
@@ -2107,28 +2286,48 @@ def do_partial(ex, sym, st, which):
             state[sym][f"partial_{which}_taken"] = True
         save_state()
         return False
+    pending = {"which": which, "before": contracts, "id": None, "price": None, "ts": time.time()}
+    with state_lock:
+        state[sym]["partial_order_pending"] = pending
+    save_state()
     try:
         order = ex.create_order(sym, 'market', close_side, amt, None,
                                 {'tdMode': MARGIN_MODE, 'posSide': 'net', 'reduceOnly': True})
+        with state_lock:
+            pending.update(id=order.get("id"), price=order.get("average") or order.get("price"))
+        save_state()
     except Exception as e:
         log.error(f"[PARTIAL ORDER] {sym}: {e}")
+        with state_lock:
+            state[sym]["partial_order_pending"] = None
+        save_state()
+        send(f"⚠️ تعذر إرسال طلب الإغلاق الجزئي لـ <code>{short(sym)}</code>.")
         return False
     time.sleep(0.8)
     try:
         after = get_open_position(ex, sym)
-        remaining = after["contracts"] if after else 0.0
-        actual_closed = max(0.0, contracts - remaining)
-        if actual_closed < mn or remaining < mn:
-            log.warning(f"[PARTIAL UNCONFIRMED] {sym}: closed={actual_closed}")
-            return False
+        if after and after["side"] == side:
+            reconcile_partial(ex, sym, st, pending, after["contracts"])
     except Exception as e:
         log.warning(f"[PARTIAL POS FETCH] {sym}: {e}")
+    return True
+
+
+def reconcile_partial(ex, sym, st, pending, remaining):
+    which, contracts = pending["which"], pending["before"]
+    actual_closed = contracts - remaining
+    if actual_closed <= 1e-10 or remaining <= 0:
+        if time.time() - pending.get("ts", 0) > 30:
+            with state_lock:
+                state[sym]["partial_order_pending"] = None
+            save_state()
         return False
+    side, entry = st["position"], st["entry"]
     fill_ts = time.time()
-    exit_price = order.get("average") or order.get("price")
+    exit_price = pending.get("price")
     try:
-        if not exit_price and order.get("id"):
-            fetched = ex.fetch_order(order["id"], sym)
+        if not exit_price and pending.get("id"):
+            fetched = ex.fetch_order(pending["id"], sym)
             exit_price = fetched.get("average") or fetched.get("price")
     except Exception as e:
         log.warning(f"[PARTIAL FILL PRICE] {sym}: {e}")
@@ -2136,8 +2335,10 @@ def do_partial(ex, sym, st, which):
     cs_leg = contract_size(ex, sym)
     pnl = leg_pnl(side, entry, exit_price, actual_closed, cs_leg)
     fee_est_leg = leg_fee_est(entry, exit_price, actual_closed, cs_leg)
-    new_sl = breakeven_price(side, entry) if which == 1 else st["sl"]
-    protected = replace_protection(ex, sym, close_side, remaining, new_sl, st.get("tp"))
+    new_sl = st["sl"]
+    if which == 1:
+        be = breakeven_price(side, entry)
+        new_sl = max(be, new_sl) if side == "LONG" else min(be, new_sl)
     with state_lock:
         s = state[sym]
         s["contracts"] = remaining
@@ -2145,42 +2346,74 @@ def do_partial(ex, sym, st, which):
         s["realized_pnl"] = s.get("realized_pnl", 0.0) + pnl
         s["realized_fees_est"] = s.get("realized_fees_est", 0.0) + fee_est_leg
         s["leg_ts"] = fill_ts
-        if which == 1 and protected:
-            s["sl"] = new_sl
-            s["breakeven_hit"] = True
+        s["pending_protection_sl"] = new_sl
+        s["partial_order_pending"] = None
     add_daily_pnl(pnl)
-    save_state()
-    pct_txt = f"{int(p1_pct * 100)}% من الكمية" if which == 1 else f"{int(p2_pct * 100)}% من المتبقي"
-    extra = "نقل الوقف للتعادل" if (which == 1 and protected) else "قفل أرباح إضافية"
-    warn = "" if protected else "\n⚠️ تعذر تحديث الحماية."
-    send(f"💰 <b>إغلاق جزئي {which} ({pct_txt})</b> — <code>{short(sym)}</code>\n"
-         f"ربح الجزء: {pnl:+.2f} USDT | {extra}{warn}")
+    send(f"💰 <b>إغلاق جزئي {which}</b> | <code>{short(sym)}</code>\n"
+         f"ربح الجزء: {pnl:+.2f} USDT. جارٍ التحقق من حماية المتبقي.")
+    repair_protection(ex, sym, dict(state[sym]), get_current_price(ex, sym))
+    return True
+
+
+_tp_retry = {}
+
+
+def repair_protection(ex, sym, st, price):
+    side = st["position"]
+    close_side = 'sell' if side == "LONG" else 'buy'
+    contracts = st["contracts"]
+    has_sl, has_tp = has_protection(ex, sym, close_side, contracts)
+    pending_sl = st.get("pending_protection_sl")
+    if has_sl is None and pending_sl is None:
+        return False
+    if not has_sl or pending_sl is not None:
+        sl_px = st.get("sl")
+        desired = pending_sl or sl_px
+        breached = price and desired and (price <= desired if side == "LONG" else price >= desired)
+        if breached or not desired:
+            if has_sl is not True or pending_sl is not None:
+                emergency_close(ex, sym, "تجاوز الوقف أو تعذر تحديده")
+            return False
+        if replace_protection(ex, sym, close_side, contracts, desired, st.get("tp")):
+            with state_lock:
+                state[sym]["sl"] = desired
+                state[sym]["pending_protection_sl"] = None
+                entry = st["entry"]
+                state[sym]["breakeven_hit"] = (desired >= entry if side == "LONG" else desired <= entry)
+            save_state()
+        else:
+            has_sl, _ = has_protection(ex, sym, close_side, contracts)
+            if has_sl is not True:
+                emergency_close(ex, sym, "تعذر تأكيد وقف يغطي الكمية المتبقية")
+        return False
+
+    tp = st.get("tp")
+    if tp and has_tp is False and price and time.monotonic() >= _tp_retry.get(sym, 0):
+        _tp_retry[sym] = time.monotonic() + 30
+        if (price >= tp if side == "LONG" else price <= tp):
+            fresh = get_current_price(ex, sym, 0)
+            if not fresh:
+                return False
+            if (fresh >= tp if side == "LONG" else fresh <= tp):
+                if close_full(ex, sym):
+                    finalize_trade(ex, sym, reason_hint="Take Profit")
+                return False
+        try:
+            place_sl_tp(ex, sym, close_side, contracts, tp, False)
+        except Exception as e:
+            log.warning("[TP REPAIR] %s: %s", sym, e)
     return True
 
 
 def manage_position(ex, sym, st):
-    side = st["position"]
-    entry = st["entry"]
+    side, entry = st["position"], st["entry"]
     d = 1 if side == "LONG" else -1
     price = get_current_price(ex, sym)
-    if not price:
+    pending = st.get("partial_order_pending")
+    if pending and reconcile_partial(ex, sym, st, pending, st["contracts"]):
         return
-    close_side = 'sell' if side == "LONG" else 'buy'
-
-    has_sl, _ = has_protection(ex, sym)
-    if has_sl is None:
-        log.warning(f"[MANAGE] حالة الحماية مجهولة لـ {sym} — تأجيل")
+    if not repair_protection(ex, sym, st, price) or not price:
         return
-    if not has_sl:
-        sl_px = st.get("sl")
-        breached = bool(sl_px) and ((side == "LONG" and price <= sl_px) or (side == "SHORT" and price >= sl_px))
-        if breached:
-            emergency_close(ex, sym, "السعر تجاوز الوقف ولم يُنفَّذ — إغلاق فوري")
-            return
-        ok = replace_protection(ex, sym, close_side, st["contracts"], st["sl"], st.get("tp"))
-        if not ok:
-            emergency_close(ex, sym, "الصفقة بدون وقف خسارة")
-            return
 
     mode = st.get("mode", "swing")
     params = get_trade_params(mode)
@@ -2196,10 +2429,10 @@ def manage_position(ex, sym, st):
         return
     r_now = (price - entry) * d / risk
 
-    if not st.get("partial_1_taken") and r_now >= params["partial1_r"]:
+    if not pending and not st.get("partial_1_taken") and r_now >= params["partial1_r"]:
         if do_partial(ex, sym, st, 1):
             return
-    elif st.get("partial_1_taken") and not st.get("partial_2_taken") and r_now >= params["partial2_r"]:
+    elif not pending and st.get("partial_1_taken") and not st.get("partial_2_taken") and r_now >= params["partial2_r"]:
         if do_partial(ex, sym, st, 2):
             return
 
@@ -2209,10 +2442,10 @@ def manage_position(ex, sym, st):
         return
 
     trail_tf = "5m" if mode == "sniper" else "15m"
-    raw = fetch_data(ex, sym, trail_tf)
-    if len(raw) < 50:
+    df = fetch_data(ex, sym, trail_tf)
+    if len(df) < 60:
         return
-    atr_val = to_df(raw).iloc[-2].get("atr")
+    atr_val = df.iloc[-2].get("atr")
     if atr_val is None or pd.isna(atr_val):
         return
     mult = params["trail_atr"]
@@ -2246,8 +2479,9 @@ def floating_pnl_cached(ex):
     for sym, v in open_positions_snapshot().items():
         c = _price_cache.get(sym)
         price = c[1] if c else v["entry"]
-        d = 1 if v["position"] == "LONG" else -1
-        total += (price - v["entry"]) * d * v["contracts"] * contract_size(ex, sym)
+        cs = contract_size(ex, sym)
+        total += leg_pnl(v["position"], v["entry"], price, v["contracts"], cs)
+        total -= price * v["contracts"] * cs * FLOATING_FUNDING_BUFFER_PCT
     return total
 
 
@@ -2276,7 +2510,7 @@ def entries_allowed(ex):
 
 
 # ==========================================
-# معالجة الرموز (مع Paper logging)
+# معالجة الرموز (مع Paper logging و Sniper)
 # ==========================================
 def process_symbol(ex, sym):
     try:
@@ -2296,6 +2530,9 @@ def process_symbol(ex, sym):
                         return
                     finalize_trade(ex, sym)
                     return
+                if exch_pos["side"] != pos_data["position"]:
+                    log.error("[POSITION SIDE MISMATCH] %s: verify the position in OKX", sym)
+                    return
                 with state_lock:
                     state[sym]["missing_checks"] = 0
                     state[sym]["contracts"] = exch_pos["contracts"]
@@ -2303,6 +2540,7 @@ def process_symbol(ex, sym):
                 manage_position(ex, sym, cur)
                 return
 
+        if pos_data.get("position") is None:
             last_exit_mode = pos_data.get("last_exit_mode") or "swing"
             effective_cooldown = SNIPER["cooldown"] if last_exit_mode == "sniper" else REENTRY_COOLDOWN_SEC
             if time.time() - pos_data.get("last_exit_ts", 0) < effective_cooldown:
@@ -2318,33 +2556,34 @@ def process_symbol(ex, sym):
                 set_last_reason(sym, "max_positions")
                 return
 
-            raw_15m = fetch_data(ex, sym, "15m")
-            if len(raw_15m) < 70:
+            df_15m = fetch_data(ex, sym, "15m")
+            if len(df_15m) < 70:
                 set_last_reason(sym, "no_data")
                 return
-            closed_ts = raw_15m[-2][0]
-            if _last_eval.get(sym) == closed_ts:
-                return
-            raw_1h = fetch_data(ex, sym, "1h")
-            raw_4h = fetch_data(ex, sym, "4h")
-            if len(raw_1h) < 60 or len(raw_4h) < 60:
-                set_last_reason(sym, "no_data")
-                return
-            _last_eval[sym] = closed_ts
-            raw_5m = fetch_data(ex, sym, "5m") if ENABLE_SNIPER else []
 
-            # ===================== محاولة القناص أولاً =====================
+            swing_ts = int(df_15m["timestamp"].iloc[-2])
+            want_swing = not SNIPER_ONLY and _last_eval.get((sym, "swing")) != swing_ts
+            expected_5m = (int(time.time() * 1000 // TF_MS["5m"]) - 1) * TF_MS["5m"]
+            want_sniper = ENABLE_SNIPER and _last_eval.get((sym, "sniper")) != expected_5m
+            if not want_swing and not want_sniper:
+                return
+
+            df_1h = fetch_data(ex, sym, "1h")
+            if len(df_1h) < 60:
+                set_last_reason(sym, "no_data")
+                return
+            df_5m = fetch_data(ex, sym, "5m") if want_sniper else pd.DataFrame()
+
+            # ===================== 1. محاولة القناص أولاً (5m) =====================
             signal = None
             reasons = {}
             mode = "swing"
 
-            if ENABLE_SNIPER and len(raw_5m) >= 70:
+            if want_sniper and len(df_5m) >= 70:
                 try:
-                    df_5m = to_df(raw_5m)
-                    df_15m = to_df(raw_15m)
-                    df_1h = to_df(raw_1h)
-
+                    _last_eval[(sym, "sniper")] = int(df_5m["timestamp"].iloc[-2])
                     signal_s, reasons_s = evaluate_signal(df_5m, df_15m, df_1h, timeframe="5m")
+                    reasons = reasons_s or {"common": "score_low"}
 
                     if signal_s and signal_s.get("score", 0) >= SNIPER["min_score"]:
                         current_price = get_current_price(ex, sym) or signal_s["price"]
@@ -2366,17 +2605,32 @@ def process_symbol(ex, sym):
                                 mode = "sniper"
                                 log.info(f"[SNIPER] {sym} {signal['side']} score={signal.get('score')} ✓")
                         else:
+                            reasons = {"common": reason_sniper}
                             log.info(f"[SNIPER REJECT] {sym} → {reason_sniper}")
                 except Exception as e:
                     log.warning(f"[SNIPER ERROR] {sym}: {e}")
 
-            # إذا ما نجح القناص → نستخدم النظام العادي
-            if signal is None and not SNIPER_ONLY:
-                signal, reasons = evaluate_signal(to_df(raw_15m), to_df(raw_1h), to_df(raw_4h))
-                mode = "swing"
+            # ===================== 2. النظام الأساسي (15m) =====================
+            if signal is None and want_swing:
+                df_4h = fetch_data(ex, sym, "4h")
+                if len(df_4h) >= 60:
+                    _last_eval[(sym, "swing")] = swing_ts
+                    signal, reasons = evaluate_signal(df_15m, df_1h, df_4h, timeframe="15m")
+                    mode = "swing"
+
+            if not signal and not reasons:
+                set_last_reason(sym, "no_data")
+                return
 
             note_eval(sym, signal, reasons)
             if not signal:
+                return
+
+            # التحقق من عمر الإشارة الزمني
+            tf_ms = TF_MS["5m" if mode == "sniper" else "15m"]
+            max_age_sec = SNIPER["max_signal_age_sec"] if mode == "sniper" else 240
+            if (time.time() * 1000 - (signal.get("candle_ts", 0) + tf_ms)) > max_age_sec * 1000:
+                note_block(sym, "signal_expired")
                 return
 
             side = signal["side"]
@@ -2405,28 +2659,15 @@ def process_symbol(ex, sym):
                 log_paper_signal(sym, signal, m_reason)
                 return
 
-            actual_price = get_current_price(ex, sym, 0)
-            if not actual_price:
-                note_block(sym, "ticker_unavailable")
-                log_paper_signal(sym, signal, "ticker_unavailable")
-                return
-
             max_slip = SNIPER["max_entry_slip"] if mode == "sniper" else max(MAX_ENTRY_SLIPPAGE_PCT, 0.18 * signal["sl_pct"])
-            if abs(actual_price - signal["price"]) / signal["price"] > max_slip:
-                note_block(sym, "slippage")
-                log_paper_signal(sym, signal, "slippage")
-                return
-
             t_params = get_trade_params(mode)
             sl_pct = max(t_params["min_sl"], min(t_params["max_sl"], signal["sl_pct"]))
             tp_rr = t_params["rr"]
-            if side == "LONG":
-                sl = actual_price * (1 - sl_pct)
-                tp = actual_price * (1 + sl_pct * tp_rr)
-            else:
-                sl = actual_price * (1 + sl_pct)
-                tp = actual_price * (1 - sl_pct * tp_rr)
-            # --- فلتر الـ AI ---
+            lev_eff = t_params["leverage"]
+            risk_eff = t_params["risk_pct"]
+
+            # --- فلتر وتقييم الـ AI المحلي ---
+            ai_prob = None
             if AI_IS_ACTIVE:
                 try:
                     factors = signal.get("score_factors", {})
@@ -2440,64 +2681,92 @@ def process_symbol(ex, sym):
                         le_side.transform([signal.get("side", "LONG")])[0]
                     ]
                     ai_prob = float(ai_model.predict_proba([features])[0][1])
+                    if not 0 <= ai_prob <= 1:
+                        raise ValueError("invalid model probability")
                     signal["ai_probability"] = ai_prob
-                    log.info(f"[AI] توقع نجاح {sym}: {ai_prob*100:.1f}%")
-                    
                     thr = AI_MIN_PROB_LONG if side == "LONG" else AI_MIN_PROB_SHORT
+                    if signal.get("score", 0) >= 86:
+                        thr = max(0.35, thr - 0.05)
+
                     log.info(f"[AI] {short(sym)} {side} score={signal.get('score')} "
                              f"احتمال={ai_prob*100:.1f}% (الحد {thr*100:.0f}%)")
                     if mode == "sniper":
                         log.info(f"[AI SNIPER] {short(sym)} مستثنى من حجب الـ AI")
-                    elif ai_prob < thr:
+                    elif USE_AI_ENTRY_FILTER and ai_prob < thr:
                         note_block(sym, "ai_rejected")
                         log_paper_signal(sym, signal, f"ai_rejected_{ai_prob:.2f}")
                         return
                 except Exception as e:
                     log.warning(f"[AI ERROR] {e}")
-                    ai_prob = 0.5
-            else:
-                ai_prob = 0.5
-            # -------------------
-            
-            equity_now = get_equity(ex)
-            margin = compute_margin_scored(equity_now, sl_pct, signal.get("score", 0), None if mode == "sniper" else ai_prob)
+                    ai_prob = None
 
-            if margin <= 0:
-                log.info(f"[SKIP] {sym}: الهامش غير صالح")
-                note_block(sym, "margin_too_small")
-                log_paper_signal(sym, signal, "margin_too_small")
-                return
-
-            success, info, entry, contracts = open_position(ex, sym, side, actual_price, sl, tp, margin)
-            now = time.time()
-            if success:
-                note_opened()
+            with trade_lock:
                 with state_lock:
-                    state[sym].update({
-                        "position": side, "entry": entry, "sl": sl, "tp": tp,
-                        "initial_sl": sl, "initial_risk": abs(entry - sl),
-                        "contracts": contracts, "initial_contracts": contracts,
-                        "margin": margin, "opened_ts": now, "leg_ts": now,
-                        "realized_pnl": 0.0, "realized_fees_est": 0.0,
-                        "planned_entry": actual_price,
-                        "last_notified_sl": None,
-                        "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False,
-                        "regime": signal.get("regime", ""),
-                        "strategy": signal.get("strategy", ""),
-                        "mode": mode,
-                        "signal_score": signal.get("score", 0),
-                        "score_factors": signal.get("score_factors", {}),
-                        "volume_ratio": signal.get("volume_ratio", 0),
-                        "ker": signal.get("ker"),
-                    })
-            else:
-                note_block(sym, "open_failed")
-                with state_lock:
-                    state[sym]["last_exit_ts"] = now
-            save_state()
+                    current = state.get(sym, {})
+                    open_count = sum(bool(v.get("position")) for v in state.values())
+                    same_dir = sum(v.get("position") == side for v in state.values())
+                    sniper_count = sum(bool(v.get("position")) and v.get("mode") == "sniper"
+                                       for v in state.values())
+                if (current.get("position") or current.get("last_exit_ts") != pos_data.get("last_exit_ts")
+                        or open_count >= MAX_OPEN_POSITIONS or same_dir >= MAX_SAME_DIRECTION
+                        or (mode == "sniper" and sniper_count >= SNIPER["max_open"])
+                        or sector_limit_reached(sym, side)):
+                    return
+                if meta.get("paused") or get_open_position(ex, sym) is not None:
+                    return
+                equity_now, free_margin = get_balances(ex, force=True)
+                ok, gate = entries_allowed(ex)
+                if not ok:
+                    note_block(sym, gate)
+                    return
+                margin = compute_margin_scored(
+                    equity_now, sl_pct, signal.get("score", 0), free_margin,
+                    ai_prob=None if mode == "sniper" else ai_prob,
+                    risk_pct=risk_eff, leverage=lev_eff
+                )
+                if margin <= 0:
+                    note_block(sym, "margin_too_small")
+                    log_paper_signal(sym, signal, "margin_too_small")
+                    return
+                actual_price = get_current_price(ex, sym, 0)
+                if not actual_price or abs(actual_price - signal["price"]) / signal["price"] > max_slip:
+                    reason = "slippage" if actual_price else "ticker_unavailable"
+                    note_block(sym, reason)
+                    log_paper_signal(sym, signal, reason)
+                    return
+                d = 1 if side == "LONG" else -1
+                sl, tp = actual_price * (1 - d * sl_pct), actual_price * (1 + d * sl_pct * tp_rr)
+                success, info, entry, contracts = open_position(ex, sym, side, actual_price, sl, tp, margin, leverage=lev_eff)
+                now = time.time()
+                if success:
+                    note_opened()
+                    with state_lock:
+                        state[sym].update({
+                            "position": side, "entry": entry, "sl": sl, "tp": tp,
+                            "initial_sl": sl, "initial_risk": abs(entry - sl),
+                            "contracts": contracts, "initial_contracts": contracts,
+                            "margin": margin, "opened_ts": now, "leg_ts": now,
+                            "realized_pnl": 0.0, "realized_fees_est": 0.0,
+                            "planned_entry": actual_price,
+                            "last_notified_sl": None,
+                            "breakeven_hit": False, "partial_1_taken": False, "partial_2_taken": False,
+                            "regime": signal.get("regime", ""),
+                            "strategy": signal.get("strategy", ""),
+                            "mode": mode,
+                            "signal_score": signal.get("score", 0),
+                            "score_factors": signal.get("score_factors", {}),
+                            "volume_ratio": signal.get("volume_ratio", 0),
+                            "ker": signal.get("ker"),
+                        })
+                else:
+                    note_block(sym, "open_failed")
+                    with state_lock:
+                        state[sym]["last_exit_ts"] = now
+                        state[sym]["last_exit_mode"] = mode
+                save_state()
             caption = msg_entry(sym, side, entry, sl, tp, margin, success,
                                 signal.get("regime", ""), signal.get("strategy", ""),
-                                equity_now, signal.get("score", 0))
+                                equity_now, signal.get("score", 0), lev=lev_eff, mode=mode)
             if not success:
                 caption += f"\n❌ {info}"
             send(caption)
@@ -2511,9 +2780,8 @@ def process_symbol(ex, sym):
 # ==========================================
 def adopt_sl_pct(ex, sym):
     try:
-        raw = fetch_data(ex, sym, "15m")
-        if len(raw) >= 60:
-            df = to_df(raw)
+        df = fetch_data(ex, sym, "15m")
+        if len(df) >= 60:
             a, c = float(df.iloc[-2]["atr"]), float(df.iloc[-2]["close"])
             if c > 0 and not np.isnan(a):
                 return max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULT * a / c))
@@ -2529,7 +2797,7 @@ def sync_positions(ex, active_symbols):
             exch = {}
             for p in ex.fetch_positions():
                 c = abs(float(p.get('contracts') or 0))
-                if c > 0 and p.get('symbol') in active_symbols:
+                if c > 0 and p.get('symbol'):
                     exch[p['symbol']] = p
         except Exception as e:
             log.error(f"[SYNC] {e}")
@@ -2537,21 +2805,27 @@ def sync_positions(ex, active_symbols):
         for sym in exch:
             if sym not in active_symbols:
                 active_symbols.append(sym)
-        for sym in active_symbols:
+        for sym in list(active_symbols):
             with state_lock:
                 st = dict(state.get(sym, new_sym_state()))
             if st.get("position") and sym not in exch:
                 finalize_trade(ex, sym)
             elif st.get("position") and sym in exch:
+                if st["position"].lower() != exch[sym].get("side") or (
+                    exch[sym].get("info") or {}
+                ).get("posSide") in ("long", "short"):
+                    log.error("[SYNC] %s: position side/mode mismatch", sym)
+                    continue
                 contracts = abs(float(exch[sym].get('contracts')))
                 with state_lock:
                     state[sym]["contracts"] = contracts
-                has_sl, _ = has_protection(ex, sym)
-                if has_sl is False:
-                    close_side = 'sell' if st["position"] == "LONG" else 'buy'
-                    replace_protection(ex, sym, close_side, contracts, st["sl"], st.get("tp"))
-            elif not st.get("position") and sym in exch:
+                st["contracts"] = contracts
+                repair_protection(ex, sym, st, get_current_price(ex, sym))
+            elif not st.get("position") and sym in exch and ADOPT_ORPHANS:
                 p = exch[sym]
+                if (p.get("info") or {}).get("posSide") in ("long", "short") or p.get("side") not in ("long", "short"):
+                    log.error("[SYNC] %s: requires net position mode", sym)
+                    continue
                 side = "LONG" if p.get('side') == 'long' else "SHORT"
                 entry = float(p.get('entryPrice') or 0)
                 contracts = abs(float(p.get('contracts')))
@@ -2590,12 +2864,15 @@ def adopt_orphans(ex, active_symbols):
             exch = {}
             for p in ex.fetch_positions():
                 c = abs(float(p.get('contracts') or 0))
-                if c > 0 and p.get('symbol') in active_symbols:
+                if c > 0 and p.get('symbol'):
                     exch[p['symbol']] = p
         except Exception as e:
             log.warning(f"[ORPHAN] {e}")
             return
         for sym, p in exch.items():
+            if (p.get("info") or {}).get("posSide") in ("long", "short") or p.get("side") not in ("long", "short"):
+                log.error("[ORPHAN] %s: requires net position mode", sym)
+                continue
             if sym not in active_symbols:
                 active_symbols.append(sym)
             with state_lock:
@@ -2653,6 +2930,8 @@ def unrealized(ex, sym, v):
 
 def flags_text(v):
     f = ""
+    if v.get("mode") == "sniper":
+        f += " 🎯"
     if v.get("partial_2_taken"):
         f += " 💰💰"
     elif v.get("partial_1_taken"):
@@ -2775,7 +3054,8 @@ def config_text():
         f"المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة {LEVERAGE}x | سقف الهامش {MAX_MARGIN_USDT:.0f}",
         f"حد الدرجة: {MIN_SIGNAL_SCORE}/100 | عملات: {UNIVERSE_MODE} (حتى {MAX_UNIVERSE_SYMBOLS})",
         f"أقصى صفقات: {MAX_OPEN_POSITIONS} | نفس الاتجاه: {MAX_SAME_DIRECTION}",
-        f"القناص: {'مفعّل' if ENABLE_SNIPER else 'معطّل'} | حد الدرجة {SNIPER['min_score']} | أقصى مدة {SNIPER['max_hold_minutes']}د | أقصى صفقات {SNIPER['max_open']}",
+        f"القناص: {'مفعّل' if ENABLE_SNIPER else 'معطّل'} | حد الدرجة {SNIPER['min_score']} | رافعة {SNIPER['leverage']}x | مخاطرة {SNIPER['risk_pct']}% | مدة {SNIPER['max_hold_minutes']}د",
+        f"AI المحلي: {'نشط ✅' if AI_IS_ACTIVE else 'معطّل'} | فلتر الدخول: {'مفعّل' if USE_AI_ENTRY_FILTER else 'تشخيص فقط'}",
         "━━━━━━━━━━━━━━━",
         "للتعديل: متغيرات البيئة في Render ثم Redeploy."])
 
@@ -2882,12 +3162,15 @@ def handle_command(ex, text, chat_id, active_symbols):
         send("⏳ جاري تصدير السجل والحالة...", chat_id)
         backup_to_telegram(chat_id)
     elif cmd == "/restore":
-        send("📥 أرسل لي الآن ملف trades_journal.csv أو bot_state.json أو paper_signals.csv", chat_id)
+        send("أوقف الدخول بـ /pause، وتأكد من عدم وجود مراكز. أرسل الملف في الخاص "
+             "مع كتابة <code>/restore confirm</code> في تعليقه.", chat_id)
     elif cmd == "/pause":
-        set_meta("paused", True)
+        with trade_lock:
+            set_meta("paused", True)
         send("⏸️ تم إيقاف فتح صفقات جديدة.", chat_id)
     elif cmd == "/resume":
-        set_meta("paused", False)
+        with trade_lock:
+            set_meta("paused", False)
         send("▶️ تم استئناف البحث.", chat_id)
     elif cmd == "/close":
         if len(parts) < 2:
@@ -2964,7 +3247,7 @@ def telegram_listener(active_symbols):
                 if chat_id not in AUTHORIZED_CHATS:
                     continue
                 if "document" in msg:
-                    handle_document_restore(msg, chat_id)
+                    handle_document_restore(msg, chat_id, ex2)
                     continue
                 if not text.startswith("/"):
                     continue
@@ -2974,7 +3257,7 @@ def telegram_listener(active_symbols):
                     log.exception(f"[TG CMD] {text[:80]}")
                     send("حدث خطأ داخلي. راجع سجل البوت.", chat_id)
         except Exception as e:
-            log.warning(f"[TG POLL] {e}")
+            log.warning("[TG POLL] %s", type(e).__name__)
             time.sleep(5)
 
 
@@ -3113,6 +3396,9 @@ def discover_universe(ex):
 # ==========================================
 def trading_loop():
     log.info(f"[INIT] Starting {VERSION} ...")
+    if not USE_SANDBOX and not ALLOW_LIVE_TRADING:
+        log.error("[INIT] Live trading requires ALLOW_LIVE_TRADING=true")
+        return
     missing = [name for name, val in (
         ("OKX_API_KEY", OKX_API_KEY),
         ("OKX_SECRET", OKX_SECRET),
@@ -3122,8 +3408,8 @@ def trading_loop():
         log.error(f"[INIT] Missing credentials: {', '.join(missing)}")
         send("❌ بيانات اعتماد OKX غير مكتملة — راجع متغيرات البيئة.")
         return
+    load_local_ai()
 
-    # تشغيل خيط إرسال Telegram
     threading.Thread(target=_send_worker, daemon=True).start()
 
     try:
@@ -3138,6 +3424,7 @@ def trading_loop():
         return
 
     active_symbols = discover_universe(ex)
+    active_symbols = list(dict.fromkeys(active_symbols + list(open_positions_snapshot())))
     universe_refresh_ts = time.time()
     sync_positions(ex, active_symbols)
     threading.Thread(target=telegram_listener, args=(active_symbols,), daemon=True).start()
@@ -3146,8 +3433,8 @@ def trading_loop():
          f"⚙️ الوضع: {mode_str}\n🪙 العملات: {len(active_symbols)}\n"
          f"📊 أقصى صفقات: {MAX_OPEN_POSITIONS}\n"
          f"💰 المخاطرة: {RISK_PCT_PER_TRADE}% | رافعة: {LEVERAGE}x\n"
-         f"🎚️ البروفايل: {PROFILE_NAME} | الاختراق: {'مفعّل' if ENABLE_BREAKOUT else 'معطّل'}\n"
-         f"🧠 حد الدرجة: {MIN_SIGNAL_SCORE}/100 | تحديث السوق: {UNIVERSE_REFRESH_SEC // 60} دقيقة\n"
+         f"🎚️ البروفايل: {PROFILE_NAME} | القناص: {'مفعّل' if ENABLE_SNIPER else 'معطّل'}\n"
+         f"🧠 AI المحلي: {'نشط ✅' if AI_IS_ACTIVE else 'معطّل'} | حد الدرجة: {MIN_SIGNAL_SCORE}/100\n"
          f"🔎 /why أسباب | ⚙️ /config إعدادات | 📱 /help\n━━━━━━━━━━━━━━━")
     if PROFILE_WARNING:
         send(f"⚠️ {PROFILE_WARNING}")
@@ -3171,14 +3458,15 @@ def trading_loop():
             refresh_prices(ex, active_symbols)
             if USE_BTC_FILTER:
                 btc_bias(ex)
-            for sym in active_symbols:
+            held_symbols = open_positions_snapshot()
+            scan_order = sorted(active_symbols, key=lambda sym: sym not in held_symbols)
+            for sym in scan_order:
                 try:
                     process_symbol(ex, sym)
                 except Exception as e:
                     cycle_errors += 1
                     loop_info["last_error"] = f"{sym}: {str(e)[:150]}"
                     log.error(f"[LOOP] {sym}: {e}")
-                time.sleep(0.25)
             if time.time() - last_orphan_check >= ORPHAN_CHECK_SEC:
                 adopt_orphans(ex, active_symbols)
                 last_orphan_check = time.time()
@@ -3214,6 +3502,7 @@ def trading_loop():
 # نقطة الدخول
 # ==========================================
 if __name__ == "__main__":
+    os.makedirs(DATA_DIR, exist_ok=True)
     if not acquire_single_instance():
         log.error("نسخة أخرى من البوت تعمل بالفعل — إيقاف.")
         sys.exit(1)
