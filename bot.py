@@ -1215,7 +1215,7 @@ def calculate_contracts(ex, sym, margin, price, lev):
         return 0.0
 
 
-ddef compute_margin(equity, sl_pct, risk_pct=None, leverage=None):
+def compute_margin(equity, sl_pct, risk_pct=None, leverage=None):
     rp = risk_pct if risk_pct is not None else RISK_PCT_PER_TRADE
     lev = leverage if leverage is not None else LEVERAGE
     if equity <= 0 or lev <= 0:
