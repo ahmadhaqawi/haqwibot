@@ -179,13 +179,13 @@ def _download_model(url, path, expected, size_limit):
     with tempfile.NamedTemporaryFile(dir=os.path.dirname(os.path.abspath(path)), delete=False) as tmp:
         staging = tmp.name
     try:
-        with requests.get(url, timeout=(5, 20), stream=True) as response, open(staging, "wb") as out:
+        with requests.get(url, timeout=(10, 60), stream=True) as response, open(staging, "wb") as out:
             response.raise_for_status()
             if any(urlsplit(item.url).scheme != "https" for item in [*response.history, response]):
                 raise ValueError("AI model redirect must use HTTPS")
             size = 0
-            deadline = time.monotonic() + 120
-            for chunk in response.iter_content(64 * 1024):
+            deadline = time.monotonic() + 180
+            for chunk in response.iter_content(128 * 1024):
                 size += len(chunk)
                 if size > size_limit or time.monotonic() > deadline:
                     raise ValueError("AI model download exceeded its size or time budget")
@@ -213,21 +213,23 @@ def load_local_ai():
     try:
         import joblib
         folder = os.getenv("AI_MODEL_DIR", ".")
-        pins = [os.getenv(env, "").strip().lower() for _, env, _ in specs]
-        if not all(re.fullmatch(r"[0-9a-f]{64}", pin) for pin in pins):
-            raise ValueError("تجب تهيئة بصمات SHA-256 الأربع من مصدر موثوق")
+        pins = [re.sub(r"\s+", "", os.getenv(env, "")).lower() for _, env, _ in specs]
+        for (_, env, _), pin in zip(specs, pins):
+            if not re.fullmatch(r"[0-9a-f]{64}", pin):
+                raise ValueError(f"بصمة غير صالحة أو ناقصة في المتغير: {env}")
         verified = []
         for (name, _, limit), pin in zip(specs, pins):
             path = os.path.join(folder, name)
             url = os.getenv("AI_MODEL_URL", "").strip() if name == specs[0][0] else ""
             if not os.path.exists(path) and url:
+                log.info(f"[AI] جاري تنزيل {name} ...")
                 _download_model(url, path, pin, limit)
             verified.append(_verified_bytes(path, pin, limit))
         ai_model, le_regime, le_strategy, le_side = [joblib.load(io.BytesIO(blob)) for blob in verified]
         AI_IS_ACTIVE = True
         log.info("[AI] تم تحميل النموذج المحلي من ملفات مطابقة للبصمات")
     except Exception as e:
-        log.warning("[AI] لم يُحمّل النموذج المحلي: %s", type(e).__name__)
+        log.warning(f"[AI] لم يُحمّل النموذج المحلي: {type(e).__name__} - {e}")
 
 
 # ---------- Paper Mode ----------
